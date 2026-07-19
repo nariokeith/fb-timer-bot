@@ -464,7 +464,7 @@ def boss_field(boss: str, now: datetime) -> str:
     return f"⏰ Cooling down ({hours}H)\n{ts(spawn, 'F')}"
 
 
-def build_boss_embeds(now: datetime) -> list[discord.Embed]:
+def build_boss_embeds(now: datetime, limit: int | None = None) -> list[discord.Embed]:
     def sort_key(boss: str):
         spawn = next_spawn(boss, now)
         # Unknown/overdue timers sink to the bottom of the list.
@@ -475,6 +475,9 @@ def build_boss_embeds(now: datetime) -> list[discord.Embed]:
         return (0, spawn)
 
     ordered = sorted(ALL_BOSSES.values(), key=sort_key)
+    total = len(ordered)
+    if limit:
+        ordered = ordered[:limit]
 
     embeds = []
     embed = discord.Embed(title="📋 All Boss Timers", color=discord.Color.orange())
@@ -485,14 +488,19 @@ def build_boss_embeds(now: datetime) -> list[discord.Embed]:
         embed.add_field(
             name=f"{i}. {boss}", value=boss_field(boss, now), inline=True
         )
+    if len(ordered) < total:
+        embed.set_footer(
+            text=f"Showing the next {len(ordered)} of {total} — use !bosses all for everything"
+        )
     embeds.append(embed)
     return embeds
 
 
 @bot.command(name="bosses")
-async def bosses(ctx: commands.Context):
-    """List every boss and its next spawn, soonest first: !bosses"""
-    await ctx.send(embeds=build_boss_embeds(datetime.now()))
+async def bosses(ctx: commands.Context, scope: str = ""):
+    """Next 20 spawns: !bosses — or the full list: !bosses all"""
+    limit = None if scope.lower() == "all" else 20
+    await ctx.send(embeds=build_boss_embeds(datetime.now(), limit=limit))
 
 
 @killed.error
