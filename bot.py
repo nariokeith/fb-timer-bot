@@ -449,11 +449,22 @@ def boss_line(boss: str, now: datetime) -> str:
     return f"**{boss}** ({hours}h) — next: {ts(spawn)} {ts(spawn, 'R')}"
 
 
-@bot.command(name="bosses")
-async def bosses(ctx: commands.Context):
-    """List every boss and its next spawn, soonest first: !bosses"""
-    now = datetime.now()
+def boss_field(boss: str, now: datetime) -> str:
+    """Embed field body for one boss: status line + spawn time."""
+    if boss in SCHEDULED_BOSSES:
+        spawn = next_scheduled_spawn(boss, now)
+        return f"⏰ Cooling down (weekly)\n{ts(spawn, 'F')}"
 
+    hours = INTERVAL_BOSSES[boss]
+    spawn = interval_spawn(boss)
+    if spawn is None:
+        return f"❓ No kill recorded\nUse `!killed {boss}`"
+    if spawn <= now:
+        return f"⚔️ Should be up!\nSpawned {ts(spawn, 'R')}"
+    return f"⏰ Cooling down ({hours}H)\n{ts(spawn, 'F')}"
+
+
+def build_boss_embeds(now: datetime) -> list[discord.Embed]:
     def sort_key(boss: str):
         spawn = next_spawn(boss, now)
         # Unknown/overdue timers sink to the bottom of the list.
@@ -463,16 +474,25 @@ async def bosses(ctx: commands.Context):
             return (1, spawn)
         return (0, spawn)
 
-    lines = [boss_line(b, now) for b in sorted(ALL_BOSSES.values(), key=sort_key)]
+    ordered = sorted(ALL_BOSSES.values(), key=sort_key)
 
-    chunk = ""
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 1900:
-            await ctx.send(chunk)
-            chunk = ""
-        chunk += line + "\n"
-    if chunk:
-        await ctx.send(chunk)
+    embeds = []
+    embed = discord.Embed(title="📋 All Boss Timers", color=discord.Color.orange())
+    for i, boss in enumerate(ordered, 1):
+        if len(embed.fields) == 25:  # Discord's per-embed field limit
+            embeds.append(embed)
+            embed = discord.Embed(color=discord.Color.orange())
+        embed.add_field(
+            name=f"{i}. {boss}", value=boss_field(boss, now), inline=True
+        )
+    embeds.append(embed)
+    return embeds
+
+
+@bot.command(name="bosses")
+async def bosses(ctx: commands.Context):
+    """List every boss and its next spawn, soonest first: !bosses"""
+    await ctx.send(embeds=build_boss_embeds(datetime.now()))
 
 
 @killed.error
