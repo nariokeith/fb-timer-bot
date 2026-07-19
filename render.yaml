@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: fb-timer-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u bot.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: BOT_TZ
+        value: Asia/Manila
+      - key: PYTHON_VERSION
+        value: 3.13.4
