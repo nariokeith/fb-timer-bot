@@ -38,6 +38,9 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 DATA_FILE = Path(__file__).with_name("data.json")
 NOTIFY_BEFORE = timedelta(minutes=10)
+# How long after the spawn moment the "has spawned!" message may still be
+# sent (covers the watcher's 30s cadence and short outages/restarts).
+SPAWN_ANNOUNCE_WINDOW = timedelta(minutes=10)
 STATE_MARKER = "FBTIMER_STATE_V1"
 
 # ---------------------------------------------------------------------------
@@ -106,7 +109,7 @@ def load_local() -> dict:
     if DATA_FILE.exists():
         with DATA_FILE.open() as f:
             return json.load(f)
-    return {"channel_id": None, "deaths": {}, "notified": {}}
+    return {"channel_id": None, "deaths": {}, "notified": {}, "spawned": {}}
 
 
 def save_local() -> None:
@@ -115,40 +118,60 @@ def save_local() -> None:
 
 
 data = load_local()
+data.setdefault("spawned", {})
 state_msg: discord.Message | None = None
 
 
-def prune_notified(now: datetime) -> None:
-    """Drop notification markers for spawns that already happened."""
+def prune_state(now: datetime) -> None:
+    """Drop markers that can no longer matter."""
     for boss, iso in list(data["notified"].items()):
         if datetime.fromisoformat(iso) < now:
             del data["notified"][boss]
+    for boss, iso in list(data["spawned"].items()):
+        if datetime.fromisoformat(iso) < now - timedelta(hours=1):
+            del data["spawned"][boss]
+
+
+def _unix_map(section: str) -> dict:
+    return {b: int(datetime.fromisoformat(v).timestamp())
+            for b, v in data[section].items()}
 
 
 def encode_state() -> str:
     payload = {
         "channel_id": data["channel_id"],
-        "deaths": {b: int(datetime.fromisoformat(v).timestamp())
-                   for b, v in data["deaths"].items()},
-        "notified": {b: int(datetime.fromisoformat(v).timestamp())
-                     for b, v in data["notified"].items()},
+        "deaths": _unix_map("deaths"),
+        "notified": _unix_map("notified"),
+        "spawned": _unix_map("spawned"),
     }
-    return (
+    content = (
         f"{STATE_MARKER} — bot storage, please don't delete this message.\n"
         f"```json\n{json.dumps(payload)}\n```"
     )
+    if len(content) > 1990:  # never exceed Discord's 2000-char message limit;
+        # keep the critical data (channel + kill times) and drop the rest
+        payload["notified"] = {}
+        payload["spawned"] = {}
+        content = (
+            f"{STATE_MARKER} — bot storage, please don't delete this message.\n"
+            f"```json\n{json.dumps(payload)}\n```"
+        )
+    return content
 
 
 def decode_state(content: str) -> dict | None:
+    def from_unix(section: dict) -> dict:
+        return {b: datetime.fromtimestamp(t).isoformat()
+                for b, t in section.items() if b.lower() in ALL_BOSSES}
+
     try:
         raw = content.split("```json\n", 1)[1].rsplit("\n```", 1)[0]
         payload = json.loads(raw)
         return {
             "channel_id": payload["channel_id"],
-            "deaths": {b: datetime.fromtimestamp(t).isoformat()
-                       for b, t in payload["deaths"].items() if b.lower() in ALL_BOSSES},
-            "notified": {b: datetime.fromtimestamp(t).isoformat()
-                         for b, t in payload["notified"].items() if b.lower() in ALL_BOSSES},
+            "deaths": from_unix(payload["deaths"]),
+            "notified": from_unix(payload["notified"]),
+            "spawned": from_unix(payload.get("spawned", {})),
         }
     except (IndexError, KeyError, ValueError, TypeError, json.JSONDecodeError):
         return None
@@ -157,7 +180,7 @@ def decode_state(content: str) -> dict | None:
 async def persist() -> None:
     """Save state locally and mirror it into the pinned Discord message."""
     global state_msg
-    prune_notified(datetime.now())
+    prune_state(datetime.now())
     save_local()
     if not data["channel_id"]:
         return
@@ -236,6 +259,21 @@ def next_scheduled_spawn(boss: str, now: datetime) -> datetime:
             candidate += timedelta(days=7)
         candidates.append(candidate)
     return min(candidates)
+
+
+def last_scheduled_spawn(boss: str, now: datetime) -> datetime:
+    """Most recent slot of a fixed-schedule boss that is already past."""
+    candidates = []
+    for weekday, hhmm in SCHEDULED_BOSSES[boss]:
+        hour, minute = map(int, hhmm.split(":"))
+        days_back = (now.weekday() - weekday) % 7
+        candidate = (now - timedelta(days=days_back)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if candidate > now:
+            candidate -= timedelta(days=7)
+        candidates.append(candidate)
+    return max(candidates)
 
 
 def interval_spawn(boss: str) -> datetime | None:
@@ -339,7 +377,7 @@ async def on_ready():
 
 @tasks.loop(seconds=30)
 async def spawn_watcher():
-    """Post a heads-up 10 minutes before each known spawn."""
+    """Post a heads-up 10 minutes before each spawn, and again at spawn time."""
     channel_id = data.get("channel_id")
     if not channel_id:
         return
@@ -350,21 +388,45 @@ async def spawn_watcher():
     now = datetime.now()
     changed = False
     for boss in ALL_BOSSES.values():
+        # 10-minute warning for the upcoming spawn.
         spawn = next_spawn(boss, now)
-        if spawn is None or not (timedelta(0) <= spawn - now <= NOTIFY_BEFORE):
+        if spawn is not None and timedelta(0) <= spawn - now <= NOTIFY_BEFORE:
+            spawn_iso = spawn.isoformat()
+            if data["notified"].get(boss) != spawn_iso:
+                try:
+                    await channel.send(
+                        f"🔔 **{boss}** spawns {ts(spawn, 'R')} — at {ts(spawn, 't')}!"
+                    )
+                    data["notified"][boss] = spawn_iso
+                    changed = True
+                except discord.HTTPException as exc:
+                    print(f"Failed to send warning for {boss}: {exc}")
+
+        # "Has spawned!" message right when the spawn moment passes.
+        if boss in SCHEDULED_BOSSES:
+            spawned_at = last_scheduled_spawn(boss, now)
+        else:
+            spawned_at = interval_spawn(boss)
+        if spawned_at is None or not (
+            timedelta(0) <= now - spawned_at <= SPAWN_ANNOUNCE_WINDOW
+        ):
             continue
-        spawn_iso = spawn.isoformat()
-        if data["notified"].get(boss) == spawn_iso:
+        spawned_iso = spawned_at.isoformat()
+        if data["spawned"].get(boss) == spawned_iso:
             continue
-        try:
-            await channel.send(
-                f"🔔 **{boss}** spawns {ts(spawn, 'R')} — at {ts(spawn, 't')}!"
+        if boss in INTERVAL_BOSSES:
+            text = (
+                f"⚔️ **{boss}** has spawned! "
+                f"After the kill, log it with `!killed {boss}`."
             )
+        else:
+            text = f"⚔️ **{boss}** has spawned!"
+        try:
+            await channel.send(text)
+            data["spawned"][boss] = spawned_iso
+            changed = True
         except discord.HTTPException as exc:
-            print(f"Failed to send notification for {boss}: {exc}")
-            continue
-        data["notified"][boss] = spawn_iso
-        changed = True
+            print(f"Failed to send spawn message for {boss}: {exc}")
     if changed:
         await persist()
 
