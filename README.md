@@ -11,7 +11,9 @@ Two kinds of bosses:
 
 | Command | What it does |
 |---|---|
-| `!setchannel` | Run once in the channel where spawn notifications should go. **Required.** The bot also pins a small storage message there — don't delete it; it's how timers survive restarts. |
+| `!setchannel` | Run once in the channel where spawn notifications should go. **Required.** Unless you set a storage channel, the bot also pins a small storage message here — don't delete it; it's how timers survive restarts. |
+| `!setstoragechannel` | Optional. Run in a private channel to move the storage message there, keeping the notification channel clean. Existing timers move across automatically — nothing has to be re-entered. The bot needs View Channel, Send Messages and Read Message History there (Manage Messages too, so it can pin). |
+| `!clearstoragechannel` | Store the timers back in the notification channel. |
 | `!killed <boss> [time]` | Record an interval boss kill. Time is optional (defaults to right now). Examples: `!killed Supore` · `!killed Supore 9PM` · `!killed venatus 21:30` · `!killed Ordo 2026-07-20 21:00`. A time later than now is assumed to be yesterday. |
 | `!boss <name>` | Show one boss's next spawn. Names are case-insensitive and prefix-matched (`!boss sup` → Supore). |
 | `!bosses` | List all 40 bosses sorted by next spawn (unknown/overdue at the bottom). |
@@ -41,7 +43,7 @@ Free-tier services sleep after 15 minutes without web traffic, so the bot runs a
    - (Alternative without Blueprint: New → Web Service → pick the repo → runtime Python, build `pip install -r requirements.txt`, start `python -u bot.py`, plan Free → add env vars `DISCORD_TOKEN`, `BOT_TZ=Asia/Manila`, `PYTHON_VERSION=3.13.4`.)
 3. Wait for the deploy, then open the service URL (like `https://fb-timer-bot.onrender.com`) — it should say *FB Timer bot is alive*, and the bot should be online in Discord.
 4. **Keep it awake:** create a free monitor at [uptimerobot.com](https://uptimerobot.com) → **New Monitor** → type *HTTP(s)* → paste the Render URL → interval **5 minutes**.
-5. In Discord, run `!setchannel` in your notification channel.
+5. In Discord, run `!setchannel` in your notification channel. Optionally run `!setstoragechannel` in a private channel to keep the storage message out of sight.
 
 Auto-deploy is on by default: pushing to GitHub redeploys the bot. Kill timers survive redeploys via the pinned storage message.
 

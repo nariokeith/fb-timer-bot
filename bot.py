@@ -14,7 +14,9 @@ Built to run on Render's free tier:
   * A tiny web server binds $PORT so an uptime pinger can keep the free
     instance awake.
   * State (channel + kill times) is mirrored into a pinned Discord message,
-    so it survives Render wiping the disk on every restart/redeploy.
+    so it survives Render wiping the disk on every restart/redeploy. That
+    message lives in the notification channel by default; `!setstoragechannel`
+    moves it to a private channel to keep the timer channel clean.
 """
 
 import asyncio
@@ -109,7 +111,13 @@ def load_local() -> dict:
     if DATA_FILE.exists():
         with DATA_FILE.open() as f:
             return json.load(f)
-    return {"channel_id": None, "deaths": {}, "notified": {}, "spawned": {}}
+    return {
+        "channel_id": None,
+        "storage_channel_id": None,
+        "deaths": {},
+        "notified": {},
+        "spawned": {},
+    }
 
 
 def save_local() -> None:
@@ -119,6 +127,7 @@ def save_local() -> None:
 
 data = load_local()
 data.setdefault("spawned", {})
+data.setdefault("storage_channel_id", None)
 state_msg: discord.Message | None = None
 state_pinned = False
 # How many history messages restore_state() scans per channel, and how deep
@@ -142,9 +151,16 @@ def _unix_map(section: str) -> dict:
             for b, v in data[section].items()}
 
 
+def storage_channel_id() -> int | None:
+    """Where the storage message lives: the dedicated channel if one was set
+    with `!setstoragechannel`, otherwise the notification channel."""
+    return data.get("storage_channel_id") or data.get("channel_id")
+
+
 def encode_state() -> str:
     payload = {
         "channel_id": data["channel_id"],
+        "storage_channel_id": data.get("storage_channel_id"),
         "deaths": _unix_map("deaths"),
         "notified": _unix_map("notified"),
         "spawned": _unix_map("spawned"),
@@ -174,6 +190,8 @@ def decode_state(content: str) -> dict | None:
         payload = json.loads(raw)
         return {
             "channel_id": payload["channel_id"],
+            # Absent in messages written before storage channels existed.
+            "storage_channel_id": payload.get("storage_channel_id"),
             "deaths": from_unix(payload["deaths"]),
             "notified": from_unix(payload["notified"]),
             "spawned": from_unix(payload.get("spawned", {})),
@@ -214,37 +232,35 @@ async def persist() -> None:
     global state_msg
     prune_state(datetime.now())
     save_local()
-    if not data["channel_id"]:
+    target_id = storage_channel_id()
+    if not target_id:
         return
     content = encode_state()
     try:
-        if state_msg is not None and state_msg.channel.id != data["channel_id"]:
-            # Notification channel moved: retire the old storage message.
-            try:
-                await state_msg.delete()
-            except discord.HTTPException:
-                pass
-            state_msg = None
-
-        if state_msg is None:
-            channel = bot.get_channel(data["channel_id"])
-            if channel is None:
-                return
-            state_msg = await channel.send(content)
-            await try_pin_state_msg()
-        elif state_pinned or await state_msg_is_recent():
+        if (
+            state_msg is not None
+            and state_msg.channel.id == target_id
+            and (state_pinned or await state_msg_is_recent())
+        ):
             await state_msg.edit(content=content)
-        else:
-            # Unpinned and buried under chat: repost so it stays inside the
-            # window restore_state() scans after a restart. Losing it there
-            # silently disables all spawn notifications.
-            old = state_msg
-            state_msg = await old.channel.send(content)
+            return
+
+        # Either there is no storage message yet, it sits in a channel we no
+        # longer store in, or it is unpinned and has sunk below the window
+        # restore_state() scans — losing it there silently disables every
+        # spawn notification. Post the replacement before deleting the old
+        # one so a failure here can't leave Discord with no copy at all.
+        channel = bot.get_channel(target_id)
+        if channel is None:
+            return
+        old = state_msg
+        state_msg = await channel.send(content)
+        if old is not None:
             try:
                 await old.delete()
             except discord.HTTPException:
                 pass
-            await try_pin_state_msg()
+        await try_pin_state_msg()
     except discord.HTTPException as exc:
         print(f"Failed to mirror state to Discord: {exc}")
 
@@ -535,14 +551,51 @@ async def setchannel(ctx: commands.Context):
     """Use spawn notifications in this channel: !setchannel"""
     data["channel_id"] = ctx.channel.id
     await persist()
+    if data.get("storage_channel_id"):
+        footer = "Timers are stored in the storage channel you set earlier."
+    else:
+        footer = (
+            "I keep a pinned storage message here so timers survive restarts — "
+            "please don't delete it. Use !setstoragechannel elsewhere to hide it."
+        )
     await ctx.send(
         embed=make_embed(
             "✅ Notification Channel Set",
             f"Spawn notifications will be posted in {ctx.channel.mention}.",
+            footer=footer,
+        )
+    )
+
+
+@bot.command(name="setstoragechannel")
+async def setstoragechannel(ctx: commands.Context):
+    """Keep the storage message in this channel: !setstoragechannel"""
+    data["storage_channel_id"] = ctx.channel.id
+    # Moves the existing message here, kill times and all, and deletes the old
+    # copy — nothing has to be re-entered.
+    await persist()
+    await ctx.send(
+        embed=make_embed(
+            "✅ Storage Channel Set",
+            f"Timers are now stored in {ctx.channel.mention}, so the "
+            "notification channel stays clean.",
             footer=(
-                "I keep a pinned storage message here so timers survive "
-                "restarts — please don't delete it."
+                "Existing timers moved across automatically — please don't "
+                "delete the storage message or remove my access here."
             ),
+        )
+    )
+
+
+@bot.command(name="clearstoragechannel")
+async def clearstoragechannel(ctx: commands.Context):
+    """Store the timers in the notification channel again: !clearstoragechannel"""
+    data["storage_channel_id"] = None
+    await persist()
+    await ctx.send(
+        embed=make_embed(
+            "✅ Storage Channel Cleared",
+            "Timers are stored in the notification channel again.",
         )
     )
 
