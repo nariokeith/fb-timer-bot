@@ -71,6 +71,7 @@ INTERVAL_BOSSES = {
     "Ordo": 62,
     "Asta": 62,
     "Supore": 62,
+    "Amentis": 29
 }
 
 # Boss -> list of (weekday, "HH:MM") weekly spawn slots. Monday = 0.
@@ -327,6 +328,32 @@ def ts(dt: datetime, style: str = "f") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared embed look — every message the bot sends uses the same design
+# as `!bosses`: orange embed, emoji title, boss fields, footer for hints.
+# ---------------------------------------------------------------------------
+
+EMBED_COLOR = discord.Color.orange()
+
+
+def make_embed(
+    title: str, description: str | None = None, footer: str | None = None
+) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, color=EMBED_COLOR)
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
+
+
+def boss_embed(
+    title: str, boss: str, value: str, footer: str | None = None
+) -> discord.Embed:
+    """One-boss embed shaped like a single `!bosses` grid cell."""
+    embed = make_embed(title, footer=footer)
+    embed.add_field(name=boss, value=value, inline=True)
+    return embed
+
+
+# ---------------------------------------------------------------------------
 # Keep-alive web server so an uptime pinger can stop Render from sleeping
 # ---------------------------------------------------------------------------
 
@@ -395,7 +422,11 @@ async def spawn_watcher():
             if data["notified"].get(boss) != spawn_iso:
                 try:
                     await channel.send(
-                        f"🔔 **{boss}** spawns {ts(spawn, 'R')} — at {ts(spawn, 't')}!"
+                        embed=boss_embed(
+                            "🔔 Spawning Soon",
+                            boss,
+                            f"🔔 Spawns {ts(spawn, 'R')}\n{ts(spawn, 'F')}",
+                        )
                     )
                     data["notified"][boss] = spawn_iso
                     changed = True
@@ -414,15 +445,18 @@ async def spawn_watcher():
         spawned_iso = spawned_at.isoformat()
         if data["spawned"].get(boss) == spawned_iso:
             continue
-        if boss in INTERVAL_BOSSES:
-            text = (
-                f"⚔️ **{boss}** has spawned! "
-                f"After the kill, log it with `!killed {boss}`."
-            )
-        else:
-            text = f"⚔️ **{boss}** has spawned!"
+        embed = boss_embed(
+            "⚔️ Boss Spawned",
+            boss,
+            f"⚔️ Has spawned!\n{ts(spawned_at, 'F')}",
+            footer=(
+                f"After the kill, log it with !killed {boss}"
+                if boss in INTERVAL_BOSSES
+                else None
+            ),
+        )
         try:
-            await channel.send(text)
+            await channel.send(embed=embed)
             data["spawned"][boss] = spawned_iso
             changed = True
         except discord.HTTPException as exc:
@@ -437,9 +471,14 @@ async def setchannel(ctx: commands.Context):
     data["channel_id"] = ctx.channel.id
     await persist()
     await ctx.send(
-        f"✅ Spawn notifications will be posted in {ctx.channel.mention}.\n"
-        "I keep a pinned storage message here so timers survive restarts — "
-        "please don't delete it."
+        embed=make_embed(
+            "✅ Notification Channel Set",
+            f"Spawn notifications will be posted in {ctx.channel.mention}.",
+            footer=(
+                "I keep a pinned storage message here so timers survive "
+                "restarts — please don't delete it."
+            ),
+        )
     )
 
 
@@ -448,25 +487,32 @@ async def killed(ctx: commands.Context, boss_name: str, *, when: str = ""):
     """Record a boss kill: !killed <boss> [time]  (e.g. !killed Supore 9PM)"""
     boss = resolve_boss(boss_name)
     if boss is None:
-        await ctx.send(f"Unknown boss `{boss_name}`. Check `!bosses` for the list.")
+        await ctx.send(embed=unknown_boss_embed(boss_name))
         return
+    now = datetime.now()
     if boss in SCHEDULED_BOSSES:
         slots = ", ".join(
             f"{WEEKDAYS[d]} {t}" for d, t in SCHEDULED_BOSSES[boss]
         )
         await ctx.send(
-            f"**{boss}** is on a fixed schedule ({slots}) — "
-            "no death time needed."
+            embed=boss_embed(
+                "📋 Boss Timer",
+                boss,
+                boss_field(boss, now),
+                footer=f"Fixed weekly schedule ({slots}) — no kill time needed",
+            )
         )
         return
 
-    now = datetime.now()
     if when:
         death = parse_death_time(when, now)
         if death is None:
             await ctx.send(
-                "Couldn't read that time. Use e.g. `9PM`, `21:00` or "
-                "`2026-07-20 21:00` (or leave it out for right now)."
+                embed=make_embed(
+                    "❓ Couldn't Read That Time",
+                    "Use e.g. `9PM`, `21:00` or `2026-07-20 21:00` — "
+                    "or leave the time out for right now.",
+                )
             )
             return
     else:
@@ -476,10 +522,23 @@ async def killed(ctx: commands.Context, boss_name: str, *, when: str = ""):
     data["notified"].pop(boss, None)
     await persist()
 
-    spawn = death + timedelta(hours=INTERVAL_BOSSES[boss])
+    hours = INTERVAL_BOSSES[boss]
+    spawn = death + timedelta(hours=hours)
     await ctx.send(
-        f"💀 **{boss}** killed at {ts(death)}.\n"
-        f"Next spawn ({INTERVAL_BOSSES[boss]}h later): {ts(spawn)} — {ts(spawn, 'R')}."
+        embed=boss_embed(
+            "💀 Kill Recorded",
+            boss,
+            f"💀 Killed {ts(death, 'F')}\n"
+            f"⏰ Respawns ({hours}H)\n{ts(spawn, 'F')} — {ts(spawn, 'R')}",
+        )
+    )
+
+
+def unknown_boss_embed(boss_name: str) -> discord.Embed:
+    return make_embed(
+        "❓ Unknown Boss",
+        f"`{boss_name}` is not a known boss.",
+        footer="Use !bosses for the full list",
     )
 
 
@@ -488,27 +547,17 @@ async def boss_info(ctx: commands.Context, boss_name: str):
     """Show one boss's timer: !boss <name>"""
     boss = resolve_boss(boss_name)
     if boss is None:
-        await ctx.send(f"Unknown boss `{boss_name}`. Check `!bosses` for the list.")
+        await ctx.send(embed=unknown_boss_embed(boss_name))
         return
-    await ctx.send(boss_line(boss, datetime.now()))
-
-
-def boss_line(boss: str, now: datetime) -> str:
+    footer = None
     if boss in SCHEDULED_BOSSES:
         slots = ", ".join(f"{WEEKDAYS[d]} {t}" for d, t in SCHEDULED_BOSSES[boss])
-        spawn = next_scheduled_spawn(boss, now)
-        return f"**{boss}** ({slots}) — next: {ts(spawn)} {ts(spawn, 'R')}"
-
-    hours = INTERVAL_BOSSES[boss]
-    spawn = interval_spawn(boss)
-    if spawn is None:
-        return f"**{boss}** ({hours}h) — no kill recorded, use `!killed {boss}`"
-    if spawn <= now:
-        return (
-            f"**{boss}** ({hours}h) — should have spawned {ts(spawn, 'R')}; "
-            f"record the new kill with `!killed {boss}`"
+        footer = f"Fixed weekly schedule: {slots}"
+    await ctx.send(
+        embed=boss_embed(
+            "📋 Boss Timer", boss, boss_field(boss, datetime.now()), footer=footer
         )
-    return f"**{boss}** ({hours}h) — next: {ts(spawn)} {ts(spawn, 'R')}"
+    )
 
 
 def boss_field(boss: str, now: datetime) -> str:
@@ -542,11 +591,11 @@ def build_boss_embeds(now: datetime, limit: int | None = None) -> list[discord.E
         ordered = ordered[:limit]
 
     embeds = []
-    embed = discord.Embed(title="📋 All Boss Timers", color=discord.Color.orange())
+    embed = discord.Embed(title="📋 All Boss Timers", color=EMBED_COLOR)
     for i, boss in enumerate(ordered, 1):
         if len(embed.fields) == 25:  # Discord's per-embed field limit
             embeds.append(embed)
-            embed = discord.Embed(color=discord.Color.orange())
+            embed = discord.Embed(color=EMBED_COLOR)
         embed.add_field(
             name=f"{i}. {boss}", value=boss_field(boss, now), inline=True
         )
@@ -570,8 +619,11 @@ async def bosses(ctx: commands.Context, scope: str = ""):
 async def boss_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(
-            "Usage: `!killed <boss> [time]` or `!boss <name>` — e.g. "
-            "`!killed Supore 9PM`."
+            embed=make_embed(
+                "❓ Missing Boss Name",
+                "Usage: `!killed <boss> [time]` or `!boss <name>`",
+                footer="e.g. !killed Supore 9PM",
+            )
         )
     else:
         raise error
@@ -583,23 +635,42 @@ async def timer(ctx: commands.Context, seconds: str):
     try:
         remaining = int(seconds)
     except ValueError:
-        await ctx.send("Please provide a positive whole number of seconds.")
+        await ctx.send(
+            embed=make_embed(
+                "❓ Invalid Timer",
+                "Please provide a positive whole number of seconds.",
+                footer="e.g. !timer 300",
+            )
+        )
         return
     if remaining <= 0:
-        await ctx.send("The number of seconds must be greater than zero.")
+        await ctx.send(
+            embed=make_embed(
+                "❓ Invalid Timer", "The number of seconds must be greater than zero."
+            )
+        )
         return
     if remaining > 3600:
-        await ctx.send("Timers are capped at 3600 seconds (1 hour).")
+        await ctx.send(
+            embed=make_embed(
+                "❓ Invalid Timer", "Timers are capped at 3600 seconds (1 hour)."
+            )
+        )
         return
 
-    msg = await ctx.send(f"⏳ Time remaining: **{remaining}s**")
+    def countdown_embed(secs: int) -> discord.Embed:
+        return make_embed("⏳ Timer", f"Time remaining: **{secs}s**")
+
+    msg = await ctx.send(embed=countdown_embed(remaining))
     try:
         while remaining > 0:
             await asyncio.sleep(1)
             remaining -= 1
             if remaining > 0:
-                await msg.edit(content=f"⏳ Time remaining: **{remaining}s**")
-        await msg.edit(content=f"⏰ Time's up! {ctx.author.mention}")
+                await msg.edit(embed=countdown_embed(remaining))
+        await msg.edit(
+            embed=make_embed("⏰ Time's Up!", f"Your timer is done, {ctx.author.mention}!")
+        )
     except discord.NotFound:
         pass
     except discord.HTTPException as exc:
