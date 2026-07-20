@@ -57,7 +57,7 @@ INTERVAL_BOSSES = {
     "Undo": 24,
     "Dalia": 18,
     "General": 29,
-    "Amentos": 29,
+    "Amentis": 29,
     "Baron": 32,
     "Wannitas": 48,
     "Metus": 48,
@@ -70,8 +70,7 @@ INTERVAL_BOSSES = {
     "Secreta": 62,
     "Ordo": 62,
     "Asta": 62,
-    "Supore": 62,
-    "Amentis": 29
+    "Supore": 62
 }
 
 # Boss -> list of (weekday, "HH:MM") weekly spawn slots. Monday = 0.
