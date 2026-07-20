@@ -120,6 +120,11 @@ def save_local() -> None:
 data = load_local()
 data.setdefault("spawned", {})
 state_msg: discord.Message | None = None
+state_pinned = False
+# How many history messages restore_state() scans per channel, and how deep
+# the unpinned storage message may sink before persist() reposts it.
+RESTORE_SCAN_LIMIT = 100
+REPOST_DEPTH = 25
 
 
 def prune_state(now: datetime) -> None:
@@ -177,8 +182,35 @@ def decode_state(content: str) -> dict | None:
         return None
 
 
+async def try_pin_state_msg() -> None:
+    """Pin the storage message if possible (needs Manage Messages)."""
+    global state_pinned
+    try:
+        await state_msg.pin()
+        state_pinned = True
+    except discord.HTTPException:
+        # Without the pin the storage message must stay within the history
+        # window restore_state() scans; persist() reposts it to ensure that.
+        state_pinned = False
+        print("Could not pin the storage message (missing Manage Messages?).")
+
+
+async def state_msg_is_recent() -> bool:
+    """Is the storage message shallow enough for restore_state() to find?"""
+    channel = state_msg.channel
+    if channel.last_message_id == state_msg.id:
+        return True
+    try:
+        async for msg in channel.history(limit=REPOST_DEPTH):
+            if msg.id == state_msg.id:
+                return True
+    except discord.HTTPException:
+        return True  # can't check — keep editing rather than churn
+    return False
+
+
 async def persist() -> None:
-    """Save state locally and mirror it into the pinned Discord message."""
+    """Save state locally and mirror it into a pinned/recent Discord message."""
     global state_msg
     prune_state(datetime.now())
     save_local()
@@ -199,45 +231,67 @@ async def persist() -> None:
             if channel is None:
                 return
             state_msg = await channel.send(content)
-            try:
-                await state_msg.pin()
-            except discord.HTTPException:
-                # Pinning needs Manage Messages; the fallback history scan
-                # in restore_state() still finds an unpinned storage message.
-                print("Could not pin the storage message (missing Manage Messages?).")
-        else:
+            await try_pin_state_msg()
+        elif state_pinned or await state_msg_is_recent():
             await state_msg.edit(content=content)
+        else:
+            # Unpinned and buried under chat: repost so it stays inside the
+            # window restore_state() scans after a restart. Losing it there
+            # silently disables all spawn notifications.
+            old = state_msg
+            state_msg = await old.channel.send(content)
+            try:
+                await old.delete()
+            except discord.HTTPException:
+                pass
+            await try_pin_state_msg()
     except discord.HTTPException as exc:
         print(f"Failed to mirror state to Discord: {exc}")
 
 
 async def restore_state() -> bool:
     """Find the storage message after a restart and reload state from it."""
-    global state_msg
-    for scan_history in (False, True):
-        for guild in bot.guilds:
-            for channel in guild.text_channels:
-                perms = channel.permissions_for(guild.me)
-                if not (perms.view_channel and perms.read_message_history):
-                    continue
-                try:
-                    if scan_history:
-                        messages = channel.history(limit=25)
-                    else:
-                        messages = channel.pins(limit=50)
+    global state_msg, state_pinned
+    candidates: list[discord.Message] = []
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            perms = channel.permissions_for(guild.me)
+            if not (perms.view_channel and perms.read_message_history):
+                continue
+            seen: set[int] = set()
+            try:
+                for messages in (
+                    channel.pins(limit=50),
+                    channel.history(limit=RESTORE_SCAN_LIMIT),
+                ):
                     async for msg in messages:
                         if (
                             msg.author.id == bot.user.id
                             and msg.content.startswith(STATE_MARKER)
+                            and msg.id not in seen
                         ):
-                            decoded = decode_state(msg.content)
-                            if decoded:
-                                data.update(decoded)
-                                state_msg = msg
-                                save_local()
-                                return True
+                            seen.add(msg.id)
+                            candidates.append(msg)
+            except discord.HTTPException:
+                continue
+
+    # Newest edit wins; anything older is a stale leftover.
+    candidates.sort(key=lambda m: m.edited_at or m.created_at, reverse=True)
+    for msg in candidates:
+        decoded = decode_state(msg.content)
+        if decoded is None:
+            continue
+        data.update(decoded)
+        state_msg = msg
+        state_pinned = msg.pinned
+        save_local()
+        for stale in candidates:
+            if stale.id != msg.id:
+                try:
+                    await stale.delete()
                 except discord.HTTPException:
-                    continue
+                    pass
+        return True
     return False
 
 
@@ -396,7 +450,11 @@ async def on_ready():
     if _started:
         return
     _started = True
-    restored = await restore_state()
+    try:
+        restored = await restore_state()
+    except Exception as exc:  # never let a restore failure kill notifications
+        restored = False
+        print(f"State restore crashed: {exc!r}")
     print(f"State restored from Discord: {restored}")
     spawn_watcher.start()
 
@@ -462,6 +520,14 @@ async def spawn_watcher():
             print(f"Failed to send spawn message for {boss}: {exc}")
     if changed:
         await persist()
+
+
+@spawn_watcher.error
+async def spawn_watcher_error(exc: BaseException) -> None:
+    # An unhandled exception stops a tasks.loop for good — restart it so one
+    # bad tick can't silently end all future notifications.
+    print(f"spawn_watcher crashed: {exc!r}; restarting")
+    spawn_watcher.restart()
 
 
 @bot.command(name="setchannel")
