@@ -47,6 +47,11 @@ class Supervisor:
         self._procs: dict[str, subprocess.Popen] = {}
         self._restart_delay = restart_delay
         self._stopping = False
+        # name -> monotonic time it becomes eligible for relaunch. A dead
+        # child lives here (not in self._procs) while its restart delay
+        # elapses, so waiting it out never blocks tick() from noticing a
+        # sibling die in the meantime.
+        self._due_at: dict[str, float] = {}
 
     # -- inspection -------------------------------------------------------
 
@@ -69,23 +74,32 @@ class Supervisor:
             self._launch(name)
 
     def tick(self) -> list[str]:
-        """Check every child once; relaunch the ones that crashed.
+        """Check every child once; relaunch the ones that are due.
+
+        Never blocks: a crashed child's restart delay only postpones that
+        child's own relaunch by recording when it becomes due, instead of
+        sleeping inline. Sleeping here would stall detection of everyone
+        else for up to restart_delay seconds -- including a still-healthy
+        sibling like the timer -- which defeats the point of running them
+        as independent processes.
 
         Returns the names restarted, so callers and tests can see what
         happened without parsing logs.
         """
-        restarted = []
+        now = time.monotonic()
+
         for name, proc in list(self._procs.items()):
             code = proc.poll()
             if code is None:
                 continue
 
+            del self._procs[name]
             if not should_restart(code):
                 print(
                     f"[supervisor] {name} exited with {code}; leaving it stopped",
                     flush=True,
                 )
-                del self._procs[name]
+                self._due_at.pop(name, None)
                 continue
 
             print(
@@ -93,10 +107,14 @@ class Supervisor:
                 f"{self._restart_delay}s",
                 flush=True,
             )
-            if self._restart_delay:
-                time.sleep(self._restart_delay)
-            self._launch(name)
-            restarted.append(name)
+            self._due_at[name] = now + self._restart_delay
+
+        restarted = []
+        for name, due in list(self._due_at.items()):
+            if now >= due:
+                del self._due_at[name]
+                self._launch(name)
+                restarted.append(name)
         return restarted
 
     def stop_all(self, timeout: float = 10.0) -> None:
@@ -114,11 +132,25 @@ class Supervisor:
             except subprocess.TimeoutExpired:
                 proc.kill()
         self._procs.clear()
+        self._due_at.clear()
 
     def run(self) -> None:
         """Start everything and supervise until told to stop."""
 
         def handle_signal(signum, _frame):
+            if self._stopping:
+                # A second SIGTERM/SIGINT while shutdown is already under
+                # way -- orchestrators (Render included) escalate like
+                # this. stop_all() may be mid-flight, blocked waiting on a
+                # child; re-entering it here would mutate self._procs out
+                # from under its own iteration. Ignore and let the first
+                # call finish.
+                print(
+                    f"[supervisor] received signal {signum} while already "
+                    "stopping; ignoring",
+                    flush=True,
+                )
+                return
             print(f"[supervisor] received signal {signum}", flush=True)
             self.stop_all()
             raise SystemExit(0)
