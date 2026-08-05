@@ -69,19 +69,19 @@ def _pid_alive(pid):
     return True
 
 
-def _run_harness(child_name, child_argv):
+def _run_harness(child_name, child_argv, restart_delay=0):
     """Spawn `supervisor.py`'s real Supervisor.run() as its own OS process.
 
-    Used to test the SIGTERM/SIGINT wiring for real: sending the harness
-    process an actual signal, the same way Render (or any orchestrator)
-    would, rather than calling the handler function directly in-process --
-    which would miss exactly the kind of bug (an orphaned child) this is
-    meant to catch.
+    Used to test behaviour of run() for real -- signal handling, the
+    poll/relaunch loop -- against a genuine subprocess rather than calling
+    private pieces (like the signal handler) directly in-process, which
+    would miss bugs that only show up in run()'s own control flow (an
+    orphaned child, or the supervisor exiting early).
     """
     code = (
         "from supervisor import ChildSpec, Supervisor\n"
         f"Supervisor([ChildSpec({child_name!r}, {child_argv!r})], "
-        "restart_delay=0).run()\n"
+        f"restart_delay={restart_delay!r}).run()\n"
     )
     return subprocess.Popen(
         [sys.executable, "-c", code],
@@ -294,3 +294,52 @@ def test_a_second_signal_during_shutdown_does_not_crash():
         if harness.poll() is None:
             harness.kill()
             harness.wait(timeout=2)
+
+
+def test_run_does_not_exit_while_a_restart_is_pending():
+    """A crash isn't "no children left" -- it's "one child due back soon".
+
+    run()'s loop-exit check used to be `if not self._procs`, written when
+    a restart-pending child stayed in self._procs for the whole blocking
+    sleep. Once tick() stopped blocking (moving a pending child out of
+    self._procs and into self._due_at instead, see the earlier
+    restart-delay fix), a lone child crashing with a non-zero
+    restart_delay emptied self._procs for the whole delay window, and the
+    old check would exit the supervisor mid-wait -- abandoning the very
+    restart it had just scheduled. This is exactly what would happen in
+    production the moment attendance_bot.py exits 78 (removed
+    permanently, per design) and the timer then crashes once: a single
+    timer crash would have silently taken the whole supervisor down.
+
+    Must drive the real run() loop (not just tick()) -- the bug lives in
+    run()'s exit condition, not in tick() itself.
+    """
+    restart_delay = 3.0
+    harness = _run_harness("flaky", EXIT_CRASH, restart_delay=restart_delay)
+    try:
+        # The lone child crashes almost immediately and is due back in
+        # `restart_delay` seconds. For that whole window self._procs is
+        # empty but self._due_at is not -- exactly the gap the old exit
+        # check missed. The supervisor must still be alive throughout it.
+        gave_up_early = _wait_until(
+            lambda: harness.poll() is not None, timeout=restart_delay + 1.0
+        )
+        assert not gave_up_early, "supervisor exited during the restart delay"
+
+        # ...and the restart isn't just deferred, it actually happens.
+        assert _wait_until(
+            lambda: len(_child_pids(harness.pid)) == 1,
+            timeout=restart_delay + 3.0,
+        )
+    finally:
+        if harness.poll() is None:
+            harness.terminate()
+            try:
+                harness.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                harness.kill()
+                harness.wait(timeout=2)
+
+    stdout = harness.stdout.read()
+    assert "no children left; exiting" not in stdout, stdout
+    assert stdout.count("[supervisor] starting flaky") >= 2, stdout

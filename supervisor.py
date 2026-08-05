@@ -162,7 +162,12 @@ class Supervisor:
         while not self._stopping:
             time.sleep(POLL_INTERVAL)
             self.tick()
-            if not self._procs:
+            # A child scheduled to restart lives in self._due_at, not
+            # self._procs, for the length of its restart delay -- it must
+            # count as "still here" or a crash right before a long delay
+            # would empty self._procs and exit the supervisor mid-wait,
+            # abandoning the very restart it just scheduled.
+            if not self._procs and not self._due_at:
                 print("[supervisor] no children left; exiting", flush=True)
                 return
 
