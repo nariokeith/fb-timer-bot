@@ -205,6 +205,55 @@ def test_refuses_an_infinite_cell_as_a_structure_error_not_a_crash():
         plan_point_writes(ws, ["ARCILynN"], 3, 1)
 
 
+def test_refuses_a_decimal_cell_instead_of_truncating_it():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", "3.7"],
+    ])
+    with pytest.raises(SheetStructureError, match="C2") as excinfo:
+        plan_point_writes(ws, ["ARCILynN"], 3, 3)
+    message = str(excinfo.value)
+    assert "C2" in message
+    assert "3.7" in message
+    assert "whole number" in message
+
+
+def test_accepts_a_whole_number_rendered_with_a_trailing_point_zero():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", "5.0"],
+    ])
+    assert plan_point_writes(ws, ["ARCILynN"], 3, 1) == [
+        {"range": "C2", "values": [[6]]}
+    ]
+
+
+def test_a_negative_whole_number_cell_still_parses_normally():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", "-2"],
+    ])
+    assert plan_point_writes(ws, ["ARCILynN"], 3, 1) == [
+        {"range": "C2", "values": [[-1]]}
+    ]
+
+
+def test_a_plain_whole_number_cell_still_parses_normally():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", "5"],
+    ])
+    assert plan_point_writes(ws, ["ARCILynN"], 3, 1) == [
+        {"range": "C2", "values": [[6]]}
+    ]
+
+
+def test_blank_cell_still_yields_zero_after_the_whole_number_check(ws):
+    assert plan_point_writes(ws, ["ARCILynN"], 3, 3) == [
+        {"range": "C2", "values": [[3]]}
+    ]
+
+
 def test_duplicate_player_rows_abort_naming_both_rows():
     ws = FakeWorksheet([
         ["Player Name", "Points", "EGO"],

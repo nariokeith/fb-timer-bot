@@ -6,6 +6,7 @@ matches the boss. Reordering columns therefore breaks nothing.
 """
 
 import json
+import math
 
 import gspread
 import gspread.utils
@@ -99,12 +100,18 @@ def find_column(worksheet, boss_name: str) -> int:
 def _cell_number(row: list[str], column_index: int, cell_address: str) -> int:
     """Current value of a cell, treating blanks as 0.
 
-    Anything else that isn't a plain number is refused rather than
-    coerced: the guild owner confirmed boss columns only ever hold a
+    Anything else that isn't a plain whole number is refused rather than
+    coerced: the guild owner confirmed boss columns only ever hold a whole
     number or a blank, so any other content (a note, an "x" marker, a
-    formula, an out-of-range value like "inf") means the sheet's
-    structure isn't what this code expects, and silently overwriting it
-    with 0 + points would destroy it.
+    formula, an out-of-range value like "inf", or a genuine fraction like
+    "3.7") means the sheet's structure isn't what this code expects, and
+    silently overwriting it with 0 + points would destroy it.
+
+    "5.0" is accepted and treated as 5: Sheets sometimes renders a whole
+    number with a trailing ".0", and that is still a whole number, not
+    anomalous data -- refusing it would block a legitimate value for no
+    safety benefit. A negative whole number (e.g. "-2", which shows up
+    after an undo) parses normally too.
     """
     if column_index - 1 >= len(row):
         return 0
@@ -112,12 +119,23 @@ def _cell_number(row: list[str], column_index: int, cell_address: str) -> int:
     if not raw:
         return 0
     try:
-        return int(float(raw))
+        value = float(raw)
     except (ValueError, OverflowError):
         raise SheetStructureError(
             f"Cell {cell_address} holds {raw!r}, which is not a number; "
             "refusing to overwrite it"
         )
+    if math.isinf(value) or math.isnan(value):
+        raise SheetStructureError(
+            f"Cell {cell_address} holds {raw!r}, which is not a number; "
+            "refusing to overwrite it"
+        )
+    if not value.is_integer():
+        raise SheetStructureError(
+            f"Cell {cell_address} holds {raw!r}, which is not a whole "
+            "number; refusing to overwrite it"
+        )
+    return int(value)
 
 
 def _rows_by_player(grid: list[list[str]], worksheet_title: str) -> dict[str, int]:
