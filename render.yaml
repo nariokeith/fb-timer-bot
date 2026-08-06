@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python -u bot.py
+    startCommand: python -u supervisor.py
     envVars:
       - key: DISCORD_TOKEN
         sync: false
@@ -12,3 +12,11 @@ services:
         value: Asia/Manila
       - key: PYTHON_VERSION
         value: 3.13.4
+      - key: ATTENDANCE_DISCORD_TOKEN
+        sync: false
+      - key: SHEET_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
