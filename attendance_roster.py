@@ -4,6 +4,11 @@ The bot never invents a player row. Every raw string either resolves to a
 name already in column A, or it is reported as unmatched for a human to
 sort out. That constraint is what lets a free OCR engine be good enough --
 this is matching against ~35 known strings, not open transcription.
+
+In-game names sometimes carry suffixes (like "KobePH") that the sheet does
+not. The ALIASES table maps these in-game variants to exact sheet rows, and
+is maintained by hand as the guild's roster changes. An alias resolves only
+if its target row actually exists in the sheet.
 """
 
 import unicodedata
@@ -18,6 +23,12 @@ MATCH_THRESHOLD = 0.85
 # "Kobe0" against "Kobe01" and "Kobe02" (both 0.909) would award points
 # to whichever happened to sort first.
 AMBIGUITY_MARGIN = 0.05
+
+# In-game names that differ from the sheet's row for the same person.
+# Keys are what the OCR reads; values are the exact sheet row.
+ALIASES = {
+    "KobePH": "Kobe",
+}
 
 
 @dataclass(frozen=True)
@@ -67,6 +78,11 @@ def match_names(
     player, so a name the model reads twice never earns double points.
     """
     index = {normalize(p): p for p in known_players if p.strip()}
+    alias_index = {
+        normalize(alias_raw): target
+        for alias_raw, target in ALIASES.items()
+        if normalize(target) in index
+    }
 
     matched: list[Match] = []
     unmatched: list[str] = []
@@ -79,6 +95,8 @@ def match_names(
 
         if target in index:
             player, score = index[target], 1.0
+        elif target in alias_index:
+            player, score = index[normalize(alias_index[target])], 1.0
         else:
             candidate = _best_candidate(target, index)
             if candidate is None:

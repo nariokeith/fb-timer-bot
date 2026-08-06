@@ -109,3 +109,47 @@ def test_match_carries_the_raw_text_that_produced_it():
 
 def test_normalize_collapses_case_and_internal_whitespace():
     assert normalize("  Chinchong   NI  mumu ") == "chinchong ni mumu"
+
+
+def test_alias_resolves_with_score_1_0():
+    # KobePH is an alias for Kobe; should resolve with score 1.0.
+    matched, unmatched = match_names(["KobePH"], KNOWN)
+    assert _players(matched) == ["Kobe"]
+    assert matched[0].score == 1.0
+    assert unmatched == []
+
+
+def test_alias_matching_ignores_case_and_whitespace():
+    # Aliases are matched on normalized form.
+    matched, unmatched = match_names(["  kobeph  ", "KOBEPH"], KNOWN)
+    assert _players(matched) == ["Kobe"]
+    assert len(matched) == 1  # Both map to the same player, so dedup.
+    assert unmatched == []
+
+
+def test_alias_with_missing_target_is_unmatched():
+    # If the sheet has no "Kobe" row, KobePH must not invent one.
+    known_without_kobe = [
+        "ARCILynN", "xSigarilyas", "Talong", "XxLINGAxX", "fLuffy",
+        "ToastedBread", "wileKAMOTE卐", "BudoySul (Riuz)", "chinchong ni Mumu",
+    ]
+    matched, unmatched = match_names(["KobePH"], known_without_kobe)
+    assert matched == []
+    assert unmatched == ["KobePH"]
+
+
+def test_exact_match_wins_over_alias():
+    # If a sheet row is literally named "KobePH", it wins over the alias.
+    known_with_kobeph = KNOWN + ["KobePH"]
+    matched, unmatched = match_names(["KobePH"], known_with_kobeph)
+    assert _players(matched) == ["KobePH"]
+    assert matched[0].score == 1.0
+    assert unmatched == []
+
+
+def test_dedup_across_alias_and_exact_match():
+    # Reading both "Kobe" and "KobePH" off one screenshot produces one Match.
+    matched, unmatched = match_names(["Kobe", "KobePH"], KNOWN)
+    assert len(matched) == 1
+    assert matched[0].player == "Kobe"
+    assert unmatched == []
