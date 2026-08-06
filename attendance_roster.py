@@ -33,6 +33,7 @@ AMBIGUITY_MARGIN = 0.05
 ALIASES = {
     "KobePH": "Kobe",
     "面白い": "chinchong ni Mumu",
+    "ツRyuuツ": "Ryuu",
 }
 
 
