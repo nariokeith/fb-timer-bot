@@ -1,4 +1,6 @@
-from attendance_roster import Match, match_names, normalize
+import pytest
+
+from attendance_roster import DuplicatePlayerName, Match, match_names, normalize
 
 KNOWN = [
     "ARCILynN", "xSigarilyas", "Talong", "XxLINGAxX", "fLuffy", "Kobe",
@@ -161,6 +163,29 @@ def test_japanese_alias_resolves():
     matched, unmatched = match_names(["面白い"], KNOWN)
     assert _players(matched) == ["chinchong ni Mumu"]
     assert matched[0].score == 1.0
+    assert unmatched == []
+
+
+def test_case_variant_duplicate_players_are_refused_naming_both():
+    # attendance_sheet._rows_by_player's own duplicate check would NOT
+    # catch this: "Kobe" != "kobe" as exact strings. Only match_names'
+    # normalized index collides, and it must refuse rather than silently
+    # let the second overwrite the first (which would make one of the two
+    # players permanently unmatchable).
+    known_with_case_variants = KNOWN + ["kobe"]
+    with pytest.raises(DuplicatePlayerName) as excinfo:
+        match_names(["Kobe"], known_with_case_variants)
+    message = str(excinfo.value)
+    assert "Kobe" in message
+    assert "kobe" in message
+
+
+def test_identical_duplicate_player_strings_do_not_raise():
+    # The exact same name appearing twice (e.g. a sheet read glitch) is
+    # not a collision between two DIFFERENT players -- nothing is lost by
+    # matching it, so this must not be refused.
+    matched, unmatched = match_names(["Kobe"], ["Kobe", "Kobe"])
+    assert _players(matched) == ["Kobe"]
     assert unmatched == []
 
 

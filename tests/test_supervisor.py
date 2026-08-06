@@ -7,7 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from supervisor import EXIT_NOT_CONFIGURED, ChildSpec, Supervisor, should_restart
+from supervisor import (
+    CHILDREN,
+    EXIT_NOT_CONFIGURED,
+    NO_RESTART_CODES,
+    ChildSpec,
+    Supervisor,
+    should_restart,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -20,6 +27,11 @@ SLEEP_FOREVER = _python("import time; time.sleep(300)")
 EXIT_CRASH = _python("import sys; sys.exit(1)")
 EXIT_CLEAN = _python("import sys; sys.exit(0)")
 EXIT_UNCONFIGURED = _python(f"import sys; sys.exit({EXIT_NOT_CONFIGURED})")
+
+# Stays up briefly (long enough to clear a short restart_reset_after in a
+# test) before crashing, so backoff-reset can be exercised without waiting
+# out the production-sized RESTART_RESET_AFTER.
+CRASH_AFTER_BRIEF_UPTIME = _python("import sys, time; time.sleep(0.5); sys.exit(1)")
 
 # A child that survives SIGTERM for a little while instead of dying
 # instantly -- widens the window in which a *second* signal to the
@@ -347,3 +359,144 @@ def test_run_does_not_exit_while_a_restart_is_pending():
     stdout = harness.stdout.read()
     assert "no children left; exiting" not in stdout, stdout
     assert stdout.count("[supervisor] starting flaky") >= 2, stdout
+
+
+# -- per-ChildSpec restart policy (bot.py exits 0 on a normal return, so
+#    the timer must restart on exit 0 even though attendance must not) ---
+
+
+def test_children_have_the_correct_restart_policy():
+    """CHILDREN is what actually ships; pin its policy directly."""
+    specs = {c.name: c for c in CHILDREN}
+    assert specs["timer"].no_restart_codes == frozenset()
+    assert specs["attendance"].no_restart_codes == NO_RESTART_CODES
+
+
+def test_a_child_with_the_timers_policy_is_restarted_after_exit_0(stopper):
+    """bot.py exits 0 whenever bot.run() returns normally, not only when
+    deliberately stopped -- so a timer-shaped ChildSpec (no_restart_codes
+    empty) must relaunch on exit 0, unlike the default policy."""
+    sup = Supervisor(
+        [ChildSpec("timer", EXIT_CLEAN, no_restart_codes=frozenset())],
+        restart_delay=0,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+    assert sup.tick() == ["timer"]
+
+
+def test_a_child_with_the_default_policy_is_not_restarted_after_exit_0(stopper):
+    sup = Supervisor([ChildSpec("attendance", EXIT_CLEAN)], restart_delay=0)
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+    assert sup.tick() == []
+    assert sup.running_names() == []
+
+
+def test_78_still_stops_a_child_under_the_default_policy(stopper):
+    sup = Supervisor([ChildSpec("attendance", EXIT_UNCONFIGURED)], restart_delay=0)
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+    assert sup.tick() == []
+    assert sup.running_names() == []
+
+
+# -- restart backoff -------------------------------------------------------
+
+
+def test_restart_delay_doubles_on_consecutive_crashes(stopper):
+    sup = Supervisor(
+        [ChildSpec("flaky", EXIT_CRASH)],
+        restart_delay=1.0,
+        max_restart_delay=100.0,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    assert sup.tick() == []  # not due yet, but now scheduled
+    first_due_in = sup._due_at["flaky"] - time.monotonic()
+    assert 0.5 < first_due_in <= 1.0
+
+    # Force it due now instead of sleeping out the delay, then let it
+    # crash again immediately (EXIT_CRASH always crashes).
+    sup._due_at["flaky"] = time.monotonic()
+    assert sup.tick() == ["flaky"]
+    _settle()
+
+    assert sup.tick() == []
+    second_due_in = sup._due_at["flaky"] - time.monotonic()
+    assert 1.5 < second_due_in <= 2.0, "delay did not double from 1.0 to 2.0"
+
+
+def test_restart_delay_is_capped(stopper):
+    sup = Supervisor(
+        [ChildSpec("flaky", EXIT_CRASH)],
+        restart_delay=1.0,
+        max_restart_delay=2.0,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    # Drive several consecutive crash/restart cycles; the delay would
+    # otherwise keep doubling past the cap (1 -> 2 -> 4 -> 8 ...).
+    for _ in range(4):
+        sup.tick()
+        sup._due_at["flaky"] = time.monotonic()
+        sup.tick()
+        _settle()
+
+    sup.tick()
+    due_in = sup._due_at["flaky"] - time.monotonic()
+    assert due_in <= 2.0 + 0.1, "restart delay exceeded the configured cap"
+
+
+def test_restart_delay_resets_after_the_child_stays_up(stopper):
+    """A crash right after a healthy run must not inherit a stale backoff."""
+    sup = Supervisor(
+        [ChildSpec("flaky", CRASH_AFTER_BRIEF_UPTIME)],
+        restart_delay=0.3,
+        restart_reset_after=0.4,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    time.sleep(0.8)  # let the first crash (at ~0.5s uptime) land
+
+    assert sup.tick() == []
+    first_due_in = sup._due_at["flaky"] - time.monotonic()
+    assert first_due_in <= 0.3 + 0.1
+
+    # Relaunch it now and let it run past restart_reset_after (0.4s)
+    # before it crashes again (~0.5s uptime) -- backoff should reset to
+    # the base delay rather than doubling to ~0.6s.
+    sup._due_at["flaky"] = time.monotonic()
+    sup.tick()
+    time.sleep(0.8)
+
+    sup.tick()
+    second_due_in = sup._due_at["flaky"] - time.monotonic()
+    assert second_due_in <= 0.3 + 0.1, "backoff did not reset after a healthy run"
+
+
+def test_crash_looping_is_logged(stopper, capsys):
+    sup = Supervisor(
+        [ChildSpec("flaky", EXIT_CRASH)],
+        restart_delay=0.1,
+        max_restart_delay=0.2,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    for _ in range(4):
+        sup.tick()
+        sup._due_at["flaky"] = time.monotonic()
+        sup.tick()
+        _settle()
+
+    out = capsys.readouterr().out
+    assert "crash-looping" in out, out

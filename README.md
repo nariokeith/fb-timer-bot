@@ -71,6 +71,14 @@ hours are shared across a workspace, so two services running 24/7 would
 exhaust them around the 16th of each month — and Render then suspends
 *every* free service, timer included.
 
+Be honest about what "separate" buys here: the two bots are isolated as
+**processes** (crash, exception, import error, blocked event loop), not
+as **resources**. Both run inside the same 512 MB / 0.1 CPU instance, so
+an attendance-side memory leak or runaway process can still starve or OOM
+the whole instance and take the timer down with it. `supervisor.py`'s
+restart backoff limits how often a broken child can chew CPU, but it
+cannot give the timer its own memory budget.
+
 **This makes the feature safe to deploy before its credentials exist.**
 If `ATTENDANCE_DISCORD_TOKEN`, `SHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_JSON`
 or `GEMINI_API_KEY` is missing, `attendance_bot.py` exits immediately
@@ -107,9 +115,33 @@ them:
 - `_BotConfig` holds the target tab and officer role, so they survive
   Render restarts.
 - `_BotLog` records one row per confirmed submission; it's what makes
-  `!undoattendance` and duplicate-screenshot detection work.
+  `!undoattendance` and duplicate-screenshot detection work. Duplicate
+  detection is keyed on a hash of the screenshot's own image bytes
+  (`image_sha256`), not on the Discord attachment id — Discord mints a
+  new id on every upload, so id-based detection would never catch a
+  genuine re-post of the same picture.
+
+  If `_BotLog`'s column layout (`LOG_HEADER` in `attendance_sheet.py`)
+  is ever changed in code, the bot will refuse to read or write an
+  **existing** `_BotLog` tab whose row 1 doesn't match — on purpose,
+  because silently re-zipping old rows against a new column order would
+  misattribute fields and make undo subtract the wrong points from the
+  wrong people. There is no automatic migration: fix row 1 by hand (or
+  delete the tab and let the bot recreate it, losing history) after a
+  `LOG_HEADER` change.
 
 ### Testing locally
+
+⚠️ **Stop the Render instance first** (or point this local run at a
+different `SHEET_ID`, e.g. a scratch copy of the sheet). `attendance_sheet.py`'s
+locking (`asyncio.Lock` plus a read-then-write pattern) is per-**process**,
+not per-sheet: a local run and the Render instance are two independent
+processes with two independent locks, and neither can see the other's
+lock. Both would happily read the same cell's current value at once and
+both write their own answer — one attendance entry silently vanishes,
+with no error from either side. This is the same hazard `attendance_bot.py`'s
+own `_SHEET_LOCK` protects against *within* one process; it does nothing
+across two.
 
 Because the attendance bot is a **separate Discord application with its
 own token**, it can be run standalone with the production timer completely

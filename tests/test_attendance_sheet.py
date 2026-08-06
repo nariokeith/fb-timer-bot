@@ -152,6 +152,13 @@ def test_installed_gspread_actually_has_the_api_the_module_calls():
         "open_spreadsheet() calls gspread.authorize(creds).open_by_key(...)"
     )
 
+    assert hasattr(gspread.Client, "set_timeout"), (
+        f"gspread=={version} Client has no `set_timeout` method, but "
+        "open_spreadsheet() calls client.set_timeout(...) to bound every "
+        "request so a black-holed connection cannot wedge the sheet lock "
+        "forever"
+    )
+
     from google.oauth2.service_account import Credentials
 
     google_auth_version = None
@@ -389,8 +396,8 @@ from attendance_sheet import (
     LOG_HEADER,
     LOG_TAB,
     append_log_entry,
-    attachment_already_logged,
     get_or_create_tab,
+    image_already_logged,
     last_unreversed_entry,
     mark_entry_reversed,
     read_config,
@@ -407,6 +414,7 @@ def _entry(**overrides):
         "points_each": 3,
         "message_id": "111",
         "attachment_id": "aaa",
+        "image_sha256": "hash-aaa",
         "confirmed_by": "officer#1",
         "players": "Kobe, Talong",
         "reversed": "",
@@ -457,17 +465,28 @@ def test_log_entry_is_appended_in_header_order():
 
 def test_detects_a_screenshot_that_was_already_logged():
     sh = FakeSpreadsheet()
-    append_log_entry(sh, _entry(attachment_id="aaa"))
-    assert attachment_already_logged(sh, "aaa") is True
-    assert attachment_already_logged(sh, "bbb") is False
+    append_log_entry(sh, _entry(image_sha256="hash-aaa"))
+    assert image_already_logged(sh, "hash-aaa") is True
+    assert image_already_logged(sh, "hash-bbb") is False
+
+
+def test_a_new_attachment_id_for_the_same_image_still_counts_as_a_duplicate():
+    """The actual defect this module exists to fix: Discord mints a new
+    attachment_id on every upload, so a genuine repost of the same picture
+    must still be caught by its (unchanged) image hash even though its
+    attachment_id is different every time.
+    """
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(attachment_id="first-upload", image_sha256="hash-aaa"))
+    assert image_already_logged(sh, "hash-aaa") is True
 
 
 def test_reversed_entries_do_not_count_as_already_logged():
     sh = FakeSpreadsheet()
-    append_log_entry(sh, _entry(attachment_id="aaa"))
+    append_log_entry(sh, _entry(attachment_id="aaa", image_sha256="hash-aaa"))
     row_number, entry = last_unreversed_entry(sh)
     mark_entry_reversed(sh, row_number, entry["attachment_id"])
-    assert attachment_already_logged(sh, "aaa") is False
+    assert image_already_logged(sh, "hash-aaa") is False
 
 
 def test_last_unreversed_entry_returns_the_most_recent():
@@ -537,6 +556,7 @@ def test_a_short_log_row_from_an_older_version_pads_without_shifting_fields():
     assert entry["points_each"] == "3"
     assert entry["message_id"] == "111"
     assert entry["attachment_id"] == ""
+    assert entry["image_sha256"] == ""
     assert entry["confirmed_by"] == ""
     assert entry["players"] == ""
     assert entry["reversed"] == ""
@@ -580,7 +600,7 @@ def test_a_log_tab_whose_header_no_longer_matches_LOG_HEADER_is_refused():
         last_unreversed_entry(sh)
 
     with pytest.raises(SheetStructureError, match="row 1"):
-        attachment_already_logged(sh, "aaa")
+        image_already_logged(sh, "aaa")
 
     with pytest.raises(SheetStructureError, match="row 1"):
         append_log_entry(sh, _entry())
@@ -715,21 +735,21 @@ def test_get_or_create_tab_raises_sheet_structure_error_when_the_race_never_reso
 
 def test_reversed_yes_is_reversed():
     sh = FakeSpreadsheet()
-    append_log_entry(sh, _entry(attachment_id="aaa"))
+    append_log_entry(sh, _entry(attachment_id="aaa", image_sha256="hash-aaa"))
     row_number, entry = last_unreversed_entry(sh)
     mark_entry_reversed(sh, row_number, entry["attachment_id"])
-    assert attachment_already_logged(sh, "aaa") is False
+    assert image_already_logged(sh, "hash-aaa") is False
 
 
 def test_reversed_blank_is_not_reversed():
     sh = FakeSpreadsheet()
-    append_log_entry(sh, _entry(attachment_id="aaa", reversed=""))
-    assert attachment_already_logged(sh, "aaa") is True
+    append_log_entry(sh, _entry(image_sha256="hash-aaa", reversed=""))
+    assert image_already_logged(sh, "hash-aaa") is True
 
 
 def test_reversed_no_is_refused_rather_than_treated_as_falsy():
     """A human typing 'no' in the reversed column must not silently make
-    attachment_already_logged fail open and let a re-posted screenshot be
+    image_already_logged fail open and let a re-posted screenshot be
     processed (and paid) a second time.
     """
     row = [
@@ -739,13 +759,14 @@ def test_reversed_no_is_refused_rather_than_treated_as_falsy():
         "3",
         "111",
         "aaa",
+        "hash-aaa",
         "officer#1",
         "Kobe, Talong",
         "no",
     ]
     sh = FakeSpreadsheet({LOG_TAB: FakeWorksheet([LOG_HEADER, row], title=LOG_TAB)})
     with pytest.raises(SheetStructureError, match="no"):
-        attachment_already_logged(sh, "aaa")
+        image_already_logged(sh, "hash-aaa")
     with pytest.raises(SheetStructureError, match="no"):
         last_unreversed_entry(sh)
 
@@ -755,7 +776,7 @@ def test_a_cleared_row_of_all_blank_cells_is_skipped_not_returned_as_an_entry():
     a row must not become an entry with every field blank -- if it were
     last, last_unreversed_entry would hand it back as "the thing to undo".
     """
-    cleared_row = ["", "", "", "", "", "", "", "", ""]
+    cleared_row = ["", "", "", "", "", "", "", "", "", ""]
     sh = FakeSpreadsheet()
     append_log_entry(sh, _entry(boss="Lucus", attachment_id="aaa"))
     ws = sh.worksheet(LOG_TAB)

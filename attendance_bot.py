@@ -10,6 +10,8 @@ so the timer runs normally on a deploy that predates these secrets.
 """
 
 import asyncio
+import hashlib
+import json
 import os
 import sys
 from datetime import datetime
@@ -20,13 +22,13 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from attendance_bosses import BossAmbiguous, BossNotFound, boss_points, resolve_boss
-from attendance_roster import match_names
+from attendance_roster import DuplicatePlayerName, match_names
 from attendance_sheet import (
     SheetStructureError,
     append_log_entry,
     apply_writes,
-    attachment_already_logged,
     find_column,
+    image_already_logged,
     last_unreversed_entry,
     mark_entry_reversed,
     open_spreadsheet,
@@ -190,11 +192,12 @@ class PointsRemovedButNotMarked(RuntimeError):
 
     @property
     def description(self) -> str:
-        players = [
-            part.strip()
-            for part in str(self.entry.get("players", "")).split(",")
-            if part.strip()
-        ]
+        try:
+            players = _parse_players(str(self.entry.get("players", "[]")))
+        except SheetStructureError:
+            # Display only: even if the players cell were somehow
+            # unparseable, the do-not-re-run warning must still render.
+            players = [str(self.entry.get("players", ""))]
         return (
             f"**{self.entry['points_each']}** points for "
             f"**{_clip(self.entry['boss'], NAME_LIMIT)}** have **already** "
@@ -260,8 +263,8 @@ def _spreadsheet():
     return open_spreadsheet(SHEET_ID, SERVICE_ACCOUNT_JSON)
 
 
-def _officer_role_id() -> int | None:
-    raw = read_config(_spreadsheet()).get("officer_role_id", "")
+def _officer_role_id(spreadsheet) -> int | None:
+    raw = read_config(spreadsheet).get("officer_role_id", "")
     return int(raw) if raw.isdigit() else None
 
 
@@ -271,13 +274,44 @@ def _is_officer(member, role_id: int | None) -> bool:
     return any(role.id == role_id for role in getattr(member, "roles", []))
 
 
-def _load_context(boss_query: str, attachment_id: str) -> dict:
-    """Everything the preview needs, in one trip to Sheets.
+def _parse_players(raw: str) -> list[str]:
+    """The player list from a log entry's `players` cell.
+
+    Stored as JSON (see attendance_cmd) rather than comma-joined-and-split:
+    a player name that itself contains a comma would otherwise round-trip
+    into fragments, and !undoattendance would then either refuse forever
+    (wrong player count vs. the sheet) or silently subtract points for
+    fragments instead of the real name.
+    """
+    try:
+        players = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        raise SheetStructureError(
+            f"_BotLog row 'players' cell is not valid JSON: {raw!r}"
+        ) from None
+    if not isinstance(players, list) or not all(isinstance(p, str) for p in players):
+        raise SheetStructureError(
+            f"_BotLog row 'players' cell is not a JSON list of strings: {raw!r}"
+        )
+    return players
+
+
+def _load_context(spreadsheet, boss_query: str) -> dict:
+    """Everything the preview needs except the duplicate flag.
+
+    The duplicate flag needs the image's hash, which is only known once
+    the attachment has been downloaded -- see image_already_logged, called
+    separately by the caller once it has the bytes.
 
     Read-only, so it does not need _SHEET_LOCK: nothing it returns is
-    written back without a fresh read inside the locked commit.
+    written back without a fresh read inside the locked commit. Takes an
+    already-authorised `spreadsheet` (the caller fetches one per command
+    and reuses it here and for the officer check, instead of each helper
+    re-authorising its own) and reads the target tab's grid exactly once
+    for the header lookup, the boss-column check, and the player list --
+    instead of three separate get_all_values() calls against the same
+    sheet.
     """
-    spreadsheet = _spreadsheet()
     config = read_config(spreadsheet)
 
     tab = config.get("target_tab")
@@ -285,20 +319,20 @@ def _load_context(boss_query: str, attachment_id: str) -> dict:
         raise SheetStructureError("No target tab set. Run !setweek <tab name> first.")
 
     worksheet = spreadsheet.worksheet(tab)
-    boss = resolve_boss(read_headers(worksheet), boss_query)
+    grid = worksheet.get_all_values()
+    boss = resolve_boss(read_headers(worksheet, grid), boss_query)
 
     # find_column's result is deliberately discarded: calling it here only
     # fails fast, before a Gemini request, if the boss has no column or
     # has two. The index itself must not be carried across the preview --
     # see _commit.
-    find_column(worksheet, boss)
+    find_column(worksheet, boss, grid)
 
     return {
         "tab": tab,
         "boss": boss,
         "points": boss_points(boss),
-        "players": read_players(worksheet),
-        "duplicate": attachment_already_logged(spreadsheet, attachment_id),
+        "players": read_players(worksheet, grid),
     }
 
 
@@ -325,20 +359,27 @@ def _commit(
     confirmed it during the wait and this would double-pay, so it aborts.
     If it WAS flagged, the officer saw the warning and chose to proceed --
     a legitimate re-log, e.g. after an undo.
+
+    Always fetches its own spreadsheet handle and its own fresh grid, run
+    inside the lock -- never a handle or grid cached from before the
+    preview. The grid is still read only ONCE here (reused for both
+    find_column and plan_point_writes) rather than twice, but that read
+    itself happens right now, under the lock, same as before.
     """
     spreadsheet = _spreadsheet()
 
-    if not was_duplicate and attachment_already_logged(
-        spreadsheet, entry["attachment_id"]
-    ):
+    if not was_duplicate and image_already_logged(spreadsheet, entry["image_sha256"]):
         raise AlreadyLoggedDuringPreview(
             "This screenshot was logged by someone else while this preview "
             "was open. Nothing was written, to avoid paying twice."
         )
 
     worksheet = spreadsheet.worksheet(tab)
-    column = find_column(worksheet, boss)
-    apply_writes(worksheet, plan_point_writes(worksheet, players, column, points))
+    grid = worksheet.get_all_values()
+    column = find_column(worksheet, boss, grid)
+    apply_writes(
+        worksheet, plan_point_writes(worksheet, players, column, points, grid)
+    )
 
     # Past this line the points are in the sheet. Anything that fails now
     # must be reported as a partial write, never as "nothing was written".
@@ -362,14 +403,17 @@ def _reverse_last() -> dict | None:
         return None
 
     row_number, entry = found
-    players = [p.strip() for p in entry["players"].split(",") if p.strip()]
+    players = _parse_players(entry["players"])
     worksheet = spreadsheet.worksheet(entry["tab"])
+    grid = worksheet.get_all_values()
     # Resolved by name inside the lock, same reasoning as _commit.
-    column = find_column(worksheet, entry["boss"])
+    column = find_column(worksheet, entry["boss"], grid)
 
     apply_writes(
         worksheet,
-        plan_point_writes(worksheet, players, column, -int(entry["points_each"])),
+        plan_point_writes(
+            worksheet, players, column, -int(entry["points_each"]), grid
+        ),
     )
 
     # Past this line the points are gone from the sheet.
@@ -398,14 +442,29 @@ def _set_officer_role(role_id: str) -> None:
     write_config(_spreadsheet(), "officer_role_id", role_id)
 
 
+# A stuck gspread call has no timeout of its own by default (see
+# attendance_sheet.REQUEST_TIMEOUT, which now bounds each individual
+# request) but several such requests can still chain together inside one
+# _locked call. This is the backstop: if the whole locked section is still
+# running after LOCK_TIMEOUT, it is abandoned so _SHEET_LOCK is released
+# and the officer sees a clear refusal -- instead of every later command
+# hanging silently on "Working on it..." forever because the lock never
+# came free. 45s is comfortably above REQUEST_TIMEOUT (15s) so a single
+# slow-but-not-hung request has room to finish normally, while still being
+# short enough that the officer isn't left waiting indefinitely.
+LOCK_TIMEOUT = 45.0
+
+
 async def _locked(func, *args):
     """Run one blocking sheet mutation as a single serialised unit.
 
     The lock covers the whole read-plan-write section, not the individual
-    gspread calls, and is released the moment the work is done.
+    gspread calls, and is released the moment the work is done -- or the
+    moment LOCK_TIMEOUT elapses, whichever comes first.
     """
     async with _SHEET_LOCK:
-        return await asyncio.to_thread(func, *args)
+        async with asyncio.timeout(LOCK_TIMEOUT):
+            return await asyncio.to_thread(func, *args)
 
 
 # ---------------------------------------------------------------------------
@@ -425,10 +484,86 @@ async def _safe_reject(ctx, title: str, description: str):
         print(f"Could not report {title!r}: {exc!r}", file=sys.stderr, flush=True)
 
 
-async def _require_officer(ctx) -> int | None:
+async def _report_partial_failure(
+    ctx, working, title: str, description: str, footer: str | None = None
+):
+    """Render a partial-write warning through whatever channel still works.
+
+    PointsWrittenButNotLogged and PointsRemovedButNotMarked exist to carry
+    one instruction an officer must see: don't re-run this, it already
+    landed once and running it again pays (or subtracts) twice. Losing
+    that instruction to a failed Discord call -- a rate limit, `working`
+    having been deleted, the bot losing permission to edit or post in the
+    channel -- would silently produce exactly the outcome the exception
+    exists to prevent. So this never depends on a single call succeeding:
+
+    1. stderr, unconditionally, first. The one channel that cannot itself
+       fail to record the full detail.
+    2. `working.edit(...)`, if a preview message was given.
+    3. `ctx.send(embed=...)`, a fresh message in the same channel.
+    4. `ctx.send(...)` with plain text and no embed, in case the failure
+       is embed-specific rather than channel-specific.
+
+    Each step is attempted only if the one before it raised; the first
+    success ends it.
+    """
+    print(f"PARTIAL WRITE -- {title}: {description}", file=sys.stderr, flush=True)
+
+    embed = make_embed(title, description, footer=footer)
+
+    if working is not None:
+        try:
+            await working.edit(embed=embed)
+            return
+        except Exception as exc:
+            print(
+                f"working.edit failed while reporting {title!r}: {exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    try:
+        await ctx.send(embed=embed)
+        return
+    except Exception as exc:
+        print(
+            f"ctx.send(embed=...) failed while reporting {title!r}: {exc!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    try:
+        plain = title + "\n\n" + description + (f"\n\n{footer}" if footer else "")
+        await ctx.send(plain)
+    except Exception as exc:
+        print(
+            f"ctx.send(plain text) also failed while reporting {title!r}: {exc!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+async def _open_spreadsheet_or_reject(ctx):
+    """Authorise once for this command, or report and return None.
+
+    Every command's first Sheets call. The caller reuses the returned
+    handle for whatever else it needs (the officer check, _load_context,
+    the duplicate check) instead of each of those re-authorising its own
+    -- open_spreadsheet does a real API round trip (open_by_key), and
+    doing it three or four times over for one Discord command was most of
+    the read amplification against the 60-calls/minute quota.
+    """
+    try:
+        return await asyncio.to_thread(_spreadsheet)
+    except Exception as exc:
+        await _reject(ctx, "❌ Sheet Unreachable", error_text(exc))
+        return None
+
+
+async def _require_officer(ctx, spreadsheet) -> int | None:
     """The configured officer role id, or None once a refusal has been sent."""
     try:
-        role_id = await asyncio.to_thread(_officer_role_id)
+        role_id = await asyncio.to_thread(_officer_role_id, spreadsheet)
     except Exception as exc:
         await _reject(ctx, "❌ Sheet Unreachable", error_text(exc))
         return None
@@ -487,7 +622,11 @@ async def on_command_error(ctx, error):
 @bot.command(name="attendance")
 async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     """Log attendance from a roster screenshot: !attendance <boss> + image"""
-    role_id = await _require_officer(ctx)
+    spreadsheet = await _open_spreadsheet_or_reject(ctx)
+    if spreadsheet is None:
+        return
+
+    role_id = await _require_officer(ctx, spreadsheet)
     if role_id is None:
         return
 
@@ -521,7 +660,7 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     )
 
     try:
-        context = await asyncio.to_thread(_load_context, boss_name, str(attachment.id))
+        context = await asyncio.to_thread(_load_context, spreadsheet, boss_name)
     except (BossNotFound, BossAmbiguous) as exc:
         await working.edit(embed=make_embed("❓ Unknown Boss", error_text(exc)))
         return
@@ -554,7 +693,32 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         )
         return
 
-    matched, unmatched = match_names(raw_names, context["players"])
+    # Hashed here, not from attachment.id: Discord mints a new attachment
+    # id on every upload, so id-based duplicate detection never fires on a
+    # genuine re-post of the same picture. The hash of the bytes is the
+    # same every time, which is what "already logged" needs to mean. Must
+    # come after attachment.read() above -- the hash is of the actual
+    # image content, not anything derivable before downloading it.
+    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    try:
+        duplicate = await asyncio.to_thread(
+            image_already_logged, spreadsheet, image_sha256
+        )
+    except Exception as exc:
+        await working.edit(embed=make_embed("❌ Sheet Problem", error_text(exc)))
+        return
+
+    try:
+        matched, unmatched = match_names(raw_names, context["players"])
+    except DuplicatePlayerName as exc:
+        await working.edit(
+            embed=make_embed(
+                "❌ Duplicate Player Names",
+                f"{error_text(exc)}\n\nFix the sheet's player column first.",
+            )
+        )
+        return
+
     if not matched:
         await working.edit(
             embed=make_embed(
@@ -585,7 +749,7 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
                    + "\n\n*Skipped. Add them to the sheet first if they count.*"),
             inline=False,
         )
-    if context["duplicate"]:
+    if duplicate:
         embed.add_field(
             name="⚠️ Already Logged",
             value="This exact screenshot has been logged before. "
@@ -629,8 +793,10 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         "points_each": points,
         "message_id": str(ctx.message.id),
         "attachment_id": str(attachment.id),
+        "image_sha256": image_sha256,
         "confirmed_by": str(confirmer),
-        "players": ", ".join(players),
+        # JSON, not comma-joined -- see _parse_players.
+        "players": json.dumps(players),
         "reversed": "",
     }
 
@@ -642,17 +808,19 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
             players,
             points,
             entry,
-            context["duplicate"],
+            duplicate,
         )
     except PointsWrittenButNotLogged as exc:
         # The points landed and the log row did not. Saying "nothing was
-        # written" here is what makes an officer re-run and double-pay.
-        await working.edit(
-            embed=make_embed(
-                "⚠️ Partly Written — Do Not Re-Run",
-                exc.description,
-                footer=f"Confirmed by {confirmer}",
-            )
+        # written" here is what makes an officer re-run and double-pay --
+        # this is the one message that must reach the officer by whatever
+        # means necessary.
+        await _report_partial_failure(
+            ctx,
+            working,
+            "⚠️ Partly Written — Do Not Re-Run",
+            exc.description,
+            footer=f"Confirmed by {confirmer}",
         )
         return
     except AlreadyLoggedDuringPreview as exc:
@@ -680,15 +848,22 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
 @bot.command(name="undoattendance")
 async def undo_attendance_cmd(ctx: commands.Context):
     """Reverse the most recent attendance log: !undoattendance"""
-    if await _require_officer(ctx) is None:
+    spreadsheet = await _open_spreadsheet_or_reject(ctx)
+    if spreadsheet is None:
+        return
+    if await _require_officer(ctx, spreadsheet) is None:
         return
 
     try:
         entry = await _locked(_reverse_last)
     except PointsRemovedButNotMarked as exc:
         # The subtraction landed and the reversed flag did not. "Undo
-        # Failed" would invite the retry that subtracts them twice.
-        await _reject(ctx, "⚠️ Partly Undone — Do Not Re-Run", exc.description)
+        # Failed" would invite the retry that subtracts them twice -- this
+        # is the one message that must reach the officer by whatever means
+        # necessary.
+        await _report_partial_failure(
+            ctx, None, "⚠️ Partly Undone — Do Not Re-Run", exc.description
+        )
         return
     except Exception as exc:
         # Reached only if the subtraction itself failed, so nothing changed.
@@ -715,7 +890,10 @@ async def undo_attendance_cmd(ctx: commands.Context):
 @bot.command(name="setweek")
 async def set_week_cmd(ctx: commands.Context, *, tab_name: str = ""):
     """Choose which sheet tab attendance goes into: !setweek Week 17.1"""
-    if await _require_officer(ctx) is None:
+    spreadsheet = await _open_spreadsheet_or_reject(ctx)
+    if spreadsheet is None:
+        return
+    if await _require_officer(ctx, spreadsheet) is None:
         return
 
     tab = tab_name.strip()

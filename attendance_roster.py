@@ -36,6 +36,22 @@ ALIASES = {
 }
 
 
+class DuplicatePlayerName(RuntimeError):
+    """Two known players normalise to the same string.
+
+    match_names' index is built from normalize(known_player), which
+    casefolds. A sheet holding both "Kobe" and "kobe" would otherwise let
+    the second silently overwrite the first in that index -- the sheet's
+    own duplicate-row check (attendance_sheet._rows_by_player) does not
+    catch this, because "Kobe" != "kobe" as exact strings, so it never
+    sees a collision. The result: one of the two players can never be
+    matched again, and the OCR'd name that should have gone to them
+    silently resolves to the other player instead. Refusing here, naming
+    both, matches the refuse-rather-than-guess convention used throughout
+    this bot rather than picking a winner.
+    """
+
+
 @dataclass(frozen=True)
 class Match:
     raw: str
@@ -81,8 +97,22 @@ def match_names(
 
     Returns (matched, unmatched). Matches are deduplicated by resolved
     player, so a name the model reads twice never earns double points.
+
+    Raises DuplicatePlayerName if two DIFFERENT known players normalise to
+    the same string (e.g. "Kobe" and "kobe") -- see that class for why.
     """
-    index = {normalize(p): p for p in known_players if p.strip()}
+    index: dict[str, str] = {}
+    for player in known_players:
+        if not player.strip():
+            continue
+        key = normalize(player)
+        if key in index and index[key] != player:
+            raise DuplicatePlayerName(
+                f"{index[key]!r} and {player!r} both normalise to the same "
+                f"name ({key!r}); refusing to guess which one a matched "
+                "screenshot name means"
+            )
+        index[key] = player
     alias_index = {
         normalize(alias_raw): target
         for alias_raw, target in ALIASES.items()

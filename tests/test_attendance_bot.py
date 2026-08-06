@@ -9,6 +9,7 @@ each other's writes. No Discord client is started.
 
 import asyncio
 import inspect
+import json
 import re
 import sys
 
@@ -214,6 +215,9 @@ TAB = "Week 17"
 ATTACHMENT = "1234567890"
 
 
+IMAGE_HASH = "deadbeef" * 8
+
+
 def _entry(**overrides):
     entry = {
         "timestamp": "2026-08-06T20:00:00+08:00",
@@ -222,8 +226,9 @@ def _entry(**overrides):
         "points_each": 3,
         "message_id": "999",
         "attachment_id": ATTACHMENT,
+        "image_sha256": IMAGE_HASH,
         "confirmed_by": "Officer#1",
-        "players": "Kobe",
+        "players": json.dumps(["Kobe"]),
         "reversed": "",
     }
     entry.update(overrides)
@@ -452,7 +457,7 @@ def _big_removed():
             "tab": "Week 17.1",
             "boss": "Lucus",
             "points_each": "3",
-            "players": ", ".join(BIG_ROSTER),
+            "players": json.dumps(BIG_ROSTER),
         },
         cause_text=BIG_CAUSE,
     )
@@ -507,7 +512,7 @@ def test_a_clamped_player_list_says_it_is_partial():
     removed = attendance_bot.PointsRemovedButNotMarked(
         entry={
             "tab": "Week 17.1", "boss": "Lucus", "points_each": "3",
-            "players": ", ".join(HUGE_ROSTER),
+            "players": json.dumps(HUGE_ROSTER),
         },
         cause_text=BIG_CAUSE,
     )
@@ -543,7 +548,7 @@ def test_a_small_undo_case_is_untouched():
             "tab": "Week 17",
             "boss": "Lucus",
             "points_each": "3",
-            "players": "Kobe, ARCILynN",
+            "players": json.dumps(["Kobe", "ARCILynN"]),
         },
         cause_text="update_cell failed",
     )
@@ -553,3 +558,293 @@ def test_a_small_undo_case_is_untouched():
     assert "…" not in description
     assert "Kobe, ARCILynN" in description
     assert "update_cell failed" in description
+
+
+# --------------------------------------------------------------------------
+# Final-review fixes
+# --------------------------------------------------------------------------
+
+
+# (2) duplicate detection must key on the image's own hash, not the
+# per-upload Discord attachment id.
+
+
+def test_commit_treats_a_repost_with_a_new_attachment_id_as_a_duplicate(spreadsheet):
+    """A screenshot logged once, then re-posted (a brand-new attachment_id,
+    same picture) must be caught. was_duplicate=False here mirrors what
+    the preview would have shown if the hash check had been run for it --
+    the point of this test is that image_sha256, not attachment_id, is
+    what decides "duplicate".
+    """
+    logged = _entry(attachment_id="original-upload", image_sha256="same-hash")
+    row = [str(logged[field]) for field in LOG_HEADER]
+    sh = spreadsheet(_sheets(log=_log_tab(row)))
+
+    repost = _entry(attachment_id="brand-new-upload-id", image_sha256="same-hash")
+    with pytest.raises(attendance_bot.AlreadyLoggedDuringPreview):
+        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, repost, False)
+
+    assert not sh.worksheet(TAB).batches
+
+
+def test_commit_does_not_flag_a_different_screenshot_as_a_duplicate(spreadsheet):
+    logged = _entry(attachment_id="upload-1", image_sha256="hash-1")
+    row = [str(logged[field]) for field in LOG_HEADER]
+    sh = spreadsheet(_sheets(log=_log_tab(row)))
+
+    different = _entry(attachment_id="upload-2", image_sha256="hash-2")
+    attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, different, False)
+
+    assert sh.worksheet(TAB).batches
+
+
+# (3) the do-not-re-run warning must reach the officer even if the normal
+# Discord call used to show it fails.
+
+
+class _FailingEditMessage:
+    """Stands in for `working`: editing it always raises."""
+
+    def __init__(self):
+        self.edit_attempts = 0
+
+    async def edit(self, **kwargs):
+        self.edit_attempts += 1
+        raise RuntimeError("boom: message was deleted")
+
+
+class _RecordingCtx:
+    """Stands in for `ctx`: records what actually got sent, can be made
+    to fail its embed send too, to exercise the plain-text fallback."""
+
+    def __init__(self, fail_embed_send=False):
+        self.fail_embed_send = fail_embed_send
+        self.sent = []
+
+    async def send(self, *args, **kwargs):
+        if kwargs.get("embed") is not None and self.fail_embed_send:
+            raise RuntimeError("boom: also rate limited")
+        self.sent.append((args, kwargs))
+
+
+def test_partial_failure_falls_back_to_ctx_send_when_working_edit_fails(capsys):
+    working = _FailingEditMessage()
+    ctx = _RecordingCtx()
+
+    asyncio.run(
+        attendance_bot._report_partial_failure(
+            ctx, working, "⚠️ Partly Written — Do Not Re-Run", "the real detail"
+        )
+    )
+
+    assert working.edit_attempts == 1
+    assert len(ctx.sent) == 1
+    _, kwargs = ctx.sent[0]
+    assert kwargs["embed"].description == "the real detail"
+
+    # stderr carries the detail unconditionally, before any Discord call.
+    err = capsys.readouterr().err
+    assert "the real detail" in err
+
+
+def test_partial_failure_falls_back_to_plain_text_when_everything_else_fails(capsys):
+    working = _FailingEditMessage()
+    ctx = _RecordingCtx(fail_embed_send=True)
+
+    asyncio.run(
+        attendance_bot._report_partial_failure(
+            ctx, working, "⚠️ Partly Undone — Do Not Re-Run", "cause detail here"
+        )
+    )
+
+    assert working.edit_attempts == 1
+    assert len(ctx.sent) == 1
+    args, kwargs = ctx.sent[0]
+    assert kwargs.get("embed") is None
+    assert "cause detail here" in args[0]
+    assert "Partly Undone" in args[0]
+
+    err = capsys.readouterr().err
+    assert "cause detail here" in err
+
+
+def test_partial_failure_with_no_working_message_goes_straight_to_ctx_send():
+    # undoattendance has no preview message to edit.
+    ctx = _RecordingCtx()
+
+    asyncio.run(
+        attendance_bot._report_partial_failure(
+            ctx, None, "⚠️ Partly Undone — Do Not Re-Run", "detail"
+        )
+    )
+
+    assert len(ctx.sent) == 1
+    _, kwargs = ctx.sent[0]
+    assert kwargs["embed"].description == "detail"
+
+
+def test_stderr_is_written_even_if_every_discord_call_fails():
+    class _AlwaysFailingCtx:
+        async def send(self, *args, **kwargs):
+            raise RuntimeError("channel gone")
+
+    working = _FailingEditMessage()
+    ctx = _AlwaysFailingCtx()
+
+    # Must not raise -- this is a best-effort reporter, not a propagator.
+    asyncio.run(
+        attendance_bot._report_partial_failure(
+            ctx, working, "title", "the detail that must survive"
+        )
+    )
+
+
+# (4) a stuck sheet call must produce a visible refusal, not a permanent hang.
+
+
+def test_locked_times_out_instead_of_hanging_forever(monkeypatch):
+    """The `await _locked(...)` must raise promptly, even though the
+    blocking thread underneath it does not actually stop.
+
+    asyncio.to_thread's worker runs in a real OS thread, and Python has no
+    way to forcibly kill a running thread -- cancelling the awaiting
+    coroutine does not, and cannot, interrupt a synchronous time.sleep()
+    (or a synchronous gspread call) already in progress inside it. So the
+    orphaned worker thread keeps running past the timeout regardless; what
+    LOCK_TIMEOUT actually buys is that the *caller* stops waiting and the
+    lock is freed for the next command (see
+    test_locked_releases_the_lock_after_a_timeout), not that the stuck
+    call itself is killed. The orphan is eventually bounded by
+    attendance_sheet.REQUEST_TIMEOUT on the gspread client, which is what
+    actually ends a truly stuck network call.
+
+    Because of that, timing must happen INSIDE the coroutine, around the
+    await itself -- timing the outer asyncio.run() would also measure
+    asyncio's loop-shutdown join against the still-sleeping thread, which
+    has nothing to do with how long the officer actually waits.
+    """
+    monkeypatch.setattr(attendance_bot, "LOCK_TIMEOUT", 0.05)
+
+    def never_returns(*args):
+        time.sleep(0.5)  # plenty longer than the 0.05s timeout
+
+    elapsed = {}
+
+    async def run():
+        started = time.monotonic()
+        try:
+            await attendance_bot._locked(never_returns)
+        except TimeoutError:
+            elapsed["value"] = time.monotonic() - started
+        else:
+            raise AssertionError("expected TimeoutError")
+
+    asyncio.run(run())
+    assert elapsed["value"] < 1.0, "the await did not time out promptly"
+
+
+def test_locked_releases_the_lock_after_a_timeout():
+    monkeypatch_value = attendance_bot.LOCK_TIMEOUT
+    attendance_bot.LOCK_TIMEOUT = 0.05
+    try:
+        def never_returns(*args):
+            time.sleep(5)
+
+        async def run():
+            with pytest.raises(TimeoutError):
+                await attendance_bot._locked(never_returns)
+            # The lock must be free again for the next command, even
+            # though the timed-out thread is still running in the
+            # background -- a permanently-stuck call must not wedge every
+            # later command behind it.
+            assert not attendance_bot._SHEET_LOCK.locked()
+
+        asyncio.run(run())
+    finally:
+        attendance_bot.LOCK_TIMEOUT = monkeypatch_value
+
+
+# (7) a comma in a player name must not fragment through the log round trip.
+
+
+def test_parse_players_round_trips_a_name_containing_a_comma():
+    raw = json.dumps(["Smith, Jr.", "Kobe"])
+    assert attendance_bot._parse_players(raw) == ["Smith, Jr.", "Kobe"]
+
+
+def test_parse_players_refuses_invalid_json():
+    from attendance_sheet import SheetStructureError
+
+    with pytest.raises(SheetStructureError):
+        attendance_bot._parse_players("not valid json")
+
+
+def test_parse_players_refuses_a_json_value_that_is_not_a_list_of_strings():
+    from attendance_sheet import SheetStructureError
+
+    with pytest.raises(SheetStructureError):
+        attendance_bot._parse_players(json.dumps({"not": "a list"}))
+
+
+def test_a_comma_in_a_player_name_survives_undo(spreadsheet):
+    grid = [
+        ["Player Name", "Points", "Lucus - 3"],
+        ["Smith, Jr.", "0", "3"],
+        ["Kobe", "0", "3"],
+    ]
+    logged = _entry(boss="Lucus", players=json.dumps(["Smith, Jr.", "Kobe"]))
+    row = [str(logged[field]) for field in LOG_HEADER]
+    sh = spreadsheet(_sheets(grid=grid, log=_log_tab(row)))
+
+    entry = attendance_bot._reverse_last()
+
+    assert entry is not None
+    ranges = {cell["range"] for batch in sh.worksheet(TAB).batches for cell in batch}
+    # Had the comma fragmented "Smith, Jr." into "Smith" and " Jr.",
+    # plan_point_writes would have raised "No row for ..." for those
+    # instead of writing both real players' cells.
+    assert ranges == {"C2", "C3"}
+
+
+# (6) read amplification: one authorised handle per command, one grid read
+# per tab lookup.
+
+
+def test_load_context_reads_the_target_tabs_grid_exactly_once():
+    calls = {"get_all_values": 0}
+    ws = FakeWorksheet(SAMPLE_GRID, title=TAB)
+    original = ws.get_all_values
+
+    def counting_get_all_values():
+        calls["get_all_values"] += 1
+        return original()
+
+    ws.get_all_values = counting_get_all_values
+    sh = FakeSpreadsheet({TAB: ws})
+    attendance_bot.write_config(sh, "target_tab", TAB)
+
+    attendance_bot._load_context(sh, "Lucus")
+
+    assert calls["get_all_values"] == 1, (
+        "the target tab's grid was read more than once for a single "
+        "boss lookup (header resolution, column check, player list)"
+    )
+
+
+def test_load_context_does_not_open_its_own_spreadsheet_handle(monkeypatch):
+    """_load_context must use the handle it is given, not authorise its own
+    -- otherwise the whole point of caching one handle per command is lost.
+    """
+    def boom():
+        raise AssertionError("_load_context must not call _spreadsheet() itself")
+
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", boom)
+
+    sh = FakeSpreadsheet({TAB: FakeWorksheet(SAMPLE_GRID, title=TAB)})
+    attendance_bot.write_config(sh, "target_tab", TAB)
+
+    context = attendance_bot._load_context(sh, "Lucus")
+    assert context["boss"] == "Lucus"
+
+
+import time  # noqa: E402  (kept near its first use, above)

@@ -20,6 +20,15 @@ HEADER_ROW = 1
 PLAYER_COLUMN = 1
 POINTS_COLUMN = 2  # a SUM formula -- never written
 
+# gspread defaults to NO request timeout: a single black-holed TCP
+# connection would hang a gspread call forever, which -- since every call
+# happens inside _SHEET_LOCK -- wedges the lock permanently and every
+# later command hangs silently on "Working on it...". 15s is generous for
+# a Sheets API call (which normally completes in well under a second) but
+# still short enough that a stuck connection surfaces as a visible error
+# instead of an indefinite hang.
+REQUEST_TIMEOUT = 15.0
+
 
 class SheetStructureError(RuntimeError):
     """The sheet does not look the way the bot needs it to."""
@@ -37,31 +46,45 @@ def open_spreadsheet(sheet_id: str, service_account_json: str):
         # traceback-with-locals reporter.
         raise SheetStructureError("Service account JSON is not valid JSON") from None
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    return gspread.authorize(creds).open_by_key(sheet_id)
+    client = gspread.authorize(creds)
+    client.set_timeout(REQUEST_TIMEOUT)
+    return client.open_by_key(sheet_id)
 
 
 def _grid(worksheet) -> list[list[str]]:
     return worksheet.get_all_values()
 
 
-def read_headers(worksheet) -> list[str]:
-    """The header row, verbatim."""
-    grid = _grid(worksheet)
+def read_headers(worksheet, grid: list[list[str]] | None = None) -> list[str]:
+    """The header row, verbatim.
+
+    `grid` lets a caller that already fetched the full grid (e.g.
+    _load_context, which otherwise reads the same sheet three times) pass
+    it in instead of triggering another get_all_values() call. Omit it to
+    fetch fresh, as every existing caller does.
+    """
+    grid = grid if grid is not None else _grid(worksheet)
     if not grid:
         raise SheetStructureError(f"Worksheet {worksheet.title!r} is empty")
     return list(grid[HEADER_ROW - 1])
 
 
-def read_players(worksheet) -> list[str]:
-    """Player names in column A, below the header row."""
+def read_players(worksheet, grid: list[list[str]] | None = None) -> list[str]:
+    """Player names in column A, below the header row.
+
+    See read_headers for what `grid` is for.
+    """
+    grid = grid if grid is not None else _grid(worksheet)
     return [
         row[PLAYER_COLUMN - 1].strip()
-        for row in _grid(worksheet)[HEADER_ROW:]
+        for row in grid[HEADER_ROW:]
         if row and row[PLAYER_COLUMN - 1].strip()
     ]
 
 
-def find_column(worksheet, boss_name: str) -> int:
+def find_column(
+    worksheet, boss_name: str, grid: list[list[str]] | None = None
+) -> int:
     """1-based index of the column for this boss.
 
     Refuses a blank query outright -- an empty or whitespace-only name
@@ -70,6 +93,8 @@ def find_column(worksheet, boss_name: str) -> int:
     when more than one header names the same boss (normal for a
     weekly sheet with a boss fought twice); guessing which occurrence the
     caller meant risks paying into the wrong week's column.
+
+    See read_headers for what `grid` is for.
     """
     wanted = boss_name.strip()
     if not wanted:
@@ -77,7 +102,7 @@ def find_column(worksheet, boss_name: str) -> int:
     wanted_cf = wanted.casefold()
 
     matches = []
-    for index, cell in enumerate(read_headers(worksheet), start=1):
+    for index, cell in enumerate(read_headers(worksheet, grid), start=1):
         base = header_base(cell)
         if not base:
             continue
@@ -164,7 +189,11 @@ def _rows_by_player(grid: list[list[str]], worksheet_title: str) -> dict[str, in
 
 
 def plan_point_writes(
-    worksheet, players: list[str], column_index: int, points: int
+    worksheet,
+    players: list[str],
+    column_index: int,
+    points: int,
+    grid: list[list[str]] | None = None,
 ) -> list[dict]:
     """Build the batch payload that adds `points` for each player.
 
@@ -174,6 +203,13 @@ def plan_point_writes(
     result for a cell is exactly 0, the payload writes an empty string
     there instead of the integer 0, so a cell that nets back to nothing
     (e.g. after an undo) reads as blank again rather than a visible zero.
+
+    `grid` lets a caller that already fetched the full grid in this same
+    critical section (e.g. _commit, which also needs it to resolve the
+    boss column) pass it in instead of reading the sheet a second time.
+    Omit it to fetch fresh, as every existing caller does -- this does NOT
+    weaken the freshness guarantee inside the lock: a caller that wants a
+    fresh read still gets one, it just reads once instead of twice.
 
     Concurrency note: this function reads the current grid and computes
     absolute values to write; it does not lock anything. If two callers
@@ -186,7 +222,7 @@ def plan_point_writes(
     if column_index == POINTS_COLUMN:
         raise SheetStructureError("Refusing to write column B; it is a SUM formula")
 
-    grid = _grid(worksheet)
+    grid = grid if grid is not None else _grid(worksheet)
     rows_by_player = _rows_by_player(grid, worksheet.title)
 
     missing = [p for p in players if p.strip() not in rows_by_player]
@@ -244,7 +280,13 @@ LOG_HEADER = [
     "boss",
     "points_each",
     "message_id",
-    "attachment_id",
+    "attachment_id",  # per-upload Discord id; kept only for row identity
+                       # (mark_entry_reversed's re-check), NOT for duplicate
+                       # detection -- re-posting the same image mints a new
+                       # attachment_id, so it can never catch a real repost.
+    "image_sha256",  # hash of the image bytes; this is what duplicate
+                      # detection actually keys on, because it is the same
+                      # every time the same picture is posted.
     "confirmed_by",
     "players",
     "reversed",
@@ -254,7 +296,9 @@ LOG_HEADER = [
 REVERSED_TRUE_VALUES = {"yes", "true", "1"}
 
 
-def _expect_header(worksheet, header: list[str]) -> None:
+def _expect_header(
+    worksheet, header: list[str], grid: list[list[str]] | None = None
+) -> None:
     """Raise unless the tab's own row 1 equals the header this code expects.
 
     Row 1 is the ground truth for what order each column holds; it is
@@ -270,7 +314,7 @@ def _expect_header(worksheet, header: list[str]) -> None:
     consistent with this module's refuse-rather-than-guess convention for
     duplicate player rows, duplicate boss columns, and non-numeric cells.
     """
-    grid = worksheet.get_all_values()
+    grid = grid if grid is not None else worksheet.get_all_values()
     if not grid:
         raise SheetStructureError(f"Worksheet {worksheet.title!r} is empty")
     actual = list(grid[0])
@@ -400,10 +444,14 @@ def _log_rows(spreadsheet) -> list[tuple[int, dict]]:
     except gspread.exceptions.WorksheetNotFound:
         return []
 
-    _expect_header(worksheet, LOG_HEADER)
+    # One read, reused for both the header check and the rows -- the
+    # previous version called get_all_values() twice for every single
+    # duplicate-detection or undo lookup.
+    grid = worksheet.get_all_values()
+    _expect_header(worksheet, LOG_HEADER, grid)
 
     rows = []
-    for number, row in enumerate(worksheet.get_all_values(), start=1):
+    for number, row in enumerate(grid, start=1):
         if number == 1 or not any(cell.strip() for cell in row):
             continue
         padded = list(row) + [""] * (len(LOG_HEADER) - len(row))
@@ -418,8 +466,8 @@ def _is_reversed(value: str, row_number: int) -> bool:
     means undone. Anything else -- a stray "no", a typo, a note -- is
     refused rather than treated as falsy. Failing open here would let a
     re-posted screenshot silently double-pay: a human typing "no" in that
-    column would make attachment_already_logged treat the row as
-    not-reversed and process the screenshot a second time.
+    column would make image_already_logged treat the row as not-reversed
+    and process the screenshot a second time.
     """
     normalised = value.strip().casefold()
     if not normalised:
@@ -433,10 +481,18 @@ def _is_reversed(value: str, row_number: int) -> bool:
     )
 
 
-def attachment_already_logged(spreadsheet, attachment_id: str) -> bool:
-    """True if this exact screenshot was logged and not later reversed."""
+def image_already_logged(spreadsheet, image_sha256: str) -> bool:
+    """True if this exact screenshot's pixels were logged and not later reversed.
+
+    Keyed on the image's own content hash, not attachment_id. Discord
+    mints a new attachment_id on every upload, so the same PNG re-posted
+    a week later gets a brand-new id and attachment_id-based detection
+    would never notice -- it would look like a new, distinct screenshot
+    every time. The hash is the same every time the same picture is
+    posted, which is what "already logged" actually needs to mean.
+    """
     return any(
-        entry["attachment_id"] == attachment_id
+        entry["image_sha256"] == image_sha256
         and not _is_reversed(entry["reversed"], number)
         for number, entry in _log_rows(spreadsheet)
     )
