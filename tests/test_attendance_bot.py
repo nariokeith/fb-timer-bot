@@ -417,3 +417,139 @@ def test_the_log_timestamp_is_manila_local_time():
     from datetime import datetime
 
     assert datetime.fromisoformat(stamp).microsecond == 0
+
+
+# --------------------------------------------------------------------------
+# (dd) The do-not-re-run message must always render. Discord caps an embed
+# description at 4096 characters; if these overflow, working.edit raises and
+# the officer sees a generic error instead of the warning that stops them
+# re-running a command whose points already landed.
+# --------------------------------------------------------------------------
+
+DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
+
+# The guild's real sheet has 49 players.
+BIG_ROSTER = [f"PlayerNumber{n:02d}WithALongName" for n in range(49)]
+BIG_CAUSE = "gspread said: " + ("x" * 5000)
+
+PARTLY_WRITTEN_SENTENCES = ("were added", "not re-run", "undoattendance")
+PARTLY_UNDONE_SENTENCES = ("already", "not re-run", "twice")
+
+
+def _big_written():
+    return attendance_bot.PointsWrittenButNotLogged(
+        tab="Week 17.1",
+        boss="Lucus",
+        points=3,
+        players=BIG_ROSTER,
+        cause_text=BIG_CAUSE,
+    )
+
+
+def _big_removed():
+    return attendance_bot.PointsRemovedButNotMarked(
+        entry={
+            "tab": "Week 17.1",
+            "boss": "Lucus",
+            "points_each": "3",
+            "players": ", ".join(BIG_ROSTER),
+        },
+        cause_text=BIG_CAUSE,
+    )
+
+
+def test_partly_written_description_fits_in_an_embed():
+    description = _big_written().description
+    assert len(description) <= DISCORD_EMBED_DESCRIPTION_LIMIT
+
+
+def test_partly_written_keeps_every_instruction_under_clamping():
+    # The fixed instructional text carries the whole meaning; it must
+    # survive intact no matter how long the variable parts are.
+    description = _big_written().description
+    for sentence in PARTLY_WRITTEN_SENTENCES:
+        assert sentence in description
+    assert "Lucus" in description
+    assert "Week 17.1" in description
+
+
+def test_partly_undone_description_fits_in_an_embed():
+    description = _big_removed().description
+    assert len(description) <= DISCORD_EMBED_DESCRIPTION_LIMIT
+
+
+def test_partly_undone_keeps_every_instruction_under_clamping():
+    description = _big_removed().description
+    for sentence in PARTLY_UNDONE_SENTENCES:
+        assert sentence in description
+    assert "Lucus" in description
+
+
+def test_the_real_rosters_player_list_is_not_clamped():
+    # 49 players is what the guild's sheet actually holds; only the cause
+    # text drives the overflow at that size, so the names all survive.
+    description = _big_written().description
+    assert "more" not in description
+    for player in BIG_ROSTER:
+        assert player in description
+
+
+# Bigger than any real roster, to exercise the clamp itself.
+HUGE_ROSTER = [f"PlayerNumber{n:03d}WithAVeryLongName" for n in range(400)]
+
+
+def test_a_clamped_player_list_says_it_is_partial():
+    # Otherwise the officer takes the visible names for the whole list.
+    written = attendance_bot.PointsWrittenButNotLogged(
+        tab="Week 17.1", boss="Lucus", points=3,
+        players=HUGE_ROSTER, cause_text=BIG_CAUSE,
+    )
+    removed = attendance_bot.PointsRemovedButNotMarked(
+        entry={
+            "tab": "Week 17.1", "boss": "Lucus", "points_each": "3",
+            "players": ", ".join(HUGE_ROSTER),
+        },
+        cause_text=BIG_CAUSE,
+    )
+
+    for exc in (written, removed):
+        description = exc.description
+        assert len(description) <= DISCORD_EMBED_DESCRIPTION_LIMIT
+        count = int(re.search(r"and (\d+) more", description).group(1))
+        assert 0 < count < len(HUGE_ROSTER)
+        # The instructions still survive alongside the clamped list.
+        assert "not re-run" in description
+
+
+def test_a_small_case_is_untouched():
+    exc = attendance_bot.PointsWrittenButNotLogged(
+        tab="Week 17",
+        boss="Lucus",
+        points=3,
+        players=["Kobe", "ARCILynN"],
+        cause_text="row 1 is not what this code expects",
+    )
+    description = exc.description
+
+    assert "more" not in description  # no truncation indicator
+    assert "…" not in description
+    assert "Kobe, ARCILynN" in description
+    assert "row 1 is not what this code expects" in description
+
+
+def test_a_small_undo_case_is_untouched():
+    exc = attendance_bot.PointsRemovedButNotMarked(
+        entry={
+            "tab": "Week 17",
+            "boss": "Lucus",
+            "points_each": "3",
+            "players": "Kobe, ARCILynN",
+        },
+        cause_text="update_cell failed",
+    )
+    description = exc.description
+
+    assert "more" not in description
+    assert "…" not in description
+    assert "Kobe, ARCILynN" in description
+    assert "update_cell failed" in description

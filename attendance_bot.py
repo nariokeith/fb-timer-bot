@@ -85,6 +85,54 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
+# Discord refuses an embed whose description exceeds this, and the two
+# partial-write messages below are exactly the ones that must never fail
+# to render: if working.edit raises, the officer sees a generic error
+# instead of "do not re-run", re-runs, and the points land twice -- the
+# outcome those exceptions exist to prevent. The variable parts are
+# therefore clamped individually, so the fixed instructional text (which
+# carries the whole meaning) survives intact under any input. Budget:
+# 800 + 2200 + 100 + 100 = 3200, against roughly 600 characters of fixed
+# text, leaving comfortable headroom under 4096.
+EMBED_DESCRIPTION_LIMIT = 4096
+CAUSE_LIMIT = 800
+PLAYERS_LIMIT = 2200
+NAME_LIMIT = 100
+
+
+def _clip(text: str, limit: int) -> str:
+    """`text` shortened to `limit` characters, marked when shortened."""
+    text = str(text).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _clip_players(players: list[str], limit: int = PLAYERS_LIMIT) -> str:
+    """The player list, saying plainly when it is only part of it.
+
+    A silently truncated list is worse than a short one: the officer would
+    take the visible names for everyone affected and reconcile only those.
+    """
+    names = [str(p).strip() for p in players if str(p).strip()]
+    joined = ", ".join(names)
+    if len(joined) <= limit:
+        return joined
+
+    kept: list[str] = []
+    for index, name in enumerate(names):
+        candidate = ", ".join([*kept, name])
+        suffix = f", … and {len(names) - index - 1} more"
+        if len(candidate) + len(suffix) > limit:
+            break
+        kept.append(name)
+
+    remaining = len(names) - len(kept)
+    if not kept:
+        return f"… and {remaining} more"
+    return ", ".join(kept) + f", … and {remaining} more"
+
+
 class PointsWrittenButNotLogged(RuntimeError):
     """apply_writes succeeded; append_log_entry did not.
 
@@ -109,15 +157,17 @@ class PointsWrittenButNotLogged(RuntimeError):
     @property
     def description(self) -> str:
         return (
-            f"**+{self.points}** for **{self.boss}** **were added** to "
-            f"**{self.tab}** for {len(self.players)} player"
+            f"**+{self.points}** for **{_clip(self.boss, NAME_LIMIT)}** "
+            f"**were added** to **{_clip(self.tab, NAME_LIMIT)}** for "
+            f"{len(self.players)} player"
             f"{'s' if len(self.players) != 1 else ''}, but the audit log row "
             f"could not be written.\n\n"
             f"Please do **not re-run** this command — the points are already "
             f"in the sheet and running it again would add them twice. "
             f"`!undoattendance` cannot reverse this either, because there is "
             f"no log row for it; it must be reconciled by hand.\n\n"
-            f"Players: {', '.join(self.players)}\n\nReason: {self.cause_text}"
+            f"Players: {_clip_players(self.players)}\n\n"
+            f"Reason: {_clip(self.cause_text, CAUSE_LIMIT)}"
         )
 
 
@@ -140,15 +190,21 @@ class PointsRemovedButNotMarked(RuntimeError):
 
     @property
     def description(self) -> str:
+        players = [
+            part.strip()
+            for part in str(self.entry.get("players", "")).split(",")
+            if part.strip()
+        ]
         return (
             f"**{self.entry['points_each']}** points for "
-            f"**{self.entry['boss']}** have **already** been removed from "
-            f"**{self.entry['tab']}**, but the log entry could not be marked "
-            f"reversed.\n\n"
+            f"**{_clip(self.entry['boss'], NAME_LIMIT)}** have **already** "
+            f"been removed from **{_clip(self.entry['tab'], NAME_LIMIT)}**, "
+            f"but the log entry could not be marked reversed.\n\n"
             f"Please do **not re-run** `!undoattendance` — the entry still "
             f"looks live, so running it again would remove those points "
             f"twice. Mark the row reversed by hand instead.\n\n"
-            f"Players: {self.entry['players']}\n\nReason: {self.cause_text}"
+            f"Players: {_clip_players(players)}\n\n"
+            f"Reason: {_clip(self.cause_text, CAUSE_LIMIT)}"
         )
 
 
