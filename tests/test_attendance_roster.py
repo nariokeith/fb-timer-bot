@@ -23,8 +23,21 @@ def test_matching_ignores_case_and_surrounding_whitespace():
 
 
 def test_non_ascii_names_survive_normalization():
+    # Direct assertion: normalize must preserve the non-ASCII codepoint.
+    assert "卐" in normalize("wileKAMOTE卐")
+
+    # Match also works; if normalize stripped non-ASCII, this would fail.
     matched, unmatched = match_names(["wileKAMOTE卐"], KNOWN)
     assert _players(matched) == ["wileKAMOTE卐"]
+    assert unmatched == []
+
+
+def test_non_ascii_collision_if_stripped():
+    # Two known players differ ONLY in non-ASCII: stripping would
+    # collapse them into one, breaking the match or creating ambiguity.
+    known_with_variants = ["Kobe", "Kobe⚡"]
+    matched, unmatched = match_names(["Kobe"], known_with_variants)
+    assert _players(matched) == ["Kobe"]
     assert unmatched == []
 
 
@@ -58,8 +71,25 @@ def test_ambiguous_name_is_reported_not_guessed():
 
 
 def test_same_player_read_twice_is_only_awarded_once():
+    # Test exact-match dedup (case/whitespace variants).
     matched, unmatched = match_names(["Kobe", "kobe", "  KOBE"], KNOWN)
     assert _players(matched) == ["Kobe"]
+    assert unmatched == []
+
+
+def test_dedup_across_fuzzy_matches():
+    # Two different raw strings, both fuzzy-matching to the same known player.
+    # Dedup must happen by RESOLVED PLAYER, not by normalized raw string.
+    # "ToastdBread" (single-char omission) and "ToastedBrea" (single-char omission)
+    # both score ~0.917 above the 0.85 threshold, but resolve to the same player.
+    matched, unmatched = match_names(
+        ["ToastdBread", "ToastedBrea"], ["ToastedBread"]
+    )
+    # Only one Match should be produced; the second is deduplicated.
+    assert len(matched) == 1
+    assert matched[0].player == "ToastedBread"
+    # Verify the match score reflects fuzzy matching, not exact.
+    assert 0.85 <= matched[0].score < 1.0
     assert unmatched == []
 
 
