@@ -326,11 +326,15 @@ def test_run_does_not_exit_while_a_restart_is_pending():
         )
         assert not gave_up_early, "supervisor exited during the restart delay"
 
-        # ...and the restart isn't just deferred, it actually happens.
-        assert _wait_until(
-            lambda: len(_child_pids(harness.pid)) == 1,
-            timeout=restart_delay + 3.0,
-        )
+        # ...and the restart isn't just deferred, it actually happens. Not
+        # checked by polling for the relaunched pid here: EXIT_CRASH exits
+        # within tens of milliseconds of relaunch, so catching it alive
+        # via pgrep is a coin flip. Instead just give the next tick --
+        # which should trigger the relaunch -- time to actually fire; the
+        # stdout-count assertion after the harness is torn down is what
+        # deterministically proves the relaunch happened, by reading the
+        # supervisor's own log rather than racing a live process.
+        time.sleep(restart_delay + 1.0)
     finally:
         if harness.poll() is None:
             harness.terminate()
