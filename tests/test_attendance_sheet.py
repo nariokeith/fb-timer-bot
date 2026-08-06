@@ -1,3 +1,4 @@
+import gspread.utils
 import pytest
 
 from attendance_sheet import (
@@ -53,8 +54,12 @@ def test_treats_a_blank_cell_as_zero(ws):
 
 
 def test_negative_points_subtract_for_undo(ws):
+    # Kobe's Lady Dalia cell is "2"; -2 nets to exactly 0, which is written
+    # back as blank rather than the integer 0 (see
+    # test_a_result_of_exactly_zero_is_written_as_blank_not_the_integer_zero
+    # for the dedicated coverage of that rule).
     assert plan_point_writes(ws, ["Kobe"], 6, -2) == [
-        {"range": "F4", "values": [[0]]}
+        {"range": "F4", "values": [[""]]}
     ]
 
 
@@ -251,6 +256,90 @@ def test_a_plain_whole_number_cell_still_parses_normally():
 def test_blank_cell_still_yields_zero_after_the_whole_number_check(ws):
     assert plan_point_writes(ws, ["ARCILynN"], 3, 3) == [
         {"range": "C2", "values": [[3]]}
+    ]
+
+
+def test_a_result_of_exactly_zero_is_written_as_blank_not_the_integer_zero():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", "1"],
+    ])
+    assert plan_point_writes(ws, ["ARCILynN"], 3, -1) == [
+        {"range": "C2", "values": [[""]]}
+    ]
+
+
+def test_a_nonzero_result_after_subtracting_still_writes_an_integer():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", "3"],
+    ])
+    assert plan_point_writes(ws, ["ARCILynN"], 3, -1) == [
+        {"range": "C2", "values": [[2]]}
+    ]
+
+
+def test_a_nonzero_result_after_adding_still_writes_an_integer():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", "1"],
+    ])
+    assert plan_point_writes(ws, ["ARCILynN"], 3, 1) == [
+        {"range": "C2", "values": [[2]]}
+    ]
+
+
+def test_a_blank_cell_plus_one_still_writes_the_integer_one():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", ""],
+    ])
+    assert plan_point_writes(ws, ["ARCILynN"], 3, 1) == [
+        {"range": "C2", "values": [[1]]}
+    ]
+
+
+def _apply_to_fake_grid(ws, payload):
+    """Mirror a batch payload into FakeWorksheet's own grid.
+
+    FakeWorksheet.batch_update only records what was sent (matching what a
+    real gspread mock would assert on); it does not mutate `_rows`. This
+    test needs the grid to actually reflect each write to prove the
+    round-trip, so it replays the payload through update_cell -- which
+    FakeWorksheet does apply -- the same way real Sheets would apply a
+    batch_update to the live cells.
+    """
+    apply_writes(ws, payload)
+    for cell in payload:
+        row, col = gspread.utils.a1_to_rowcol(cell["range"])
+        ws.update_cell(row, col, cell["values"][0][0])
+
+
+def test_blank_then_commit_then_undo_then_commit_again_reads_one_not_two():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", ""],
+    ])
+
+    commit_payload = plan_point_writes(ws, ["ARCILynN"], 3, 1)
+    assert commit_payload == [{"range": "C2", "values": [[1]]}]
+    _apply_to_fake_grid(ws, commit_payload)
+
+    undo_payload = plan_point_writes(ws, ["ARCILynN"], 3, -1)
+    assert undo_payload == [{"range": "C2", "values": [[""]]}]
+    _apply_to_fake_grid(ws, undo_payload)
+
+    recommit_payload = plan_point_writes(ws, ["ARCILynN"], 3, 1)
+    assert recommit_payload == [{"range": "C2", "values": [[1]]}]
+
+
+def test_a_negative_result_still_writes_the_negative_integer_not_blank():
+    ws = FakeWorksheet([
+        ["Player Name", "Points", "EGO"],
+        ["ARCILynN", "51", "1"],
+    ])
+    assert plan_point_writes(ws, ["ARCILynN"], 3, -2) == [
+        {"range": "C2", "values": [[-1]]}
     ]
 
 

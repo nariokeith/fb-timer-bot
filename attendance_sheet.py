@@ -170,7 +170,10 @@ def plan_point_writes(
 
     `points` may be negative, which is how undo reverses a log. Raises
     rather than returning a partial payload if any player is missing -- a
-    half-written attendance log is worse than none.
+    half-written attendance log is worse than none. When the computed
+    result for a cell is exactly 0, the payload writes an empty string
+    there instead of the integer 0, so a cell that nets back to nothing
+    (e.g. after an undo) reads as blank again rather than a visible zero.
 
     Concurrency note: this function reads the current grid and computes
     absolute values to write; it does not lock anything. If two callers
@@ -198,10 +201,17 @@ def plan_point_writes(
         row_number = rows_by_player[player.strip()]
         cell_address = gspread.utils.rowcol_to_a1(row_number, column_index)
         current = _cell_number(grid[row_number - 1], column_index, cell_address)
+        new_value = current + points
+        # A result of exactly 0 is written back as an empty string, not the
+        # integer 0. Arithmetic doesn't care -- column B's SUM treats them
+        # identically -- but a cell that was blank before this row's history
+        # began (never boss-attended, or later undone back to nothing)
+        # should read as blank again rather than gradually speckling a
+        # hand-maintained sheet with visible zeros over time.
         payload.append(
             {
                 "range": cell_address,
-                "values": [[current + points]],
+                "values": [[new_value if new_value != 0 else ""]],
             }
         )
     return payload
