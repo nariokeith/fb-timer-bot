@@ -26,8 +26,13 @@ AMBIGUITY_MARGIN = 0.05
 
 # In-game names that differ from the sheet's row for the same person.
 # Keys are what the OCR reads; values are the exact sheet row.
+# Some in-game names share no characters with their sheet row (e.g. a Japanese
+# in-game name and a Filipino nickname in Latin script). Aliases are the ONLY
+# resolution path for these cases -- no fuzzy threshold, however low, could ever
+# match them. Fuzzy matching is not an alternative here.
 ALIASES = {
     "KobePH": "Kobe",
+    "面白い": "chinchong ni Mumu",
 }
 
 

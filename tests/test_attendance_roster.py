@@ -153,3 +153,32 @@ def test_dedup_across_alias_and_exact_match():
     assert len(matched) == 1
     assert matched[0].player == "Kobe"
     assert unmatched == []
+
+
+def test_japanese_alias_resolves():
+    # 面白い (in-game) is an alias for chinchong ni Mumu (sheet row).
+    # In-game Japanese name shares no characters with the Filipino nickname.
+    matched, unmatched = match_names(["面白い"], KNOWN)
+    assert _players(matched) == ["chinchong ni Mumu"]
+    assert matched[0].score == 1.0
+    assert unmatched == []
+
+
+def test_alias_resolves_with_zero_similarity():
+    # Some aliases target sheet rows with zero character overlap.
+    # This test proves aliases work even when SequenceMatcher scores 0.0.
+    # This is critical: it documents why aliases cannot be replaced by
+    # threshold tuning, and it will fail loudly if someone tries to "simplify"
+    # by removing aliases in favour of fuzzy matching.
+    from difflib import SequenceMatcher
+
+    # Verify the similarity is indeed 0.0 (no shared characters).
+    score = SequenceMatcher(None, normalize("面白い"), normalize("chinchong ni mumu")).ratio()
+    assert score < 0.85, f"Expected similarity < 0.85, got {score} (test precondition failed)"
+
+    # But the alias still resolves with score 1.0 (definite match).
+    matched, unmatched = match_names(["面白い"], KNOWN)
+    assert len(matched) == 1
+    assert matched[0].player == "chinchong ni Mumu"
+    assert matched[0].score == 1.0
+    assert unmatched == []
