@@ -1,0 +1,94 @@
+"""Match names read off a screenshot against the players already in the sheet.
+
+The bot never invents a player row. Every raw string either resolves to a
+name already in column A, or it is reported as unmatched for a human to
+sort out. That constraint is what lets a free OCR engine be good enough --
+this is matching against ~35 known strings, not open transcription.
+"""
+
+import unicodedata
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+
+# A single-character misread in an 11-character name scores about 0.909,
+# so 0.85 accepts realistic OCR noise. Unrelated names top out near 0.53.
+MATCH_THRESHOLD = 0.85
+
+# The best candidate must beat the runner-up by this much. Without it,
+# "Kobe0" against "Kobe01" and "Kobe02" (both 0.909) would award points
+# to whichever happened to sort first.
+AMBIGUITY_MARGIN = 0.05
+
+
+@dataclass(frozen=True)
+class Match:
+    raw: str
+    player: str
+    score: float
+
+
+def normalize(name: str) -> str:
+    """Casefold and collapse whitespace, preserving non-ASCII characters.
+
+    NFKC rather than stripping to ASCII, because real player names contain
+    characters like the one in "wileKAMOTE卐".
+    """
+    folded = unicodedata.normalize("NFKC", name).casefold()
+    return " ".join(folded.split())
+
+
+def _score(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _best_candidate(target: str, index: dict[str, str]) -> tuple[str, float] | None:
+    """Highest-scoring player for `target`, or None if unclear."""
+    scored = sorted(
+        ((_score(target, key), player) for key, player in index.items()),
+        reverse=True,
+    )
+    if not scored:
+        return None
+
+    best_score, best_player = scored[0]
+    if best_score < MATCH_THRESHOLD:
+        return None
+    if len(scored) > 1 and best_score - scored[1][0] < AMBIGUITY_MARGIN:
+        return None
+    return best_player, best_score
+
+
+def match_names(
+    raw_names: list[str], known_players: list[str]
+) -> tuple[list[Match], list[str]]:
+    """Resolve raw strings to known players.
+
+    Returns (matched, unmatched). Matches are deduplicated by resolved
+    player, so a name the model reads twice never earns double points.
+    """
+    index = {normalize(p): p for p in known_players if p.strip()}
+
+    matched: list[Match] = []
+    unmatched: list[str] = []
+    seen: set[str] = set()
+
+    for raw in raw_names:
+        target = normalize(raw)
+        if not target:
+            continue
+
+        if target in index:
+            player, score = index[target], 1.0
+        else:
+            candidate = _best_candidate(target, index)
+            if candidate is None:
+                unmatched.append(raw)
+                continue
+            player, score = candidate
+
+        if player in seen:
+            continue
+        seen.add(player)
+        matched.append(Match(raw=raw, player=player, score=score))
+
+    return matched, unmatched
