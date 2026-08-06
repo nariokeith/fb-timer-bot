@@ -58,10 +58,12 @@ def test_resolves_a_unique_prefix():
     assert resolve_boss(HEADERS, "gen") == "General Aqueus"
 
 
-def test_prefix_matching_is_on_the_full_header_name():
-    # "dal" is not a prefix of "Lady Dalia", so it must not match.
-    with pytest.raises(BossNotFound):
-        resolve_boss(HEADERS, "dal")
+def test_substring_match_resolves_when_prefix_does_not():
+    # "dal" is not a prefix of "Lady Dalia", but it is a substring.
+    # It should resolve via the substring fallback stage.
+    assert resolve_boss(HEADERS, "dal") == "Lady Dalia"
+    # But "dalia" (the full last part) also works via substring.
+    assert resolve_boss(HEADERS, "dalia") == "Lady Dalia"
 
 
 def test_ambiguous_prefix_names_the_candidates():
@@ -89,3 +91,38 @@ def test_blank_headers_are_ignored():
 
 def test_three_pointer_names_are_stored_without_stray_whitespace():
     assert BOSSES_WORTH_3 == {b.strip() for b in BOSSES_WORTH_3}
+
+
+def test_prefix_beats_substring():
+    # When one column starts with the query and another merely contains it,
+    # the prefix one should win without ambiguity.
+    headers = ["Player Name", "Points", "Ordo", "Lady Ordo"]
+    assert resolve_boss(headers, "ordo") == "Ordo"
+
+
+def test_ambiguous_substring_raises():
+    # Multiple columns containing the substring should raise BossAmbiguous.
+    # Use "aj" which appears in both "Rakajeth" and "Tajah" but doesn't start either.
+    headers = ["Player Name", "Points", "Rakajeth", "Tajah"]
+    with pytest.raises(BossAmbiguous) as excinfo:
+        resolve_boss(headers, "aj")
+    assert "Rakajeth" in str(excinfo.value)
+    assert "Tajah" in str(excinfo.value)
+
+
+def test_structural_columns_excluded_from_substring_match():
+    # "play" should not resolve to "Player Name" even via substring.
+    with pytest.raises(BossNotFound):
+        resolve_boss(HEADERS, "play")
+
+
+def test_missing_boss_still_raises():
+    # A boss with no attendance column should still raise BossNotFound.
+    with pytest.raises(BossNotFound):
+        resolve_boss(HEADERS, "venatus")
+
+
+def test_exact_match_wins_over_substring():
+    # If there's an exact match, it should win even if other substring matches exist.
+    headers = ["Player Name", "Points", "EGO", "Ego Whip"]
+    assert resolve_boss(headers, "ego") == "EGO"

@@ -51,9 +51,9 @@ def _boss_headers(headers: list[str]) -> list[str]:
 def resolve_boss(headers: list[str], query: str) -> str:
     """Match a typed name against the sheet's boss columns.
 
-    Case-insensitive exact match first, then unique prefix -- the same
-    convention bot.py uses for its own commands. Never guesses: an input
-    matching nothing, or several columns, raises.
+    Resolution order: case-insensitive exact match, then unique prefix,
+    then unique substring. Never guesses: an input matching nothing, or
+    several columns at any stage, raises.
     """
     wanted = query.strip().casefold()
     if not wanted:
@@ -61,15 +61,27 @@ def resolve_boss(headers: list[str], query: str) -> str:
 
     names = _boss_headers(headers)
 
+    # Stage 1: Exact match
     for name in names:
         if name.casefold() == wanted:
             return name
 
-    matches = [name for name in names if name.casefold().startswith(wanted)]
-    if len(matches) == 1:
-        return matches[0]
-    if matches:
+    # Stage 2: Prefix match
+    prefix_matches = [name for name in names if name.casefold().startswith(wanted)]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+    if prefix_matches:
         raise BossAmbiguous(
-            f"{query!r} matches several columns: {', '.join(sorted(matches))}"
+            f"{query!r} matches several columns: {', '.join(sorted(prefix_matches))}"
         )
+
+    # Stage 3: Substring match
+    substring_matches = [name for name in names if wanted in name.casefold()]
+    if len(substring_matches) == 1:
+        return substring_matches[0]
+    if substring_matches:
+        raise BossAmbiguous(
+            f"{query!r} matches several columns: {', '.join(sorted(substring_matches))}"
+        )
+
     raise BossNotFound(f"No column matches {query!r}")
