@@ -25,13 +25,14 @@ from attendance_bosses import BossAmbiguous, BossNotFound, boss_points, resolve_
 from attendance_roster import DuplicatePlayerName, match_names
 from attendance_sheet import (
     SheetStructureError,
+    any_image_already_logged,
     append_log_entry,
     apply_writes,
     find_column,
-    image_already_logged,
     last_unreversed_entry,
     mark_entry_reversed,
     open_spreadsheet,
+    parse_image_hashes,
     plan_point_writes,
     read_config,
     read_headers,
@@ -304,15 +305,46 @@ def _spreadsheet():
     return open_spreadsheet(SHEET_ID, SERVICE_ACCOUNT_JSON)
 
 
-def _officer_role_id(spreadsheet) -> int | None:
-    raw = read_config(spreadsheet).get("officer_role_id", "")
-    return int(raw) if raw.isdigit() else None
+OFFICER_ROLES_KEY = "officer_role_ids"  # JSON list of ids
+LEGACY_OFFICER_ROLE_KEY = "officer_role_id"  # single id, pre-multi-role
 
 
-def _is_officer(member, role_id: int | None) -> bool:
-    if role_id is None:
+def _officer_role_ids(spreadsheet) -> list[int]:
+    """Every role allowed to use this bot, newest config format first.
+
+    The guild needs more than one officer role, so the set is stored as a
+    JSON list under `officer_role_ids`. The live sheet still holds only
+    the older single `officer_role_id`, so that is read as a fallback --
+    the guild's existing setup keeps working without anyone re-running
+    !setofficerrole. Returns [] when nothing is configured, which callers
+    treat as "not configured yet" and refuse on.
+    """
+    config = read_config(spreadsheet)
+
+    raw = config.get(OFFICER_ROLES_KEY, "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [
+                int(text)
+                for text in (str(value).strip() for value in parsed)
+                if text.isdigit()
+            ]
+        return []
+
+    legacy = config.get(LEGACY_OFFICER_ROLE_KEY, "").strip()
+    return [int(legacy)] if legacy.isdigit() else []
+
+
+def _is_officer(member, role_ids) -> bool:
+    """True if the member holds ANY of the configured officer roles."""
+    wanted = set(role_ids or ())
+    if not wanted:
         return False
-    return any(role.id == role_id for role in getattr(member, "roles", []))
+    return any(role.id in wanted for role in getattr(member, "roles", []))
 
 
 def _parse_players(raw: str) -> list[str]:
@@ -341,8 +373,8 @@ def _load_context(spreadsheet, boss_query: str) -> dict:
     """Everything the preview needs except the duplicate flag.
 
     The duplicate flag needs the image's hash, which is only known once
-    the attachment has been downloaded -- see image_already_logged, called
-    separately by the caller once it has the bytes.
+    the images have been downloaded -- see any_image_already_logged,
+    called separately by the caller once it has every image's bytes.
 
     Read-only, so it does not need _SHEET_LOCK: nothing it returns is
     written back without a fresh read inside the locked commit. Takes an
@@ -409,10 +441,12 @@ def _commit(
     """
     spreadsheet = _spreadsheet()
 
-    if not was_duplicate and image_already_logged(spreadsheet, entry["image_sha256"]):
+    if not was_duplicate and any_image_already_logged(
+        spreadsheet, parse_image_hashes(entry["image_sha256"])
+    ):
         raise AlreadyLoggedDuringPreview(
-            "This screenshot was logged by someone else while this preview "
-            "was open. Nothing was written, to avoid paying twice."
+            "One of these screenshots was logged by someone else while this "
+            "preview was open. Nothing was written, to avoid paying twice."
         )
 
     worksheet = spreadsheet.worksheet(tab)
@@ -478,9 +512,15 @@ def _set_target_tab(tab: str) -> None:
     write_config(spreadsheet, "target_tab", tab)
 
 
-def _set_officer_role(role_id: str) -> None:
-    """Store the officer role id. Run only via _locked."""
-    write_config(_spreadsheet(), "officer_role_id", role_id)
+def _set_officer_roles(role_ids: list[int]) -> None:
+    """Replace the whole set of officer roles. Run only via _locked.
+
+    Written under the new key. The legacy `officer_role_id` row is left
+    alone deliberately -- _officer_role_ids prefers this key whenever it
+    is present, so the stale row is inert, and not touching it means a
+    rollback to an older build still finds the guild's original config.
+    """
+    write_config(_spreadsheet(), OFFICER_ROLES_KEY, json.dumps(role_ids))
 
 
 # A stuck gspread call has no timeout of its own by default (see
@@ -614,15 +654,19 @@ async def _open_spreadsheet_or_reject(ctx):
         return None
 
 
-async def _require_officer(ctx, spreadsheet) -> int | None:
-    """The configured officer role id, or None once a refusal has been sent."""
+async def _require_officer(ctx, spreadsheet) -> list[int] | None:
+    """The configured officer role ids, or None once a refusal has been sent.
+
+    Never returns an empty list: no roles configured is itself a refusal,
+    so callers can keep testing `is None`.
+    """
     try:
-        role_id = await asyncio.to_thread(_officer_role_id, spreadsheet)
+        role_ids = await asyncio.to_thread(_officer_role_ids, spreadsheet)
     except Exception as exc:
         await _reject(ctx, "❌ Sheet Unreachable", error_text(exc))
         return None
 
-    if role_id is None:
+    if not role_ids:
         await _reject(
             ctx,
             "⚙️ Not Configured Yet",
@@ -631,12 +675,12 @@ async def _require_officer(ctx, spreadsheet) -> int | None:
         )
         return None
 
-    if not _is_officer(ctx.author, role_id):
+    if not _is_officer(ctx.author, role_ids):
         await _reject(
             ctx, "\U0001f6ab Officers Only", "Only officers can record attendance."
         )
         return None
-    return role_id
+    return role_ids
 
 
 @bot.event
@@ -680,8 +724,8 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     if spreadsheet is None:
         return
 
-    role_id = await _require_officer(ctx, spreadsheet)
-    if role_id is None:
+    role_ids = await _require_officer(ctx, spreadsheet)
+    if role_ids is None:
         return
 
     if not boss_name:
@@ -701,16 +745,29 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         )
         return
 
-    attachment = ctx.message.attachments[0]
-    content_type = attachment.content_type or ""
-    if not content_type.startswith("image/"):
+    # EVERY image, not just the first. A rally with more players than fit
+    # on one screen is normal usage: the owner posted two screenshots and
+    # the bot read one of them, then showed a confident, complete-looking
+    # preview that silently omitted the two players on the second image.
+    # Non-image attachments are skipped rather than refused, so a stray
+    # file alongside real screenshots does not block the command.
+    images = [
+        attachment
+        for attachment in ctx.message.attachments
+        if (attachment.content_type or "").startswith("image/")
+    ]
+    if not images:
         await _reject(
-            ctx, "\U0001f5bc️ Not An Image", "That attachment is not an image."
+            ctx, "\U0001f5bc️ Not An Image", "No attachment on that message is an image."
         )
         return
 
     working = await ctx.send(
-        embed=make_embed("\U0001f50e Reading Screenshot", "Working on it...")
+        embed=make_embed(
+            "\U0001f50e Reading Screenshot"
+            f"{'s' if len(images) != 1 else ''}",
+            f"Working on {len(images)} image{'s' if len(images) != 1 else ''}...",
+        )
     )
 
     try:
@@ -723,40 +780,64 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         return
 
     boss, points = context["boss"], context["points"]
-    await working.edit(
-        embed=make_embed("\U0001f50e Reading Screenshot", f"Working on **{boss}**...")
-    )
 
-    try:
-        image_bytes = await attachment.read()
-        raw_names = await asyncio.to_thread(
-            extract_names, image_bytes, content_type.split(";")[0].strip()
-        )
-    except VisionError as exc:
+    raw_names: list[str] = []
+    image_hashes: list[str] = []
+    names_per_image: list[int] = []
+
+    for position, attachment in enumerate(images, start=1):
         await working.edit(
             embed=make_embed(
-                "❌ Couldn't Read That",
-                error_text(exc),
-                footer="Try a clearer or less cropped screenshot.",
+                "\U0001f50e Reading Screenshot"
+                f"{'s' if len(images) != 1 else ''}",
+                f"Working on **{boss}** — image {position} of {len(images)}...",
             )
         )
-        return
-    except Exception as exc:
-        await working.edit(
-            embed=make_embed("❌ Couldn't Read That", error_text(exc))
-        )
-        return
+        mime = (attachment.content_type or "").split(";")[0].strip()
+        try:
+            image_bytes = await attachment.read()
+            names = await asyncio.to_thread(extract_names, image_bytes, mime)
+        except VisionError as exc:
+            # Abort the WHOLE command. Logging the names from the images
+            # that did read would silently underpay everyone who only
+            # appeared on the failed one -- the same silent-omission bug
+            # this multi-image support exists to fix, just harder to spot.
+            await working.edit(
+                embed=make_embed(
+                    "❌ Couldn't Read That",
+                    f"Image **{position} of {len(images)}** could not be read:"
+                    f"\n\n{error_text(exc)}\n\n**Nothing was written.** Re-post "
+                    f"with a clearer version of that image.",
+                    footer="All images must read successfully, so nobody is "
+                           "left out of a partial roster.",
+                )
+            )
+            return
+        except Exception as exc:
+            await working.edit(
+                embed=make_embed(
+                    "❌ Couldn't Read That",
+                    f"Image **{position} of {len(images)}** could not be read:"
+                    f"\n\n{error_text(exc)}\n\n**Nothing was written.**",
+                )
+            )
+            return
 
-    # Hashed here, not from attachment.id: Discord mints a new attachment
-    # id on every upload, so id-based duplicate detection never fires on a
-    # genuine re-post of the same picture. The hash of the bytes is the
-    # same every time, which is what "already logged" needs to mean. Must
-    # come after attachment.read() above -- the hash is of the actual
-    # image content, not anything derivable before downloading it.
-    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+        # Hashed here, not from attachment.id: Discord mints a new
+        # attachment id on every upload, so id-based duplicate detection
+        # never fires on a genuine re-post of the same picture. The hash
+        # of the bytes is the same every time, which is what "already
+        # logged" needs to mean. Must come after attachment.read() --
+        # the hash is of the actual image content, not anything derivable
+        # before downloading it. One hash per image, so a partial re-post
+        # of just one screenshot is still caught.
+        image_hashes.append(hashlib.sha256(image_bytes).hexdigest())
+        names_per_image.append(len(names))
+        raw_names.extend(names)
+
     try:
         duplicate = await asyncio.to_thread(
-            image_already_logged, spreadsheet, image_sha256
+            any_image_already_logged, spreadsheet, image_hashes
         )
     except Exception as exc:
         await working.edit(embed=make_embed("❌ Sheet Problem", error_text(exc)))
@@ -791,6 +872,18 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         footer=f"React {CONFIRM_EMOJI} within {PREVIEW_TIMEOUT}s to write. "
                "Nothing is saved until you do.",
     )
+    # Shown always, not only for several images: the owner needs to see at
+    # a glance that every screenshot they posted was actually used. A
+    # preview that looks complete while quietly having read one of two
+    # images is the exact failure this makes visible.
+    embed.add_field(
+        name=f"\U0001f5bc️ Screenshots Read ({len(images)})",
+        value="\n".join(
+            f"Image {position}: {count} name{'s' if count != 1 else ''}"
+            for position, count in enumerate(names_per_image, start=1)
+        )[:1024],
+        inline=False,
+    )
     embed.add_field(
         name=f"✅ Matched ({len(players)})",
         value="\n".join(players)[:1024],
@@ -816,13 +909,14 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
 
     # Officer-only gates the approval too, not just the command: anyone
     # can react, so a non-officer must not be able to approve someone
-    # else's preview. role_id is the one already fetched above.
+    # else's preview. role_ids is the full configured set already fetched
+    # above, so every permitted role can confirm -- not just the first.
     def check(reaction, user):
         return (
             reaction.message.id == working.id
             and str(reaction.emoji) == CONFIRM_EMOJI
             and user.id != bot.user.id
-            and _is_officer(user, role_id)
+            and _is_officer(user, role_ids)
         )
 
     try:
@@ -846,8 +940,13 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         "boss": boss,
         "points_each": points,
         "message_id": str(ctx.message.id),
-        "attachment_id": str(attachment.id),
-        "image_sha256": image_sha256,
+        # First image's id. attachment_id is only row identity for
+        # mark_entry_reversed's re-check, never duplicate detection, so
+        # one stable id per row is all it has to be.
+        "attachment_id": str(images[0].id),
+        # JSON list, one hash per image. The column name is unchanged, so
+        # no header migration -- see parse_image_hashes.
+        "image_sha256": json.dumps(image_hashes),
         "confirmed_by": str(confirmer),
         # JSON, not comma-joined -- see _parse_players.
         "players": json.dumps(players),
@@ -1040,17 +1139,42 @@ async def set_week_cmd(ctx: commands.Context, *, tab_name: str = ""):
 
 @bot.command(name="setofficerrole")
 @commands.has_permissions(administrator=True)
-async def set_officer_role_cmd(ctx: commands.Context, role: discord.Role):
-    """Choose which role may log attendance: !setofficerrole @Officer"""
+async def set_officer_role_cmd(ctx: commands.Context, *roles: discord.Role):
+    """Choose which roles may log attendance: !setofficerrole @Officer @Council
+
+    Replaces the whole set, so the mentions given here become exactly the
+    roles permitted. Administrator-only, unchanged.
+    """
+    if not roles:
+        await _reject(
+            ctx,
+            "❓ Which Role?",
+            "Usage: `!setofficerrole @role [@role ...]`",
+            footer="Every role you list replaces the current set.",
+        )
+        return
+
+    # Deduplicated by id, order preserved, so mentioning a role twice does
+    # not store it twice. Keyed on the id rather than the role object so
+    # this never depends on Role being hashable.
+    unique = {}
+    for role in roles:
+        unique.setdefault(role.id, role)
+    role_ids = list(unique)
+
     try:
-        await _locked(_set_officer_role, str(role.id))
+        await _locked(_set_officer_roles, role_ids)
     except Exception as exc:
         await _reject(ctx, "❌ Sheet Problem", error_text(exc))
         return
 
+    mentions = ", ".join(role.mention for role in unique.values())
     await ctx.send(
         embed=make_embed(
-            "✅ Officer Role Set", f"{role.mention} can now record attendance."
+            "✅ Officer Roles Set",
+            f"{mentions} can now record attendance.",
+            footer=f"{len(role_ids)} role{'s' if len(role_ids) != 1 else ''} "
+                   "permitted. This replaced any previous set.",
         )
     )
 
@@ -1065,7 +1189,9 @@ async def attendance_help_cmd(ctx: commands.Context):
     )
     embed.add_field(
         name="!attendance <boss>",
-        value="Attach a roster screenshot. Officers only.", inline=False,
+        value="Attach one or more roster screenshots — every image is read "
+              "and the names are merged. Officers only.",
+        inline=False,
     )
     embed.add_field(
         name="!undoattendance",
@@ -1076,8 +1202,10 @@ async def attendance_help_cmd(ctx: commands.Context):
         value="Set the target tab, e.g. `Week 17.1`.", inline=False,
     )
     embed.add_field(
-        name="!setofficerrole @role",
-        value="Admins only. Sets who may log.", inline=False,
+        name="!setofficerrole @role [@role ...]",
+        value="Admins only. Sets every role that may log, replacing the "
+              "current set.",
+        inline=False,
     )
     await ctx.send(embed=embed)
 

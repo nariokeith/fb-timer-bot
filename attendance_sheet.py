@@ -481,21 +481,72 @@ def _is_reversed(value: str, row_number: int) -> bool:
     )
 
 
-def image_already_logged(spreadsheet, image_sha256: str) -> bool:
-    """True if this exact screenshot's pixels were logged and not later reversed.
+def parse_image_hashes(value: str) -> list[str]:
+    """The hashes held in an `image_sha256` cell, in either stored format.
 
-    Keyed on the image's own content hash, not attachment_id. Discord
+    One message can carry several screenshots, so new rows store a JSON
+    list of hashes -- one per image. Rows written before that stored a
+    single bare hex string, and the live sheet already contains them.
+    Both must read correctly: treating a legacy bare string as malformed
+    would make every existing row invisible to duplicate detection.
+
+    The column NAME is unchanged, so there is no header migration and
+    LOG_HEADER stays as it is -- only the value format is new.
+
+    Unparseable content yields no hashes rather than raising. This is the
+    one deliberate exception to this module's refuse-rather-than-guess
+    rule, and it is narrow: duplicate detection is advisory (it warns an
+    officer, it does not block them), so a corrupt cell degrades to "not
+    flagged as a duplicate" -- the officer still sees the full preview and
+    still decides. Raising instead would take down !attendance entirely
+    for every future screenshot because of one bad row.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [str(h).strip() for h in parsed if str(h).strip()]
+    return [raw]
+
+
+def any_image_already_logged(spreadsheet, image_hashes) -> bool:
+    """True if ANY of these images was logged and not later reversed.
+
+    Keyed on each image's own content hash, not attachment_id. Discord
     mints a new attachment_id on every upload, so the same PNG re-posted
     a week later gets a brand-new id and attachment_id-based detection
     would never notice -- it would look like a new, distinct screenshot
     every time. The hash is the same every time the same picture is
     posted, which is what "already logged" actually needs to mean.
+
+    ANY-match rather than all-match, because the realistic double-pay is a
+    PARTIAL re-post: someone posting just one of the two screenshots from
+    an earlier rally. A single combined hash over all the images would
+    differ from the original and sail straight through.
     """
-    return any(
-        entry["image_sha256"] == image_sha256
-        and not _is_reversed(entry["reversed"], number)
-        for number, entry in _log_rows(spreadsheet)
-    )
+    wanted = {h for h in (str(x).strip() for x in image_hashes) if h}
+    if not wanted:
+        return False
+
+    for number, entry in _log_rows(spreadsheet):
+        # Hash first, then the reversed check: an unrelated row with a
+        # malformed `reversed` cell must not raise on a lookup that would
+        # never have matched it anyway.
+        if wanted & set(parse_image_hashes(entry["image_sha256"])):
+            if not _is_reversed(entry["reversed"], number):
+                return True
+    return False
+
+
+def image_already_logged(spreadsheet, image_sha256: str) -> bool:
+    """True if this one screenshot was logged and not later reversed."""
+    return any_image_already_logged(spreadsheet, [image_sha256])
 
 
 def last_unreversed_entry(spreadsheet) -> tuple[int, dict] | None:

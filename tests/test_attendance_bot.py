@@ -8,6 +8,7 @@ each other's writes. No Discord client is started.
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import re
@@ -73,20 +74,33 @@ def test_whitespace_only_message_is_treated_as_empty():
 
 
 def test_member_with_no_roles_is_not_an_officer():
-    assert _is_officer(FakeMember(), 123) is False
+    assert _is_officer(FakeMember(), [123]) is False
 
 
 def test_wrong_role_id_is_not_an_officer():
-    assert _is_officer(FakeMember([FakeRole(999)]), 123) is False
+    assert _is_officer(FakeMember([FakeRole(999)]), [123]) is False
 
 
 def test_right_role_id_is_an_officer():
-    assert _is_officer(FakeMember([FakeRole(999), FakeRole(123)]), 123) is True
+    assert _is_officer(FakeMember([FakeRole(999), FakeRole(123)]), [123]) is True
 
 
 def test_unconfigured_role_id_denies_everyone():
-    # None means !setofficerrole has never been run; nobody may log.
+    # Empty means !setofficerrole has never been run; nobody may log.
+    assert _is_officer(FakeMember([FakeRole(123)]), []) is False
     assert _is_officer(FakeMember([FakeRole(123)]), None) is False
+
+
+def test_any_one_of_several_configured_roles_is_enough():
+    # The guild needs more than one officer role; holding the SECOND of
+    # three must be as good as holding the first.
+    configured = [111, 222, 333]
+    assert _is_officer(FakeMember([FakeRole(222)]), configured) is True
+    assert _is_officer(FakeMember([FakeRole(333)]), configured) is True
+
+
+def test_a_member_holding_none_of_the_configured_roles_is_refused():
+    assert _is_officer(FakeMember([FakeRole(444), FakeRole(555)]), [111, 222]) is False
 
 
 # --------------------------------------------------------------------------
@@ -184,7 +198,7 @@ def _reference_lines(name: str) -> list[str]:
 
 
 def test_every_mutating_helper_is_invoked_only_through_locked():
-    for name in ("_commit", "_reverse_last", "_set_target_tab", "_set_officer_role"):
+    for name in ("_commit", "_reverse_last", "_set_target_tab", "_set_officer_roles"):
         sites = _reference_lines(name)
         assert sites, f"{name} is never invoked; test is stale"
         for site in sites:
@@ -1052,3 +1066,374 @@ def test_undo_genuine_prewrite_failure_still_says_nothing_was_changed(monkeypatc
     assert len(ctx.sent) == 1
     _, kwargs, _ = ctx.sent[0]
     assert "Nothing To Undo" in kwargs["embed"].title
+
+
+# --------------------------------------------------------------------------
+# (LIVE-1) Every image on the message must be read. The owner posted two
+# screenshots of one rally; the bot read the first, ignored the second, and
+# showed a confident "Matched (19)" preview. Two players silently got
+# nothing and the preview gave no hint anything was missing.
+# --------------------------------------------------------------------------
+
+
+def _two_image_ctx():
+    return FakeCtx(
+        FakeMember([FakeRole(123)]),
+        attachments=[
+            FakeAttachment(content=b"rally-panel", att_id=1),
+            FakeAttachment(content=b"second-page", att_id=2),
+        ],
+    )
+
+
+def _confirm(monkeypatch):
+    async def fake_wait_for(event, check=None, timeout=None):
+        return (SimpleNamespace(), "Officer#1")
+
+    monkeypatch.setattr(attendance_bot.bot, "wait_for", fake_wait_for)
+
+
+def _by_image(mapping):
+    def fake_extract(image_bytes, mime, **kwargs):
+        return list(mapping[image_bytes])
+
+    return fake_extract
+
+
+def test_every_image_on_the_message_is_read(monkeypatch):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    monkeypatch.setattr(
+        attendance_bot,
+        "extract_names",
+        _by_image(
+            {
+                b"rally-panel": ["Kobe", "xSigarilyas"],
+                b"second-page": ["ARCILynN"],
+            }
+        ),
+    )
+    _confirm(monkeypatch)
+
+    ctx = _two_image_ctx()
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    # Lucus is column C; ARCILynN is row 2 and only appears on the SECOND
+    # image, so C2 is present only if that image was read at all.
+    ranges = {
+        cell["range"] for batch in sh.worksheet(TAB).batches for cell in batch
+    }
+    assert ranges == {"C2", "C3", "C4"}, f"second image was ignored: {ranges}"
+
+
+# --------------------------------------------------------------------------
+# (LIVE-2) More than one officer role. The guild's live config holds only
+# the legacy single key and must keep working untouched.
+# --------------------------------------------------------------------------
+
+LIVE_ROLE_ID = 1530553536503484426
+
+
+def test_the_legacy_single_officer_role_id_still_grants_access():
+    sh = FakeSpreadsheet({TAB: FakeWorksheet(SAMPLE_GRID, title=TAB)})
+    attendance_bot.write_config(sh, "officer_role_id", str(LIVE_ROLE_ID))
+
+    role_ids = attendance_bot._officer_role_ids(sh)
+
+    assert role_ids == [LIVE_ROLE_ID]
+    assert attendance_bot._is_officer(FakeMember([FakeRole(LIVE_ROLE_ID)]), role_ids)
+
+
+def test_a_player_on_both_images_is_paid_once(monkeypatch):
+    # Overlapping screenshots of one rally are normal: match_names
+    # deduplicates by resolved player, so the overlap must not double-pay.
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    monkeypatch.setattr(
+        attendance_bot,
+        "extract_names",
+        _by_image(
+            {
+                b"rally-panel": ["Kobe", "xSigarilyas"],
+                b"second-page": ["xSigarilyas", "ARCILynN"],
+            }
+        ),
+    )
+    _confirm(monkeypatch)
+
+    ctx = _two_image_ctx()
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    cells = [cell for batch in sh.worksheet(TAB).batches for cell in batch]
+    ranges = [cell["range"] for cell in cells]
+    assert sorted(ranges) == ["C2", "C3", "C4"]
+    assert len(ranges) == len(set(ranges)), "a player was written twice"
+    # xSigarilyas (row 3) starts at 3 in SAMPLE_GRID and Lucus is worth 3,
+    # so a single award lands on 6 -- not 9.
+    by_range = {cell["range"]: cell["values"][0][0] for cell in cells}
+    assert by_range["C3"] == 6
+
+
+def test_one_image_failing_vision_aborts_the_whole_command(monkeypatch):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    def flaky(image_bytes, mime, **kwargs):
+        if image_bytes == b"second-page":
+            raise VisionError("Gemini found no names in that image")
+        return ["Kobe"]
+
+    monkeypatch.setattr(attendance_bot, "extract_names", flaky)
+    _confirm(monkeypatch)
+
+    ctx = _two_image_ctx()
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    # A partial roster would silently underpay whoever was only on the
+    # image that failed, so nothing at all may be written.
+    assert not sh.worksheet(TAB).batches
+    description = ctx.sent[0][2].embed.description
+    assert "2 of 2" in description
+    assert "Nothing was written" in description
+
+
+def test_only_the_image_attachments_are_used(monkeypatch):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    seen = []
+
+    def fake_extract(image_bytes, mime, **kwargs):
+        seen.append(image_bytes)
+        return ["Kobe"]
+
+    monkeypatch.setattr(attendance_bot, "extract_names", fake_extract)
+    _confirm(monkeypatch)
+
+    ctx = FakeCtx(
+        FakeMember([FakeRole(123)]),
+        attachments=[
+            FakeAttachment(content=b"notes", content_type="text/plain", att_id=1),
+            FakeAttachment(content=b"rally-panel", att_id=2),
+            FakeAttachment(content=b"log.zip", content_type=None, att_id=3),
+        ],
+    )
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    assert seen == [b"rally-panel"], "a non-image attachment was sent to vision"
+    assert sh.worksheet(TAB).batches
+
+
+def test_a_message_whose_attachments_are_all_non_images_is_refused(monkeypatch):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    ctx = FakeCtx(
+        FakeMember([FakeRole(123)]),
+        attachments=[
+            FakeAttachment(content=b"notes", content_type="text/plain", att_id=1)
+        ],
+    )
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    assert "Not An Image" in ctx.sent[0][1]["embed"].title
+    assert not sh.worksheet(TAB).batches
+
+
+def test_the_preview_shows_how_many_images_were_read(monkeypatch):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    monkeypatch.setattr(
+        attendance_bot,
+        "extract_names",
+        _by_image(
+            {
+                b"rally-panel": ["Kobe", "xSigarilyas"],
+                b"second-page": ["ARCILynN"],
+            }
+        ),
+    )
+
+    preview = {}
+
+    async def capture_then_confirm(event, check=None, timeout=None):
+        preview["embed"] = ctx.sent[0][2].embed
+        return (SimpleNamespace(), "Officer#1")
+
+    monkeypatch.setattr(attendance_bot.bot, "wait_for", capture_then_confirm)
+
+    ctx = _two_image_ctx()
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    fields = {field.name: field.value for field in preview["embed"].fields}
+    screenshots = next(v for k, v in fields.items() if "Screenshots Read (2)" in k)
+    assert "Image 1: 2 names" in screenshots
+    assert "Image 2: 1 name" in screenshots
+
+
+# --------------------------------------------------------------------------
+# The image_sha256 cell: a JSON list now, a bare string on rows already in
+# the live sheet. Both must read, and any single hash matching is enough.
+# --------------------------------------------------------------------------
+
+
+def test_image_hashes_round_trip_as_a_json_list(monkeypatch):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
+    _confirm(monkeypatch)
+
+    ctx = _two_image_ctx()
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    logged = sh.worksheet(LOG_TAB).get_all_values()[-1]
+    stored = logged[LOG_HEADER.index("image_sha256")]
+    hashes = json.loads(stored)
+    assert hashes == [
+        hashlib.sha256(b"rally-panel").hexdigest(),
+        hashlib.sha256(b"second-page").hexdigest(),
+    ]
+    assert attendance_bot.parse_image_hashes(stored) == hashes
+
+
+def test_a_legacy_bare_hash_string_is_still_read():
+    # Rows written before multi-image support hold one bare hex hash.
+    assert attendance_bot.parse_image_hashes("abc123") == ["abc123"]
+    assert attendance_bot.parse_image_hashes("") == []
+    # Unparseable content degrades to "no hashes" rather than raising:
+    # duplicate detection is advisory, and one bad row must not take down
+    # !attendance for every future screenshot.
+    assert attendance_bot.parse_image_hashes("[not json") == []
+
+
+def test_a_legacy_bare_hash_row_still_flags_a_duplicate():
+    old_row = _entry(image_sha256="legacy-hash-value")
+    sh = FakeSpreadsheet(
+        {
+            TAB: FakeWorksheet(SAMPLE_GRID, title=TAB),
+            LOG_TAB: _log_tab([str(old_row[f]) for f in LOG_HEADER]),
+        }
+    )
+    assert attendance_bot.any_image_already_logged(sh, ["legacy-hash-value"])
+    assert not attendance_bot.any_image_already_logged(sh, ["some-other-hash"])
+
+
+def test_a_partial_repost_of_one_of_two_images_is_flagged():
+    # The realistic double-pay: someone re-posts just one screenshot from
+    # an earlier rally. A single combined hash over both images would
+    # differ from the original and sail straight through.
+    logged = _entry(image_sha256=json.dumps(["hash-A", "hash-B"]))
+    sh = FakeSpreadsheet(
+        {
+            TAB: FakeWorksheet(SAMPLE_GRID, title=TAB),
+            LOG_TAB: _log_tab([str(logged[f]) for f in LOG_HEADER]),
+        }
+    )
+
+    assert attendance_bot.any_image_already_logged(sh, ["hash-B"])
+    assert attendance_bot.any_image_already_logged(sh, ["hash-B", "hash-NEW"])
+    assert not attendance_bot.any_image_already_logged(sh, ["hash-NEW"])
+
+
+def test_a_reversed_row_no_longer_flags_a_duplicate():
+    logged = _entry(image_sha256=json.dumps(["hash-A"]), reversed="yes")
+    sh = FakeSpreadsheet(
+        {
+            TAB: FakeWorksheet(SAMPLE_GRID, title=TAB),
+            LOG_TAB: _log_tab([str(logged[f]) for f in LOG_HEADER]),
+        }
+    )
+    assert not attendance_bot.any_image_already_logged(sh, ["hash-A"])
+
+
+# --------------------------------------------------------------------------
+# Officer role configuration
+# --------------------------------------------------------------------------
+
+
+def test_the_new_key_is_preferred_over_the_legacy_one():
+    sh = FakeSpreadsheet({TAB: FakeWorksheet(SAMPLE_GRID, title=TAB)})
+    attendance_bot.write_config(sh, "officer_role_id", str(LIVE_ROLE_ID))
+    attendance_bot.write_config(sh, "officer_role_ids", json.dumps([111, 222, 333]))
+
+    assert attendance_bot._officer_role_ids(sh) == [111, 222, 333]
+
+
+def test_no_configuration_at_all_returns_no_roles():
+    sh = FakeSpreadsheet({TAB: FakeWorksheet(SAMPLE_GRID, title=TAB)})
+    assert attendance_bot._officer_role_ids(sh) == []
+
+
+def test_setting_several_roles_stores_them_as_a_json_list(monkeypatch):
+    sh = FakeSpreadsheet({TAB: FakeWorksheet(SAMPLE_GRID, title=TAB)})
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    ctx = FakeCtx(FakeMember())
+    roles = [
+        SimpleNamespace(id=111, mention="<@&111>"),
+        SimpleNamespace(id=222, mention="<@&222>"),
+        SimpleNamespace(id=111, mention="<@&111>"),  # duplicate mention
+    ]
+    asyncio.run(attendance_bot.set_officer_role_cmd.callback(ctx, *roles))
+
+    assert attendance_bot._officer_role_ids(sh) == [111, 222]
+
+    embed = ctx.sent[0][1]["embed"]
+    assert "<@&111>" in embed.description
+    assert "<@&222>" in embed.description
+
+
+def test_setofficerrole_with_no_roles_explains_the_usage(monkeypatch):
+    sh = FakeSpreadsheet({TAB: FakeWorksheet(SAMPLE_GRID, title=TAB)})
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    ctx = FakeCtx(FakeMember())
+    asyncio.run(attendance_bot.set_officer_role_cmd.callback(ctx))
+
+    assert "Which Role?" in ctx.sent[0][1]["embed"].title
+    assert attendance_bot._officer_role_ids(sh) == []
+
+
+def test_setofficerrole_is_still_administrator_only():
+    checks = attendance_bot.set_officer_role_cmd.checks
+    assert checks, "the administrator permission check was lost"
+
+
+def test_the_reaction_gate_accepts_any_configured_role(monkeypatch):
+    sh = FakeSpreadsheet({TAB: FakeWorksheet(SAMPLE_GRID, title=TAB)})
+    attendance_bot.write_config(sh, "officer_role_ids", json.dumps([111, 222]))
+    attendance_bot.write_config(sh, "target_tab", TAB)
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
+
+    seen = {}
+
+    async def capture_check(event, check=None, timeout=None):
+        seen["check"] = check
+        return (SimpleNamespace(), "Officer#1")
+
+    monkeypatch.setattr(attendance_bot.bot, "wait_for", capture_check)
+    # Bot.user is a read-only property, so patch it on the class.
+    monkeypatch.setattr(
+        type(attendance_bot.bot),
+        "user",
+        property(lambda self: SimpleNamespace(id=1)),
+    )
+
+    # The command is run by a holder of the FIRST role...
+    ctx = FakeCtx(FakeMember([FakeRole(111)]), attachments=[FakeAttachment()])
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    check = seen["check"]
+    reaction = SimpleNamespace(
+        message=SimpleNamespace(id=ctx.sent[0][2].id), emoji=attendance_bot.CONFIRM_EMOJI
+    )
+
+    # ...and a holder of the SECOND role may still confirm it.
+    second = FakeMember([FakeRole(222)])
+    second.id = 7
+    assert check(reaction, second) is True
+
+    outsider = FakeMember([FakeRole(999)])
+    outsider.id = 8
+    assert check(reaction, outsider) is False
