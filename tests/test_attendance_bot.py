@@ -148,18 +148,37 @@ def test_the_sheet_mutations_only_happen_inside_the_locked_helpers():
             assert site in allowed, f"{name} called outside the locked helpers: {site}"
 
 
-def _reference_lines(name: str) -> list[str]:
-    """Code lines mentioning `name`, excluding its own def, and comments."""
+def _statements() -> list[str]:
+    """Module source as logical statements, comments stripped.
+
+    Physical lines are joined while brackets are unbalanced, so a call
+    split across several lines is scanned as the single statement it is.
+    """
     source = inspect.getsource(attendance_bot)
-    pattern = re.compile(rf"(?<![\w.]){re.escape(name)}(?![\w])")
-    lines = []
+    statements, buffer, depth = [], "", 0
     for line in source.splitlines():
-        code = line.split("#")[0].strip()
-        if not code or code.startswith("def ") or code.startswith("async def "):
+        code = line.split("#")[0].rstrip()
+        if not code.strip():
             continue
-        if pattern.search(code):
-            lines.append(code)
-    return lines
+        buffer = f"{buffer} {code.strip()}" if buffer else code.strip()
+        depth += code.count("(") - code.count(")")
+        if depth <= 0:
+            statements.append(" ".join(buffer.split()))
+            buffer, depth = "", 0
+    if buffer:
+        statements.append(" ".join(buffer.split()))
+    return statements
+
+
+def _reference_lines(name: str) -> list[str]:
+    """Statements mentioning `name`, excluding its own definition."""
+    pattern = re.compile(rf"(?<![\w.]){re.escape(name)}(?![\w])")
+    return [
+        statement
+        for statement in _statements()
+        if pattern.search(statement)
+        and not statement.startswith(("def ", "async def ", "class "))
+    ]
 
 
 def test_every_mutating_helper_is_invoked_only_through_locked():
@@ -177,3 +196,224 @@ def test_the_lock_is_not_held_while_waiting_for_the_officers_reaction():
     source = inspect.getsource(attendance_bot.attendance_cmd.callback)
     assert "bot.wait_for(" in source
     assert "async with" not in source
+
+
+# --------------------------------------------------------------------------
+# Partial failure. Both sheet mutations are two-stage, and the second stage
+# can fail after the first has already landed. What the officer is told
+# after that decides whether they re-run and double-pay.
+# --------------------------------------------------------------------------
+
+
+import pytest
+
+from attendance_sheet import LOG_HEADER, SheetStructureError
+from conftest import SAMPLE_GRID, FakeSpreadsheet, FakeWorksheet
+
+TAB = "Week 17"
+ATTACHMENT = "1234567890"
+
+
+def _entry(**overrides):
+    entry = {
+        "timestamp": "2026-08-06T20:00:00+08:00",
+        "tab": TAB,
+        "boss": "Lucus",
+        "points_each": 3,
+        "message_id": "999",
+        "attachment_id": ATTACHMENT,
+        "confirmed_by": "Officer#1",
+        "players": "Kobe",
+        "reversed": "",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _log_tab(*rows):
+    return FakeWorksheet([list(LOG_HEADER), *rows], title="_BotLog")
+
+
+def _sheets(grid=None, log=None):
+    sheets = {TAB: FakeWorksheet(grid or SAMPLE_GRID, title=TAB)}
+    if log is not None:
+        sheets["_BotLog"] = log
+    return FakeSpreadsheet(sheets)
+
+
+@pytest.fixture
+def spreadsheet(monkeypatch):
+    """Install a fake spreadsheet and hand it back for assertions."""
+
+    def install(sh):
+        monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+        return sh
+
+    return install
+
+
+# (aa) points written, log row not
+
+
+def test_commit_that_fails_after_writing_points_says_so(spreadsheet, monkeypatch):
+    sh = spreadsheet(_sheets())
+
+    def boom(*args, **kwargs):
+        raise SheetStructureError("row 1 is not what this code expects")
+
+    monkeypatch.setattr(attendance_bot, "append_log_entry", boom)
+
+    with pytest.raises(attendance_bot.PointsWrittenButNotLogged) as caught:
+        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+
+    # The points really did land, so the officer must not be told otherwise.
+    assert sh.worksheet(TAB).batches, "points should already be in the sheet"
+
+    description = caught.value.description
+    assert "Nothing was written" not in description
+    assert "were added" in description
+    assert "not re-run" in description.replace("NOT", "not")
+    for detail in ("Lucus", "3", "Kobe", TAB):
+        assert detail in description
+
+
+def test_commit_that_fails_while_writing_points_writes_nothing(
+    spreadsheet, monkeypatch
+):
+    sh = spreadsheet(_sheets())
+    monkeypatch.setattr(
+        attendance_bot,
+        "apply_writes",
+        lambda *a, **k: (_ for _ in ()).throw(SheetStructureError("no")),
+    )
+
+    with pytest.raises(SheetStructureError):
+        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+
+    assert not sh.worksheet(TAB).batches
+    assert not isinstance(
+        SheetStructureError("no"), attendance_bot.PointsWrittenButNotLogged
+    )
+
+
+# (bb) points removed, entry not marked reversed
+
+
+def test_undo_that_fails_after_subtracting_says_the_points_are_already_gone(
+    spreadsheet, monkeypatch
+):
+    row = [str(_entry()[field]) for field in LOG_HEADER]
+    sh = spreadsheet(_sheets(log=_log_tab(row)))
+
+    def boom(*args, **kwargs):
+        raise SheetStructureError("update_cell failed")
+
+    monkeypatch.setattr(attendance_bot, "mark_entry_reversed", boom)
+
+    with pytest.raises(attendance_bot.PointsRemovedButNotMarked) as caught:
+        attendance_bot._reverse_last()
+
+    assert sh.worksheet(TAB).batches, "points should already be subtracted"
+
+    description = caught.value.description
+    assert "already" in description
+    assert "twice" in description
+    assert "not re-run" in description.replace("NOT", "not")
+    assert "Lucus" in description
+
+
+# (cc) the column must be re-resolved by boss name at commit time
+
+
+def test_commit_follows_the_boss_name_when_the_column_moves(spreadsheet):
+    # Preview resolved "Lucus" to column 3 (C). Between preview and commit
+    # someone inserts a column, so Lucus is now column 4 (D) and column 3
+    # holds a different boss entirely.
+    shifted = [
+        ["Player Name", "Points", "Nevaeh - 3", "Lucus - 3", "EGO", "Livera"],
+        ["ARCILynN", "51", "", "", "1", "3"],
+        ["xSigarilyas", "49", "", "3", "2", "3"],
+        ["Kobe", "44", "", "", "1", "3"],
+    ]
+    assert SAMPLE_GRID[0][2].startswith("Lucus")  # was column 3 at preview time
+
+    sh = spreadsheet(_sheets(grid=shifted))
+    attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+
+    ranges = [cell["range"] for batch in sh.worksheet(TAB).batches for cell in batch]
+    assert ranges == ["D4"], f"write followed a stale index instead of the name: {ranges}"
+
+
+def test_commit_takes_a_boss_name_not_a_column_index():
+    parameters = inspect.signature(attendance_bot._commit).parameters
+    assert "boss" in parameters
+    assert "column" not in parameters
+    assert "find_column" in inspect.getsource(attendance_bot._commit)
+
+
+def test_commit_refuses_when_the_boss_column_vanished_mid_preview(spreadsheet):
+    without_lucus = [
+        ["Player Name", "Points", "EGO", "Livera"],
+        ["Kobe", "44", "1", "3"],
+    ]
+    sh = spreadsheet(_sheets(grid=without_lucus))
+
+    with pytest.raises(SheetStructureError):
+        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+
+    assert not sh.worksheet(TAB).batches
+
+
+# duplicate confirmed by someone else during the 180s preview window
+
+
+def test_commit_aborts_if_the_screenshot_was_logged_during_the_preview(spreadsheet):
+    row = [str(_entry()[field]) for field in LOG_HEADER]
+    sh = spreadsheet(_sheets(log=_log_tab(row)))
+
+    # was_duplicate=False: the preview showed no warning, so this row
+    # appeared while the officer was deciding.
+    with pytest.raises(attendance_bot.AlreadyLoggedDuringPreview):
+        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+
+    assert not sh.worksheet(TAB).batches
+
+
+def test_commit_allows_a_duplicate_the_officer_was_warned_about(spreadsheet):
+    row = [str(_entry()[field]) for field in LOG_HEADER]
+    sh = spreadsheet(_sheets(log=_log_tab(row)))
+
+    # was_duplicate=True: the preview carried the "Already Logged" warning
+    # and the officer confirmed anyway, which is a legitimate re-log.
+    attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), True)
+
+    assert sh.worksheet(TAB).batches
+
+
+# --------------------------------------------------------------------------
+# (z) and the minors
+# --------------------------------------------------------------------------
+
+
+def test_the_builtin_help_command_is_disabled():
+    # "!help" is the only command name that collides with the production
+    # timer; leaving it enabled makes both bots answer.
+    assert attendance_bot.bot.help_command is None
+    assert "help" not in {command.name for command in attendance_bot.bot.commands}
+
+
+def test_attendance_consumes_the_rest_of_the_line_as_the_boss_name():
+    # "!attendance Lady Dalia" must not silently become "Lady".
+    parameter = inspect.signature(
+        attendance_bot.attendance_cmd.callback
+    ).parameters["boss_name"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_the_log_timestamp_is_manila_local_time():
+    stamp = attendance_bot._timestamp()
+    assert stamp.endswith("+08:00")
+    # ISO, second resolution, as append_log_entry stores it.
+    from datetime import datetime
+
+    assert datetime.fromisoformat(stamp).microsecond == 0

@@ -13,6 +13,7 @@ import asyncio
 import os
 import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -49,6 +50,11 @@ CONFIRM_EMOJI = "✅"
 PREVIEW_TIMEOUT = 180  # seconds
 EMBED_COLOR = discord.Color.orange()  # matches the timer's look
 
+# The guild reads Manila time; Render runs UTC. A naive datetime.now()
+# would stamp every log row eight hours off, and that value is shown back
+# to officers in the undo footer.
+TIMEZONE = ZoneInfo("Asia/Manila")
+
 # Serialises every sheet mutation this process performs.
 #
 # attendance_sheet's plan_point_writes/apply_writes pair is a
@@ -69,7 +75,90 @@ _SHEET_LOCK = asyncio.Lock()
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# help_command=None because the field boss timer defines its own !help in
+# the same guild with the same prefix. Leaving discord.py's built-in one
+# enabled makes both applications answer !help, and makes this bot reply
+# "No command called 'killed' found" to the timer's !help killed. That is
+# a visible regression in production behaviour. !attendancehelp covers
+# this bot's own commands, and on_command_error swallows the resulting
+# CommandNotFound.
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+
+class PointsWrittenButNotLogged(RuntimeError):
+    """apply_writes succeeded; append_log_entry did not.
+
+    A two-stage mutation can fail between the stages. Reporting this as a
+    plain failure ("Nothing was written") is actively dangerous: the
+    points ARE in the sheet, so the officer re-runs the command and pays
+    twice -- and because the audit row is missing, a later
+    !undoattendance would reverse some earlier entry instead.
+    """
+
+    def __init__(self, *, tab, boss, points, players, cause_text):
+        self.tab = tab
+        self.boss = boss
+        self.points = points
+        self.players = list(players)
+        self.cause_text = cause_text
+        super().__init__(
+            f"points for {boss} were added to {tab} but the log row was not "
+            f"written: {cause_text}"
+        )
+
+    @property
+    def description(self) -> str:
+        return (
+            f"**+{self.points}** for **{self.boss}** **were added** to "
+            f"**{self.tab}** for {len(self.players)} player"
+            f"{'s' if len(self.players) != 1 else ''}, but the audit log row "
+            f"could not be written.\n\n"
+            f"Please do **not re-run** this command — the points are already "
+            f"in the sheet and running it again would add them twice. "
+            f"`!undoattendance` cannot reverse this either, because there is "
+            f"no log row for it; it must be reconciled by hand.\n\n"
+            f"Players: {', '.join(self.players)}\n\nReason: {self.cause_text}"
+        )
+
+
+class PointsRemovedButNotMarked(RuntimeError):
+    """The undo's subtraction succeeded; mark_entry_reversed did not.
+
+    The mirror of PointsWrittenButNotLogged. The log row is still
+    reversed="", so mark_entry_reversed's attachment-id guard cannot catch
+    a retry -- the row genuinely is unreversed -- and a second
+    !undoattendance would subtract the same points again.
+    """
+
+    def __init__(self, *, entry, cause_text):
+        self.entry = dict(entry)
+        self.cause_text = cause_text
+        super().__init__(
+            f"points for {entry['boss']} were removed but the log entry could "
+            f"not be marked reversed: {cause_text}"
+        )
+
+    @property
+    def description(self) -> str:
+        return (
+            f"**{self.entry['points_each']}** points for "
+            f"**{self.entry['boss']}** have **already** been removed from "
+            f"**{self.entry['tab']}**, but the log entry could not be marked "
+            f"reversed.\n\n"
+            f"Please do **not re-run** `!undoattendance` — the entry still "
+            f"looks live, so running it again would remove those points "
+            f"twice. Mark the row reversed by hand instead.\n\n"
+            f"Players: {self.entry['players']}\n\nReason: {self.cause_text}"
+        )
+
+
+class AlreadyLoggedDuringPreview(RuntimeError):
+    """Another officer confirmed this same screenshot during the 180s wait."""
+
+
+def _timestamp() -> str:
+    """Now, in the guild's timezone, ISO with second resolution."""
+    return datetime.now(TIMEZONE).isoformat(timespec="seconds")
 
 
 def make_embed(
@@ -142,23 +231,71 @@ def _load_context(boss_query: str, attachment_id: str) -> dict:
     worksheet = spreadsheet.worksheet(tab)
     boss = resolve_boss(read_headers(worksheet), boss_query)
 
+    # find_column's result is deliberately discarded: calling it here only
+    # fails fast, before a Gemini request, if the boss has no column or
+    # has two. The index itself must not be carried across the preview --
+    # see _commit.
+    find_column(worksheet, boss)
+
     return {
         "tab": tab,
         "boss": boss,
         "points": boss_points(boss),
         "players": read_players(worksheet),
-        "column": find_column(worksheet, boss),
         "duplicate": attachment_already_logged(spreadsheet, attachment_id),
     }
 
 
-def _commit(tab: str, column: int, players: list[str], points: int,
-            entry: dict) -> None:
-    """Add the points and record the log entry. Run only via _locked."""
+def _commit(
+    tab: str,
+    boss: str,
+    players: list[str],
+    points: int,
+    entry: dict,
+    was_duplicate: bool,
+) -> None:
+    """Add the points and record the log entry. Run only via _locked.
+
+    Takes the boss NAME, not a column index. attendance_sheet locates
+    cells by content precisely so that reordering columns breaks nothing;
+    caching an index across the up-to-180-second preview would put that
+    coupling back, and an inserted column would silently send the write
+    into some other boss's column. Re-resolving here either lands on the
+    column headed by the boss the preview promised, or find_column
+    refuses loudly.
+
+    `was_duplicate` is what the preview told the officer. If the
+    screenshot was NOT flagged then but is logged now, another officer
+    confirmed it during the wait and this would double-pay, so it aborts.
+    If it WAS flagged, the officer saw the warning and chose to proceed --
+    a legitimate re-log, e.g. after an undo.
+    """
     spreadsheet = _spreadsheet()
+
+    if not was_duplicate and attachment_already_logged(
+        spreadsheet, entry["attachment_id"]
+    ):
+        raise AlreadyLoggedDuringPreview(
+            "This screenshot was logged by someone else while this preview "
+            "was open. Nothing was written, to avoid paying twice."
+        )
+
     worksheet = spreadsheet.worksheet(tab)
+    column = find_column(worksheet, boss)
     apply_writes(worksheet, plan_point_writes(worksheet, players, column, points))
-    append_log_entry(spreadsheet, entry)
+
+    # Past this line the points are in the sheet. Anything that fails now
+    # must be reported as a partial write, never as "nothing was written".
+    try:
+        append_log_entry(spreadsheet, entry)
+    except Exception as exc:
+        raise PointsWrittenButNotLogged(
+            tab=tab,
+            boss=boss,
+            points=points,
+            players=players,
+            cause_text=error_text(exc),
+        ) from exc
 
 
 def _reverse_last() -> dict | None:
@@ -171,15 +308,25 @@ def _reverse_last() -> dict | None:
     row_number, entry = found
     players = [p.strip() for p in entry["players"].split(",") if p.strip()]
     worksheet = spreadsheet.worksheet(entry["tab"])
+    # Resolved by name inside the lock, same reasoning as _commit.
     column = find_column(worksheet, entry["boss"])
 
     apply_writes(
         worksheet,
         plan_point_writes(worksheet, players, column, -int(entry["points_each"])),
     )
-    # The third argument is the row's attachment_id as just read: it makes
-    # mark_entry_reversed refuse if the row changed underneath us.
-    mark_entry_reversed(spreadsheet, row_number, entry["attachment_id"])
+
+    # Past this line the points are gone from the sheet.
+    try:
+        # The third argument is the row's attachment_id as just read: it
+        # makes mark_entry_reversed refuse if the row changed underneath
+        # us. It cannot catch a retry of THIS failure, though -- the row
+        # really is still unreversed -- hence the distinct exception.
+        mark_entry_reversed(spreadsheet, row_number, entry["attachment_id"])
+    except Exception as exc:
+        raise PointsRemovedButNotMarked(
+            entry=entry, cause_text=error_text(exc)
+        ) from exc
     return entry
 
 
@@ -212,6 +359,14 @@ async def _locked(func, *args):
 
 async def _reject(ctx, title: str, description: str, footer: str | None = None):
     await ctx.send(embed=make_embed(title, description, footer=footer))
+
+
+async def _safe_reject(ctx, title: str, description: str):
+    """_reject that cannot itself raise, for use inside the error handler."""
+    try:
+        await _reject(ctx, title, description)
+    except Exception as exc:  # e.g. no permission to post in this channel
+        print(f"Could not report {title!r}: {exc!r}", file=sys.stderr, flush=True)
 
 
 async def _require_officer(ctx) -> int | None:
@@ -255,19 +410,26 @@ async def on_command_error(ctx, error):
     """
     if isinstance(error, commands.CommandNotFound):
         return
+
+    # stderr first, and unconditionally: it is the one report that cannot
+    # itself fail. _safe_reject's send can (no permission to post in this
+    # channel), and an exception escaping the error handler is silent.
+    print(f"Command {ctx.command} failed: {error!r}", file=sys.stderr, flush=True)
+
     if isinstance(error, commands.MissingPermissions):
-        await _reject(ctx, "\U0001f6ab Admins Only", "That command needs Administrator.")
+        await _safe_reject(
+            ctx, "\U0001f6ab Admins Only", "That command needs Administrator."
+        )
         return
     if isinstance(error, (commands.UserInputError, commands.CheckFailure)):
-        await _reject(ctx, "❓ Couldn't Run That", error_text(error))
+        await _safe_reject(ctx, "❓ Couldn't Run That", error_text(error))
         return
 
-    print(f"Command {ctx.command} failed: {error!r}", file=sys.stderr, flush=True)
-    await _reject(ctx, "❌ Something Went Wrong", error_text(error))
+    await _safe_reject(ctx, "❌ Something Went Wrong", error_text(error))
 
 
 @bot.command(name="attendance")
-async def attendance_cmd(ctx: commands.Context, boss_name: str = ""):
+async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     """Log attendance from a roster screenshot: !attendance <boss> + image"""
     role_id = await _require_officer(ctx)
     if role_id is None:
@@ -405,7 +567,7 @@ async def attendance_cmd(ctx: commands.Context, boss_name: str = ""):
         return
 
     entry = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "timestamp": _timestamp(),
         "tab": context["tab"],
         "boss": boss,
         "points_each": points,
@@ -417,8 +579,31 @@ async def attendance_cmd(ctx: commands.Context, boss_name: str = ""):
     }
 
     try:
-        await _locked(_commit, context["tab"], context["column"], players, points, entry)
+        await _locked(
+            _commit,
+            context["tab"],
+            boss,
+            players,
+            points,
+            entry,
+            context["duplicate"],
+        )
+    except PointsWrittenButNotLogged as exc:
+        # The points landed and the log row did not. Saying "nothing was
+        # written" here is what makes an officer re-run and double-pay.
+        await working.edit(
+            embed=make_embed(
+                "⚠️ Partly Written — Do Not Re-Run",
+                exc.description,
+                footer=f"Confirmed by {confirmer}",
+            )
+        )
+        return
+    except AlreadyLoggedDuringPreview as exc:
+        await working.edit(embed=make_embed("⚠️ Already Logged", error_text(exc)))
+        return
     except Exception as exc:
+        # Reached only if apply_writes itself failed, so nothing landed.
         await working.edit(
             embed=make_embed(
                 "❌ Write Failed", f"{error_text(exc)}\n\nNothing was written."
@@ -444,8 +629,16 @@ async def undo_attendance_cmd(ctx: commands.Context):
 
     try:
         entry = await _locked(_reverse_last)
+    except PointsRemovedButNotMarked as exc:
+        # The subtraction landed and the reversed flag did not. "Undo
+        # Failed" would invite the retry that subtracts them twice.
+        await _reject(ctx, "⚠️ Partly Undone — Do Not Re-Run", exc.description)
+        return
     except Exception as exc:
-        await _reject(ctx, "❌ Undo Failed", error_text(exc))
+        # Reached only if the subtraction itself failed, so nothing changed.
+        await _reject(
+            ctx, "❌ Undo Failed", f"{error_text(exc)}\n\nNothing was changed."
+        )
         return
 
     if entry is None:
