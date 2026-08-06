@@ -10,6 +10,6 @@ multidict==6.7.1
 propcache==0.5.2
 python-dotenv==1.2.2
 yarl==1.24.2
-google-genai==1.44.0
+google-genai==2.16.0
 gspread==6.2.1
-google-auth==2.40.3
+google-auth==2.56.2

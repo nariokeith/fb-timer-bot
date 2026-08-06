@@ -1,5 +1,7 @@
 import base64
+import inspect
 import json
+import re
 
 import pytest
 
@@ -7,6 +9,48 @@ from attendance_vision import MODEL, VisionError, extract_names
 from conftest import FakeGeminiClient
 
 IMAGE = b"\x89PNG\r\n\x1a\n fake image bytes"
+
+
+def test_installed_sdk_actually_has_the_interactions_api_the_module_calls():
+    """Construction-only check against the REAL google-genai package.
+
+    Every other test in this file injects FakeGeminiClient, which always
+    has `.interactions` by construction -- so a fully green mocked suite
+    proves nothing about whether the *installed* SDK version actually
+    supports the Interactions API. google-genai==1.44.0 has no
+    `client.interactions` attribute at all; this test is the one place
+    that would catch a bad pin like that.
+
+    `genai.Client(api_key=...)` only builds a client object locally and
+    makes no network call, so this runs safely offline and without
+    GEMINI_API_KEY set.
+    """
+    from google import genai
+
+    # Derive the attribute chain from the module's own source, rather than
+    # hardcoding "interactions"/"create" as strings, so this test stays
+    # coupled to whatever attendance_vision.extract_names actually calls.
+    source = inspect.getsource(extract_names)
+    match = re.search(r"client\.(\w+)\.(\w+)\(", source)
+    assert match, "could not find a client.<attr>.<method>(...) call in extract_names"
+    attr_name, method_name = match.groups()
+
+    installed_version = getattr(genai, "__version__", "unknown")
+    client = genai.Client(api_key="dummy-key-construction-only-no-network-call")
+
+    outer = getattr(client, attr_name, None)
+    assert outer is not None, (
+        f"installed google-genai=={installed_version} has no `{attr_name}` "
+        f"attribute on Client -- the pinned SDK is too old for the "
+        f"Interactions API that attendance_vision.extract_names() calls"
+    )
+
+    method = getattr(outer, method_name, None)
+    assert callable(method), (
+        f"installed google-genai=={installed_version}: `{attr_name}` exists "
+        f"but has no callable `{method_name}` -- the pinned SDK is too old "
+        f"for the Interactions API that attendance_vision.extract_names() calls"
+    )
 
 
 def test_returns_the_names_the_model_reported():
