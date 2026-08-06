@@ -241,14 +241,68 @@ LOG_HEADER = [
 ]
 
 
+REVERSED_TRUE_VALUES = {"yes", "true", "1"}
+
+
+def _expect_header(worksheet, header: list[str]) -> None:
+    """Raise unless the tab's own row 1 equals the header this code expects.
+
+    Row 1 is the ground truth for what order each column holds; it is
+    written once, at tab creation, by get_or_create_tab. If LOG_HEADER (or
+    CONFIG_HEADER) is later reordered by a code change, a live tab's row 1
+    still holds the OLD order -- and every row already in it was written
+    under that OLD order too. Zipping those rows against a NEW in-code
+    header without checking would silently misassign every field (e.g.
+    attachment_id read out of the confirmed_by column), and undo would
+    subtract points from the wrong people with no error at all. Raising
+    here -- on both the write path (get_or_create_tab) and the read path
+    (_log_rows) -- turns that into a loud failure instead of a silent one,
+    consistent with this module's refuse-rather-than-guess convention for
+    duplicate player rows, duplicate boss columns, and non-numeric cells.
+    """
+    grid = worksheet.get_all_values()
+    if not grid:
+        raise SheetStructureError(f"Worksheet {worksheet.title!r} is empty")
+    actual = list(grid[0])
+    if actual != header:
+        raise SheetStructureError(
+            f"Worksheet {worksheet.title!r} row 1 is {actual!r}, but this "
+            f"code expects {header!r}; refusing to guess at field order"
+        )
+
+
 def get_or_create_tab(spreadsheet, title: str, header: list[str]):
-    """Return the named worksheet, creating it with `header` if absent."""
+    """Return the named worksheet, creating it with `header` if absent.
+
+    Raises SheetStructureError if an existing tab's row 1 does not match
+    `header` -- see _expect_header.
+
+    Concurrency note: two callers can both see WorksheetNotFound and both
+    call add_worksheet for the same title. Real Sheets accepts only one
+    and answers the other with gspread.exceptions.APIError (a
+    duplicate-title conflict). That is caught here and treated as "someone
+    else just created it": the tab is looked up again and used. This makes
+    the create race safe without the caller doing anything; it does NOT
+    make concurrent writes to the tab's contents safe -- that remains the
+    caller's responsibility, same as plan_point_writes/apply_writes.
+    """
     try:
-        return spreadsheet.worksheet(title)
+        worksheet = spreadsheet.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(title, rows=1000, cols=len(header))
-        worksheet.append_row(header)
-        return worksheet
+        try:
+            worksheet = spreadsheet.add_worksheet(title, rows=1000, cols=len(header))
+            worksheet.append_row(header)
+            return worksheet
+        except gspread.exceptions.APIError as exc:
+            try:
+                worksheet = spreadsheet.worksheet(title)
+            except gspread.exceptions.WorksheetNotFound:
+                raise SheetStructureError(
+                    f"Could not create or find worksheet {title!r}: {exc}"
+                ) from exc
+
+    _expect_header(worksheet, header)
+    return worksheet
 
 
 def read_config(spreadsheet) -> dict[str, str]:
@@ -256,27 +310,70 @@ def read_config(spreadsheet) -> dict[str, str]:
 
     The sheet is used because Render wipes the disk on every restart, so
     a local file would not survive.
+
+    Raises SheetStructureError if the same key appears in two rows.
+    Silently letting the later row win (a plain dict comprehension would)
+    could read back a different value than write_config just wrote for the
+    same key -- exactly the silent-disagreement failure mode this module
+    exists to prevent, and it is what write_config now refuses too.
     """
     try:
         worksheet = spreadsheet.worksheet(CONFIG_TAB)
     except gspread.exceptions.WorksheetNotFound:
         return {}
 
-    return {
-        row[0].strip(): row[1].strip()
-        for row in worksheet.get_all_values()[1:]
-        if len(row) >= 2 and row[0].strip()
-    }
+    seen: dict[str, int] = {}
+    result: dict[str, str] = {}
+    for number, row in enumerate(worksheet.get_all_values(), start=1):
+        if number == 1 or not row:
+            continue
+        key = row[0].strip()
+        if not key:
+            continue
+        if key in seen:
+            raise SheetStructureError(
+                f"{key!r} has two rows ({seen[key]} and {number}) in "
+                f"worksheet {worksheet.title!r}; refusing to guess"
+            )
+        seen[key] = number
+        result[key] = row[1].strip() if len(row) >= 2 else ""
+    return result
 
 
 def write_config(spreadsheet, key: str, value: str) -> None:
-    """Set one config key, replacing any existing row for it."""
+    """Set one config key, replacing any existing row for it.
+
+    Raises SheetStructureError if the key is already duplicated in the
+    sheet, matching read_config's own refusal -- so a successful write can
+    never be silently read back as some other row's value. The incoming
+    key is stripped before comparison (matching read_config, which strips
+    both key and value) so that a key with stray whitespace cannot append
+    a row no later write can ever match, which would itself manufacture a
+    duplicate.
+    """
+    key = key.strip()
     worksheet = get_or_create_tab(spreadsheet, CONFIG_TAB, CONFIG_HEADER)
 
+    seen: dict[str, int] = {}
+    match_row = None
     for number, row in enumerate(worksheet.get_all_values(), start=1):
-        if number > 1 and row and row[0].strip() == key:
-            worksheet.update_cell(number, 2, value)
-            return
+        if number == 1 or not row:
+            continue
+        row_key = row[0].strip()
+        if not row_key:
+            continue
+        if row_key in seen:
+            raise SheetStructureError(
+                f"{row_key!r} has two rows ({seen[row_key]} and {number}) "
+                f"in worksheet {worksheet.title!r}; refusing to guess"
+            )
+        seen[row_key] = number
+        if row_key == key:
+            match_row = number
+
+    if match_row is not None:
+        worksheet.update_cell(match_row, 2, value)
+        return
 
     worksheet.append_row([key, value])
 
@@ -293,32 +390,97 @@ def _log_rows(spreadsheet) -> list[tuple[int, dict]]:
     except gspread.exceptions.WorksheetNotFound:
         return []
 
+    _expect_header(worksheet, LOG_HEADER)
+
     rows = []
     for number, row in enumerate(worksheet.get_all_values(), start=1):
-        if number == 1 or not row:
+        if number == 1 or not any(cell.strip() for cell in row):
             continue
         padded = list(row) + [""] * (len(LOG_HEADER) - len(row))
         rows.append((number, dict(zip(LOG_HEADER, padded))))
     return rows
 
 
+def _is_reversed(value: str, row_number: int) -> bool:
+    """Interpret the `reversed` cell, refusing anything ambiguous.
+
+    Blank means live; an explicit "yes"/"true"/"1" (any case, stripped)
+    means undone. Anything else -- a stray "no", a typo, a note -- is
+    refused rather than treated as falsy. Failing open here would let a
+    re-posted screenshot silently double-pay: a human typing "no" in that
+    column would make attachment_already_logged treat the row as
+    not-reversed and process the screenshot a second time.
+    """
+    normalised = value.strip().casefold()
+    if not normalised:
+        return False
+    if normalised in REVERSED_TRUE_VALUES:
+        return True
+    raise SheetStructureError(
+        f"Row {row_number} in worksheet {LOG_TAB!r} has reversed={value!r}, "
+        "which is neither blank nor yes/true/1; refusing to guess whether "
+        "it was undone"
+    )
+
+
 def attachment_already_logged(spreadsheet, attachment_id: str) -> bool:
     """True if this exact screenshot was logged and not later reversed."""
     return any(
-        entry["attachment_id"] == attachment_id and not entry["reversed"].strip()
-        for _, entry in _log_rows(spreadsheet)
+        entry["attachment_id"] == attachment_id
+        and not _is_reversed(entry["reversed"], number)
+        for number, entry in _log_rows(spreadsheet)
     )
 
 
 def last_unreversed_entry(spreadsheet) -> tuple[int, dict] | None:
     """Most recent log entry that has not been undone."""
     for number, entry in reversed(_log_rows(spreadsheet)):
-        if not entry["reversed"].strip():
+        if not _is_reversed(entry["reversed"], number):
             return number, entry
     return None
 
 
-def mark_entry_reversed(spreadsheet, row_number: int) -> None:
-    """Flag a log entry as undone."""
+def mark_entry_reversed(
+    spreadsheet, row_number: int, expected_attachment_id: str
+) -> None:
+    """Flag a log entry as undone.
+
+    `expected_attachment_id` must be the attachment_id of the entry the
+    caller read at `row_number` (from last_unreversed_entry). Before
+    writing, this re-reads that row and refuses unless it still holds that
+    same attachment_id and is still unreversed.
+
+    Concurrency note: last_unreversed_entry (read) and mark_entry_reversed
+    (write) are two separate round trips with no lock between them. Two
+    officers running !undoattendance at once can both read the same row as
+    "the one to undo"; without this check, both writes would land, points
+    would come off twice, and the entry underneath would never get its
+    turn. The re-check makes the second writer's call fail loudly instead
+    of double-reversing. It does not by itself serialise the
+    point-subtracting side of an undo (plan_point_writes/apply_writes) --
+    the caller is still responsible for treating read-plan-write as one
+    unit against other undo attempts, same as plan_point_writes/apply_writes.
+    """
     worksheet = spreadsheet.worksheet(LOG_TAB)
+    grid = worksheet.get_all_values()
+    if row_number - 1 >= len(grid):
+        raise SheetStructureError(
+            f"Row {row_number} no longer exists in worksheet {LOG_TAB!r}; "
+            "refusing to mark reversed"
+        )
+    row = grid[row_number - 1]
+    padded = list(row) + [""] * (len(LOG_HEADER) - len(row))
+    current_attachment_id = padded[LOG_HEADER.index("attachment_id")]
+    if current_attachment_id != expected_attachment_id:
+        raise SheetStructureError(
+            f"Row {row_number} in worksheet {LOG_TAB!r} now holds "
+            f"attachment_id {current_attachment_id!r}, not "
+            f"{expected_attachment_id!r}; refusing to mark the wrong entry "
+            "reversed"
+        )
+    if _is_reversed(padded[LOG_HEADER.index("reversed")], row_number):
+        raise SheetStructureError(
+            f"Row {row_number} in worksheet {LOG_TAB!r} was already marked "
+            "reversed; refusing to double-reverse it"
+        )
     worksheet.update_cell(row_number, LOG_HEADER.index("reversed") + 1, "yes")

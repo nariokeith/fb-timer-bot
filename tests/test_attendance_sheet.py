@@ -292,7 +292,10 @@ def test_malformed_service_account_json_does_not_leak_the_input():
     assert "TOP-SECRET-KEY" not in str(excinfo.value)
 
 
+import gspread
+
 from attendance_sheet import (
+    CONFIG_HEADER,
     CONFIG_TAB,
     LOG_HEADER,
     LOG_TAB,
@@ -373,8 +376,8 @@ def test_detects_a_screenshot_that_was_already_logged():
 def test_reversed_entries_do_not_count_as_already_logged():
     sh = FakeSpreadsheet()
     append_log_entry(sh, _entry(attachment_id="aaa"))
-    row_number, _ = last_unreversed_entry(sh)
-    mark_entry_reversed(sh, row_number)
+    row_number, entry = last_unreversed_entry(sh)
+    mark_entry_reversed(sh, row_number, entry["attachment_id"])
     assert attachment_already_logged(sh, "aaa") is False
 
 
@@ -391,7 +394,7 @@ def test_last_unreversed_entry_skips_reversed_ones():
     sh = FakeSpreadsheet()
     append_log_entry(sh, _entry(boss="Lucus", attachment_id="aaa"))
     append_log_entry(sh, _entry(boss="Motti", attachment_id="bbb"))
-    mark_entry_reversed(sh, 3)
+    mark_entry_reversed(sh, 3, "bbb")
     _, entry = last_unreversed_entry(sh)
     assert entry["boss"] == "Lucus"
 
@@ -448,3 +451,227 @@ def test_a_short_log_row_from_an_older_version_pads_without_shifting_fields():
     assert entry["confirmed_by"] == ""
     assert entry["players"] == ""
     assert entry["reversed"] == ""
+
+
+# --- Fix round 1 -------------------------------------------------------
+
+
+def test_a_log_tab_whose_header_no_longer_matches_LOG_HEADER_is_refused():
+    """(t) The real hazard: a live _BotLog tab created under an OLD field
+    order. If _log_rows zipped blindly against the current LOG_HEADER, a
+    reordered field (attachment_id and confirmed_by swapped here) would be
+    silently misread -- undo would then subtract points using the wrong
+    attachment_id/confirmed_by pairing. This must raise instead of guess.
+    """
+    old_header = [
+        "timestamp",
+        "tab",
+        "boss",
+        "points_each",
+        "message_id",
+        "confirmed_by",  # swapped with attachment_id relative to LOG_HEADER
+        "attachment_id",
+        "players",
+        "reversed",
+    ]
+    old_row = [
+        "2026-08-06T21:00:00",
+        "Week 17",
+        "Lucus",
+        "3",
+        "111",
+        "officer#1",
+        "aaa",
+        "Kobe, Talong",
+        "",
+    ]
+    sh = FakeSpreadsheet({LOG_TAB: FakeWorksheet([old_header, old_row], title=LOG_TAB)})
+
+    with pytest.raises(SheetStructureError, match="row 1"):
+        last_unreversed_entry(sh)
+
+    with pytest.raises(SheetStructureError, match="row 1"):
+        attachment_already_logged(sh, "aaa")
+
+    with pytest.raises(SheetStructureError, match="row 1"):
+        append_log_entry(sh, _entry())
+
+
+def test_duplicate_config_key_is_refused_by_both_read_and_write():
+    """(u) write_config used to update only the FIRST matching row while
+    read_config's dict comprehension let the LAST duplicate win -- so a
+    successful write could read back as an unrelated older value. Refusing
+    on the duplicate (like _rows_by_player does for players) makes both
+    sides agree: never silently disagree.
+    """
+    sh = FakeSpreadsheet(
+        {
+            CONFIG_TAB: FakeWorksheet(
+                [
+                    CONFIG_HEADER,
+                    ["target_tab", "Week 17"],
+                    ["target_tab", "Week 18"],
+                ],
+                title=CONFIG_TAB,
+            )
+        }
+    )
+    with pytest.raises(SheetStructureError, match=r"target_tab.*\(2 and 3\)"):
+        read_config(sh)
+    with pytest.raises(SheetStructureError, match=r"target_tab.*\(2 and 3\)"):
+        write_config(sh, "target_tab", "Week 19")
+
+
+def test_write_config_strips_the_incoming_key_so_whitespace_cannot_hide_a_match():
+    sh = FakeSpreadsheet()
+    write_config(sh, "target_tab", "Week 17")
+    write_config(sh, "  target_tab  ", "Week 18")
+    assert read_config(sh) == {"target_tab": "Week 18"}
+    ws = sh.worksheet(CONFIG_TAB)
+    assert len(ws.get_all_values()) == 2  # header + one row, not two
+
+
+def test_mark_entry_reversed_refuses_when_the_row_changed_underneath_it():
+    """(v) Simulates the undo race: officer A reads row 3 (last unreversed,
+    attachment_id 'bbb'), but before A's write lands, the row is no longer
+    what A read (attachment_id has changed -- e.g. another entry's write
+    landed on the same physical row, or the row was edited). A's write
+    must refuse rather than mark the wrong entry reversed.
+    """
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(boss="Lucus", attachment_id="aaa"))
+    append_log_entry(sh, _entry(boss="Motti", attachment_id="bbb"))
+    row_number, entry = last_unreversed_entry(sh)
+    assert row_number == 3
+    assert entry["attachment_id"] == "bbb"
+
+    ws = sh.worksheet(LOG_TAB)
+    ws.update_cell(row_number, LOG_HEADER.index("attachment_id") + 1, "ccc")
+
+    with pytest.raises(SheetStructureError, match="ccc"):
+        mark_entry_reversed(sh, row_number, "bbb")
+
+
+def test_mark_entry_reversed_refuses_to_double_reverse():
+    """(v) The second of two concurrent !undoattendance calls must fail
+    loudly instead of subtracting the same entry's points twice.
+    """
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(attachment_id="aaa"))
+    row_number, entry = last_unreversed_entry(sh)
+    mark_entry_reversed(sh, row_number, entry["attachment_id"])
+
+    with pytest.raises(SheetStructureError, match="already marked reversed"):
+        mark_entry_reversed(sh, row_number, entry["attachment_id"])
+
+
+class _FakeApiErrorResponse:
+    """Minimal stand-in for the requests.Response gspread.exceptions.APIError wraps."""
+
+    text = '{"error": {"code": 400, "message": "already exists"}}'
+
+    def json(self):
+        return {"error": {"code": 400, "message": "already exists"}}
+
+
+class _RaceThenExistsSpreadsheet:
+    """Simulates two concurrent get_or_create_tab callers.
+
+    The first spreadsheet.worksheet(title) lookup raises NotFound (as if
+    the tab genuinely didn't exist yet). add_worksheet then fails the way
+    real Sheets fails when another caller won the race and created the
+    tab first: gspread.exceptions.APIError. The second
+    spreadsheet.worksheet(title) lookup then succeeds, returning the tab
+    the other caller created.
+    """
+
+    def __init__(self, existing_ws):
+        self._existing = existing_ws
+        self._lookups = 0
+
+    def worksheet(self, title):
+        self._lookups += 1
+        if self._lookups == 1:
+            raise gspread.exceptions.WorksheetNotFound(title)
+        return self._existing
+
+    def add_worksheet(self, title, rows=100, cols=20):
+        raise gspread.exceptions.APIError(_FakeApiErrorResponse())
+
+
+def test_get_or_create_tab_survives_a_concurrent_create_race():
+    """(w) Two callers both see WorksheetNotFound and both call
+    add_worksheet; real Sheets accepts one and answers the other with
+    gspread.exceptions.APIError. That must not escape as a raw gspread
+    exception -- it should be treated as "someone else created it" and
+    the existing tab returned.
+    """
+    existing = FakeWorksheet([LOG_HEADER], title=LOG_TAB)
+    sh = _RaceThenExistsSpreadsheet(existing)
+    result = get_or_create_tab(sh, LOG_TAB, LOG_HEADER)
+    assert result is existing
+
+
+def test_get_or_create_tab_raises_sheet_structure_error_when_the_race_never_resolves():
+    class _AlwaysConflictingSpreadsheet:
+        def worksheet(self, title):
+            raise gspread.exceptions.WorksheetNotFound(title)
+
+        def add_worksheet(self, title, rows=100, cols=20):
+            raise gspread.exceptions.APIError(_FakeApiErrorResponse())
+
+    with pytest.raises(SheetStructureError, match=LOG_TAB):
+        get_or_create_tab(_AlwaysConflictingSpreadsheet(), LOG_TAB, LOG_HEADER)
+
+
+def test_reversed_yes_is_reversed():
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(attachment_id="aaa"))
+    row_number, entry = last_unreversed_entry(sh)
+    mark_entry_reversed(sh, row_number, entry["attachment_id"])
+    assert attachment_already_logged(sh, "aaa") is False
+
+
+def test_reversed_blank_is_not_reversed():
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(attachment_id="aaa", reversed=""))
+    assert attachment_already_logged(sh, "aaa") is True
+
+
+def test_reversed_no_is_refused_rather_than_treated_as_falsy():
+    """A human typing 'no' in the reversed column must not silently make
+    attachment_already_logged fail open and let a re-posted screenshot be
+    processed (and paid) a second time.
+    """
+    row = [
+        "2026-08-06T21:00:00",
+        "Week 17",
+        "Lucus",
+        "3",
+        "111",
+        "aaa",
+        "officer#1",
+        "Kobe, Talong",
+        "no",
+    ]
+    sh = FakeSpreadsheet({LOG_TAB: FakeWorksheet([LOG_HEADER, row], title=LOG_TAB)})
+    with pytest.raises(SheetStructureError, match="no"):
+        attachment_already_logged(sh, "aaa")
+    with pytest.raises(SheetStructureError, match="no"):
+        last_unreversed_entry(sh)
+
+
+def test_a_cleared_row_of_all_blank_cells_is_skipped_not_returned_as_an_entry():
+    """gspread pads a cleared row as all-empty-string cells, not `[]`. Such
+    a row must not become an entry with every field blank -- if it were
+    last, last_unreversed_entry would hand it back as "the thing to undo".
+    """
+    cleared_row = ["", "", "", "", "", "", "", "", ""]
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(boss="Lucus", attachment_id="aaa"))
+    ws = sh.worksheet(LOG_TAB)
+    ws._rows.append(cleared_row)
+
+    row_number, entry = last_unreversed_entry(sh)
+    assert entry["boss"] == "Lucus"
+    assert row_number == 2
