@@ -12,6 +12,7 @@ import inspect
 import json
 import re
 import sys
+from types import SimpleNamespace
 
 import attendance_bot
 from attendance_bot import _is_officer, error_text
@@ -208,7 +209,7 @@ def test_the_lock_is_not_held_while_waiting_for_the_officers_reaction():
 
 import pytest
 
-from attendance_sheet import LOG_HEADER, SheetStructureError
+from attendance_sheet import LOG_HEADER, LOG_TAB, SheetStructureError
 from conftest import SAMPLE_GRID, FakeSpreadsheet, FakeWorksheet
 
 TAB = "Week 17"
@@ -848,3 +849,206 @@ def test_load_context_does_not_open_its_own_spreadsheet_handle(monkeypatch):
 
 
 import time  # noqa: E402  (kept near its first use, above)
+
+
+# --------------------------------------------------------------------------
+# A LOCK_TIMEOUT mid-commit/mid-undo must not be reported as a confirmed
+# "nothing happened" -- the to_thread worker is not actually stopped by
+# the timeout (see _locked's docstring), so the outcome is genuinely
+# unknown at the moment this fires.
+# --------------------------------------------------------------------------
+
+
+class FakeAttachment:
+    def __init__(self, content=b"fake-image-bytes", content_type="image/png", att_id=555):
+        self._content = content
+        self.content_type = content_type
+        self.id = att_id
+
+    async def read(self):
+        return self._content
+
+
+class FakeDiscordMessage:
+    """Stands in for the message discord.py hands back from ctx.send /
+    passes as the working preview message: supports edit() and
+    add_reaction(), and records every edit for assertions."""
+
+    def __init__(self, embed=None):
+        self.embed = embed
+        self.id = 42
+        self.edits = []
+
+    async def edit(self, **kwargs):
+        if "embed" in kwargs:
+            self.embed = kwargs["embed"]
+        self.edits.append(kwargs)
+
+    async def add_reaction(self, emoji):
+        pass
+
+
+class FakeCtx:
+    def __init__(self, author, attachments=()):
+        self.author = author
+        self.message = SimpleNamespace(attachments=list(attachments), id=999)
+        self.sent = []
+
+    async def send(self, *args, **kwargs):
+        msg = FakeDiscordMessage(embed=kwargs.get("embed"))
+        self.sent.append((args, kwargs, msg))
+        return msg
+
+
+def _officer_spreadsheet(role_id=123, tab=TAB, grid=None):
+    sh = FakeSpreadsheet({TAB: FakeWorksheet(grid or SAMPLE_GRID, title=TAB)})
+    attendance_bot.write_config(sh, "officer_role_id", str(role_id))
+    attendance_bot.write_config(sh, "target_tab", tab)
+    return sh
+
+
+def test_attendance_timeout_path_gives_uncertain_wording_not_nothing_written(
+    monkeypatch,
+):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    monkeypatch.setattr(
+        attendance_bot, "extract_names", lambda *a, **k: ["Kobe"]
+    )
+
+    async def fake_wait_for(event, check=None, timeout=None):
+        return (SimpleNamespace(), "Officer#1")
+
+    monkeypatch.setattr(attendance_bot.bot, "wait_for", fake_wait_for)
+
+    async def raising_locked(func, *args):
+        raise TimeoutError()
+
+    monkeypatch.setattr(attendance_bot, "_locked", raising_locked)
+
+    ctx = FakeCtx(FakeMember([FakeRole(123)]), attachments=[FakeAttachment()])
+
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    # The last edit made to the "working" preview message is the final
+    # word the officer sees.
+    working_message = ctx.sent[0][2]
+    final_embed = working_message.embed
+    description = final_embed.description
+
+    assert "Nothing was written" not in description
+    assert "not known whether" in description or "may or may not" in description.lower()
+    assert "Kobe" in description
+    assert "Lucus" in description
+    assert TAB in description
+
+
+def test_attendance_timeout_report_goes_to_stderr_first(monkeypatch, capsys):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
+
+    async def fake_wait_for(event, check=None, timeout=None):
+        return (SimpleNamespace(), "Officer#1")
+
+    monkeypatch.setattr(attendance_bot.bot, "wait_for", fake_wait_for)
+
+    async def raising_locked(func, *args):
+        raise TimeoutError()
+
+    monkeypatch.setattr(attendance_bot, "_locked", raising_locked)
+
+    ctx = FakeCtx(FakeMember([FakeRole(123)]), attachments=[FakeAttachment()])
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    err = capsys.readouterr().err
+    assert "PARTIAL WRITE" in err
+    assert "Sheet Timed Out" in err
+
+
+def test_attendance_genuine_prewrite_failure_still_says_nothing_was_written(
+    monkeypatch,
+):
+    """The fix must not over-apply: a real, non-timeout failure with no
+    ambiguity (apply_writes itself raising, so _commit never gets past
+    that line) must keep the definite, correct "nothing was written"
+    wording. `_locked` is left real here (not monkeypatched to raise
+    TimeoutError) so this exercises the genuine `except Exception` branch,
+    not the new `except TimeoutError` one.
+    """
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
+
+    async def fake_wait_for(event, check=None, timeout=None):
+        return (SimpleNamespace(), "Officer#1")
+
+    monkeypatch.setattr(attendance_bot.bot, "wait_for", fake_wait_for)
+
+    def boom(*args, **kwargs):
+        raise SheetStructureError("simulated apply_writes failure")
+
+    monkeypatch.setattr(attendance_bot, "apply_writes", boom)
+
+    ctx = FakeCtx(FakeMember([FakeRole(123)]), attachments=[FakeAttachment()])
+    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
+
+    working_message = ctx.sent[0][2]
+    description = working_message.embed.description
+    assert "Nothing was written" in description
+
+
+def test_undo_timeout_path_gives_uncertain_wording_not_nothing_changed(monkeypatch):
+    logged = _entry(boss="Lucus", players=json.dumps(["Kobe"]))
+    row = [str(logged[field]) for field in LOG_HEADER]
+    sh = _officer_spreadsheet()
+    sh._sheets[LOG_TAB] = _log_tab(row)  # noqa: SLF001 -- test setup only
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    async def raising_locked(func, *args):
+        raise TimeoutError()
+
+    monkeypatch.setattr(attendance_bot, "_locked", raising_locked)
+
+    ctx = FakeCtx(FakeMember([FakeRole(123)]))
+    asyncio.run(attendance_bot.undo_attendance_cmd.callback(ctx))
+
+    assert len(ctx.sent) == 1
+    _, kwargs, _ = ctx.sent[0]
+    description = kwargs["embed"].description
+
+    assert "Nothing was changed" not in description
+    assert "not known whether" in description or "may or may not" in description.lower()
+    assert "Lucus" in description
+
+
+def test_undo_timeout_report_goes_to_stderr_first(monkeypatch, capsys):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    async def raising_locked(func, *args):
+        raise TimeoutError()
+
+    monkeypatch.setattr(attendance_bot, "_locked", raising_locked)
+
+    ctx = FakeCtx(FakeMember([FakeRole(123)]))
+    asyncio.run(attendance_bot.undo_attendance_cmd.callback(ctx))
+
+    err = capsys.readouterr().err
+    assert "PARTIAL WRITE" in err
+    assert "Sheet Timed Out" in err
+
+
+def test_undo_genuine_prewrite_failure_still_says_nothing_was_changed(monkeypatch):
+    sh = _officer_spreadsheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    # No log rows at all in `sh` -- last_unreversed_entry finds nothing and
+    # _reverse_last's very first step (last_unreversed_entry) returns
+    # None inside the lock too, so this is a genuine "nothing to undo",
+    # not a timeout. This pins the real _reverse_last, not a fake.
+    ctx = FakeCtx(FakeMember([FakeRole(123)]))
+    asyncio.run(attendance_bot.undo_attendance_cmd.callback(ctx))
+
+    assert len(ctx.sent) == 1
+    _, kwargs, _ = ctx.sent[0]
+    assert "Nothing To Undo" in kwargs["embed"].title

@@ -215,6 +215,47 @@ class AlreadyLoggedDuringPreview(RuntimeError):
     """Another officer confirmed this same screenshot during the 180s wait."""
 
 
+def _timeout_description(
+    *,
+    verb: str,
+    outcome: str,
+    tab: str | None,
+    boss: str | None,
+    points: int | None,
+    players: list[str] | None,
+) -> str:
+    """Wording for a LOCK_TIMEOUT that fires mid-commit or mid-undo.
+
+    Unlike PointsWrittenButNotLogged/PointsRemovedButNotMarked, this is
+    NOT a confirmed partial state: asyncio.timeout only stops the
+    AWAITING coroutine from waiting (see _locked) -- it cannot stop the
+    to_thread worker actually talking to Sheets. That worker may already
+    have finished, may be partway through, or may not have started the
+    write/removal yet by the time this fires. So, unlike the other two
+    partial-write messages, this one must not assert either outcome --
+    only that it is unknown, and that re-running before checking risks
+    paying (or removing) the same points twice.
+    """
+    boss_text = f"**{_clip(boss, NAME_LIMIT)}**" if boss else "the boss just requested"
+    tab_text = f" in **{_clip(tab, NAME_LIMIT)}**" if tab else ""
+    points_text = (
+        f" (**{points}** point{'s' if points != 1 else ''} each)"
+        if points is not None
+        else ""
+    )
+    players_text = f"\n\nPlayers: {_clip_players(players)}" if players else ""
+    return (
+        f"The sheet did not respond in time while {verb} for {boss_text}"
+        f"{tab_text}{points_text}.\n\n"
+        f"**It is not known whether the {outcome} actually happened.** "
+        f"The request may still be finishing in the background even though "
+        f"this command gave up waiting for it.\n\n"
+        f"**Check the sheet before re-running.** If it already landed, "
+        f"re-running now would {outcome} the same points a second time."
+        f"{players_text}"
+    )
+
+
 def _timestamp() -> str:
     """Now, in the guild's timezone, ISO with second resolution."""
     return datetime.now(TIMEZONE).isoformat(timespec="seconds")
@@ -463,6 +504,19 @@ async def _locked(func, *args):
     moment LOCK_TIMEOUT elapses, whichever comes first.
     """
     async with _SHEET_LOCK:
+        # NOTE for the next reader: when LOCK_TIMEOUT fires here, only the
+        # AWAITING coroutine is interrupted -- `_SHEET_LOCK` is released in
+        # this `async with`'s __aexit__ as soon as TimeoutError propagates,
+        # but the asyncio.to_thread WORKER underneath keeps running in its
+        # OS thread. CPython has no way to forcibly stop a thread executing
+        # synchronous code, so `func` (e.g. _commit) may still be mid-write
+        # -- or may finish writing -- after this function has already
+        # raised and the lock is free again for the next command. What
+        # actually bounds how long that orphan can keep talking to Sheets
+        # is REQUEST_TIMEOUT on the gspread client (attendance_sheet.py),
+        # NOT this asyncio.timeout. Callers must not report a LOCK_TIMEOUT
+        # as "nothing happened" -- see _timeout_description and its call
+        # sites in attendance_cmd / undo_attendance_cmd.
         async with asyncio.timeout(LOCK_TIMEOUT):
             return await asyncio.to_thread(func, *args)
 
@@ -826,6 +880,30 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     except AlreadyLoggedDuringPreview as exc:
         await working.edit(embed=make_embed("⚠️ Already Logged", error_text(exc)))
         return
+    except TimeoutError:
+        # LOCK_TIMEOUT fired. The to_thread worker running _commit is NOT
+        # stopped by this -- it may already have applied the points and be
+        # partway through append_log_entry, or may not have started
+        # either. Must NOT be reported as "nothing was written": that is
+        # exactly the false certainty that makes an officer re-run and
+        # double-pay. Caught explicitly, before the generic Exception
+        # branch below (which is only reached when a write genuinely never
+        # started), so this case can never fall into "Nothing was written".
+        await _report_partial_failure(
+            ctx,
+            working,
+            "⏱️ Sheet Timed Out — Verify Before Re-Running",
+            _timeout_description(
+                verb="writing",
+                outcome="add",
+                tab=context["tab"],
+                boss=boss,
+                points=points,
+                players=players,
+            ),
+            footer=f"Confirmed by {confirmer}",
+        )
+        return
     except Exception as exc:
         # Reached only if apply_writes itself failed, so nothing landed.
         await working.edit(
@@ -854,6 +932,17 @@ async def undo_attendance_cmd(ctx: commands.Context):
     if await _require_officer(ctx, spreadsheet) is None:
         return
 
+    # Best-effort only, read-only, outside the lock: which entry is about
+    # to be reversed, so a LOCK_TIMEOUT below can still name it. _locked's
+    # own re-read inside the lock is what's actually authoritative; this
+    # peek can be stale (or simply fail) without affecting correctness --
+    # it only affects how specific the timeout message below can be.
+    try:
+        pending = await asyncio.to_thread(last_unreversed_entry, spreadsheet)
+    except Exception:
+        pending = None
+    pending_entry = pending[1] if pending is not None else None
+
     try:
         entry = await _locked(_reverse_last)
     except PointsRemovedButNotMarked as exc:
@@ -863,6 +952,34 @@ async def undo_attendance_cmd(ctx: commands.Context):
         # necessary.
         await _report_partial_failure(
             ctx, None, "⚠️ Partly Undone — Do Not Re-Run", exc.description
+        )
+        return
+    except TimeoutError:
+        # Mirror of the attendance_cmd case: the to_thread worker running
+        # _reverse_last is not stopped by LOCK_TIMEOUT and may already
+        # have subtracted the points and be partway through
+        # mark_entry_reversed, or may not have started either. Must not
+        # be reported as "nothing was changed".
+        players = None
+        if pending_entry:
+            try:
+                players = _parse_players(pending_entry["players"])
+            except SheetStructureError:
+                players = None  # best-effort only; still report the timeout
+        await _report_partial_failure(
+            ctx,
+            None,
+            "⏱️ Sheet Timed Out — Verify Before Re-Running",
+            _timeout_description(
+                verb="undoing the last attendance entry",
+                outcome="remove",
+                tab=pending_entry["tab"] if pending_entry else None,
+                boss=pending_entry["boss"] if pending_entry else None,
+                points=(
+                    int(pending_entry["points_each"]) if pending_entry else None
+                ),
+                players=players,
+            ),
         )
         return
     except Exception as exc:
