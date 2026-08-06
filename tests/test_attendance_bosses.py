@@ -94,10 +94,12 @@ def test_three_pointer_names_are_stored_without_stray_whitespace():
 
 
 def test_prefix_beats_substring():
-    # When one column starts with the query and another merely contains it,
-    # the prefix one should win without ambiguity.
+    # Query "ord" is a PREFIX of "Ordo" (exact: no), a SUBSTRING-ONLY of "Lady Ordo"
+    # (does not start with "ord"), and an exact match of neither. This forces Stage 2
+    # (prefix) to find exactly one winner. If stages are reordered or merged, this
+    # becomes ambiguous at Stage 3. This test is load-bearing for the stage ordering.
     headers = ["Player Name", "Points", "Ordo", "Lady Ordo"]
-    assert resolve_boss(headers, "ordo") == "Ordo"
+    assert resolve_boss(headers, "ord") == "Ordo"
 
 
 def test_ambiguous_substring_raises():
@@ -123,6 +125,17 @@ def test_missing_boss_still_raises():
 
 
 def test_exact_match_wins_over_substring():
-    # If there's an exact match, it should win even if other substring matches exist.
+    # Query "ego" is EXACT for "EGO" and SUBSTRING-ONLY for "Mega EGO" ("mega ego"
+    # does not start with "ego"). This forces Stage 1 (exact) to find the winner before
+    # Stage 2 (prefix) is evaluated. If Stage 1 is removed, this becomes ambiguous at
+    # the prefix stage (or raises at substring if stages are reordered). This test is
+    # load-bearing for the exact-match-first invariant.
+    headers = ["Player Name", "Points", "EGO", "Mega EGO"]
+    assert resolve_boss(headers, "ego") == "EGO"
+
+
+def test_exact_match_also_beats_prefix():
+    # Exact match should win even if there's a prefix match. This is separate from
+    # the substring test to keep each invariant load-bearing independently.
     headers = ["Player Name", "Points", "EGO", "Ego Whip"]
     assert resolve_boss(headers, "ego") == "EGO"
