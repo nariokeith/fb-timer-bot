@@ -59,6 +59,7 @@ class FakeWorksheet:
 
     def append_row(self, values, **kwargs):
         self.appended.append(list(values))
+        self._rows.append(list(values))
 
     def update_cell(self, row, col, value):
         while len(self._rows) < row:
@@ -76,3 +77,26 @@ SAMPLE_GRID = [
     ["Kobe", "44", "", "1", "3", "2"],
     ["wileKAMOTE卐", "36", "", "", "3", "3"],
 ]
+
+
+import gspread
+
+
+class FakeSpreadsheet:
+    """Stands in for a gspread Spreadsheet holding FakeWorksheets."""
+
+    def __init__(self, sheets: dict[str, FakeWorksheet] | None = None):
+        self._sheets = dict(sheets or {})
+        self.created: list[str] = []
+
+    def worksheet(self, title):
+        try:
+            return self._sheets[title]
+        except KeyError:
+            raise gspread.exceptions.WorksheetNotFound(title) from None
+
+    def add_worksheet(self, title, rows=100, cols=20):
+        ws = FakeWorksheet([], title=title)
+        self._sheets[title] = ws
+        self.created.append(title)
+        return ws

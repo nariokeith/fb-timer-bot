@@ -222,3 +222,103 @@ def apply_writes(worksheet, payload: list[dict]) -> None:
     if not payload:
         return
     worksheet.batch_update(payload)
+
+
+CONFIG_TAB = "_BotConfig"
+LOG_TAB = "_BotLog"
+
+CONFIG_HEADER = ["key", "value"]
+LOG_HEADER = [
+    "timestamp",
+    "tab",
+    "boss",
+    "points_each",
+    "message_id",
+    "attachment_id",
+    "confirmed_by",
+    "players",
+    "reversed",
+]
+
+
+def get_or_create_tab(spreadsheet, title: str, header: list[str]):
+    """Return the named worksheet, creating it with `header` if absent."""
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title, rows=1000, cols=len(header))
+        worksheet.append_row(header)
+        return worksheet
+
+
+def read_config(spreadsheet) -> dict[str, str]:
+    """Bot settings stored in the sheet itself.
+
+    The sheet is used because Render wipes the disk on every restart, so
+    a local file would not survive.
+    """
+    try:
+        worksheet = spreadsheet.worksheet(CONFIG_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        return {}
+
+    return {
+        row[0].strip(): row[1].strip()
+        for row in worksheet.get_all_values()[1:]
+        if len(row) >= 2 and row[0].strip()
+    }
+
+
+def write_config(spreadsheet, key: str, value: str) -> None:
+    """Set one config key, replacing any existing row for it."""
+    worksheet = get_or_create_tab(spreadsheet, CONFIG_TAB, CONFIG_HEADER)
+
+    for number, row in enumerate(worksheet.get_all_values(), start=1):
+        if number > 1 and row and row[0].strip() == key:
+            worksheet.update_cell(number, 2, value)
+            return
+
+    worksheet.append_row([key, value])
+
+
+def append_log_entry(spreadsheet, entry: dict) -> None:
+    """Record one confirmed submission in the audit tab."""
+    worksheet = get_or_create_tab(spreadsheet, LOG_TAB, LOG_HEADER)
+    worksheet.append_row([str(entry.get(field, "")) for field in LOG_HEADER])
+
+
+def _log_rows(spreadsheet) -> list[tuple[int, dict]]:
+    try:
+        worksheet = spreadsheet.worksheet(LOG_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        return []
+
+    rows = []
+    for number, row in enumerate(worksheet.get_all_values(), start=1):
+        if number == 1 or not row:
+            continue
+        padded = list(row) + [""] * (len(LOG_HEADER) - len(row))
+        rows.append((number, dict(zip(LOG_HEADER, padded))))
+    return rows
+
+
+def attachment_already_logged(spreadsheet, attachment_id: str) -> bool:
+    """True if this exact screenshot was logged and not later reversed."""
+    return any(
+        entry["attachment_id"] == attachment_id and not entry["reversed"].strip()
+        for _, entry in _log_rows(spreadsheet)
+    )
+
+
+def last_unreversed_entry(spreadsheet) -> tuple[int, dict] | None:
+    """Most recent log entry that has not been undone."""
+    for number, entry in reversed(_log_rows(spreadsheet)):
+        if not entry["reversed"].strip():
+            return number, entry
+    return None
+
+
+def mark_entry_reversed(spreadsheet, row_number: int) -> None:
+    """Flag a log entry as undone."""
+    worksheet = spreadsheet.worksheet(LOG_TAB)
+    worksheet.update_cell(row_number, LOG_HEADER.index("reversed") + 1, "yes")

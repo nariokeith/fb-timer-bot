@@ -290,3 +290,161 @@ def test_malformed_service_account_json_does_not_leak_the_input():
 
     assert excinfo.value.__cause__ is None
     assert "TOP-SECRET-KEY" not in str(excinfo.value)
+
+
+from attendance_sheet import (
+    CONFIG_TAB,
+    LOG_HEADER,
+    LOG_TAB,
+    append_log_entry,
+    attachment_already_logged,
+    get_or_create_tab,
+    last_unreversed_entry,
+    mark_entry_reversed,
+    read_config,
+    write_config,
+)
+from conftest import FakeSpreadsheet
+
+
+def _entry(**overrides):
+    base = {
+        "timestamp": "2026-08-06T21:00:00",
+        "tab": "Week 17",
+        "boss": "Lucus",
+        "points_each": 3,
+        "message_id": "111",
+        "attachment_id": "aaa",
+        "confirmed_by": "officer#1",
+        "players": "Kobe, Talong",
+        "reversed": "",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_creates_a_tab_with_its_header_when_missing():
+    sh = FakeSpreadsheet()
+    ws = get_or_create_tab(sh, LOG_TAB, LOG_HEADER)
+    assert sh.created == [LOG_TAB]
+    assert ws.appended == [LOG_HEADER]
+
+
+def test_reuses_an_existing_tab():
+    sh = FakeSpreadsheet({LOG_TAB: FakeWorksheet([LOG_HEADER], title=LOG_TAB)})
+    get_or_create_tab(sh, LOG_TAB, LOG_HEADER)
+    assert sh.created == []
+
+
+def test_config_round_trips():
+    sh = FakeSpreadsheet()
+    write_config(sh, "target_tab", "Week 17")
+    write_config(sh, "officer_role_id", "12345")
+    assert read_config(sh) == {"target_tab": "Week 17", "officer_role_id": "12345"}
+
+
+def test_writing_an_existing_config_key_replaces_it():
+    sh = FakeSpreadsheet()
+    write_config(sh, "target_tab", "Week 17")
+    write_config(sh, "target_tab", "Week 17.1")
+    assert read_config(sh) == {"target_tab": "Week 17.1"}
+
+
+def test_config_is_empty_when_the_tab_does_not_exist():
+    assert read_config(FakeSpreadsheet()) == {}
+
+
+def test_log_entry_is_appended_in_header_order():
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry())
+    ws = sh.worksheet(LOG_TAB)
+    assert ws.appended[0] == LOG_HEADER
+    assert ws.appended[1][LOG_HEADER.index("boss")] == "Lucus"
+    assert ws.appended[1][LOG_HEADER.index("players")] == "Kobe, Talong"
+
+
+def test_detects_a_screenshot_that_was_already_logged():
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(attachment_id="aaa"))
+    assert attachment_already_logged(sh, "aaa") is True
+    assert attachment_already_logged(sh, "bbb") is False
+
+
+def test_reversed_entries_do_not_count_as_already_logged():
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(attachment_id="aaa"))
+    row_number, _ = last_unreversed_entry(sh)
+    mark_entry_reversed(sh, row_number)
+    assert attachment_already_logged(sh, "aaa") is False
+
+
+def test_last_unreversed_entry_returns_the_most_recent():
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(boss="Lucus", attachment_id="aaa"))
+    append_log_entry(sh, _entry(boss="Motti", attachment_id="bbb"))
+    row_number, entry = last_unreversed_entry(sh)
+    assert entry["boss"] == "Motti"
+    assert row_number == 3  # header + two entries
+
+
+def test_last_unreversed_entry_skips_reversed_ones():
+    sh = FakeSpreadsheet()
+    append_log_entry(sh, _entry(boss="Lucus", attachment_id="aaa"))
+    append_log_entry(sh, _entry(boss="Motti", attachment_id="bbb"))
+    mark_entry_reversed(sh, 3)
+    _, entry = last_unreversed_entry(sh)
+    assert entry["boss"] == "Lucus"
+
+
+def test_last_unreversed_entry_is_none_when_there_is_nothing_to_undo():
+    assert last_unreversed_entry(FakeSpreadsheet()) is None
+
+
+def test_log_entry_round_trips_every_field_through_log_header_order():
+    """Pins the write/read contract that undo depends on: append_log_entry
+    writes positionally from LOG_HEADER and _log_rows (via
+    last_unreversed_entry) zips the row back against the same LOG_HEADER. If
+    the two ever disagreed -- say LOG_HEADER got reordered on one side only
+    -- fields would be silently misassigned and undo would subtract the
+    wrong points from the wrong people without any test noticing.
+    """
+    sh = FakeSpreadsheet()
+    written = _entry(
+        timestamp="2026-08-06T21:00:00",
+        tab="Week 17",
+        boss="Lucus",
+        points_each=3,
+        message_id="111",
+        attachment_id="aaa",
+        confirmed_by="officer#1",
+        players="Kobe, Talong",
+        reversed="",
+    )
+    append_log_entry(sh, written)
+    _, read_back = last_unreversed_entry(sh)
+
+    for field, value in written.items():
+        assert read_back[field] == str(value), field
+
+
+def test_a_short_log_row_from_an_older_version_pads_without_shifting_fields():
+    """A log row written before a LOG_HEADER field was added would come back
+    from the sheet with fewer cells than LOG_HEADER. Padding must add blanks
+    at the end, not at the start or middle -- otherwise every field after
+    the pad point (attachment_id, confirmed_by, players, reversed) would be
+    read from the wrong column.
+    """
+    short_row = ["2026-08-06T21:00:00", "Week 17", "Lucus", "3", "111"]
+    sh = FakeSpreadsheet({LOG_TAB: FakeWorksheet([LOG_HEADER, short_row], title=LOG_TAB)})
+
+    _, entry = last_unreversed_entry(sh)
+
+    assert entry["timestamp"] == "2026-08-06T21:00:00"
+    assert entry["tab"] == "Week 17"
+    assert entry["boss"] == "Lucus"
+    assert entry["points_each"] == "3"
+    assert entry["message_id"] == "111"
+    assert entry["attachment_id"] == ""
+    assert entry["confirmed_by"] == ""
+    assert entry["players"] == ""
+    assert entry["reversed"] == ""
