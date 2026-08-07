@@ -180,3 +180,56 @@ def test_an_alias_whose_target_is_absent_does_not_resolve():
         items_rules.parse_request(
             "Asta's Heart ツRyuuツ", ["Kobe"], SPECIAL_HEADERS, GEAR_HEADERS
         )
+
+
+def test_a_special_the_player_lacks_is_allowed():
+    result = items_rules.check_eligibility(
+        items_rules.SPECIAL, "Kobe", [], "2026-08-07", already_has_special=False
+    )
+    assert result.allowed
+
+
+def test_a_special_the_player_already_has_is_refused():
+    result = items_rules.check_eligibility(
+        items_rules.SPECIAL, "Kobe", [], "2026-08-07", already_has_special=True
+    )
+    assert not result.allowed
+    assert "already" in result.reason.lower()
+
+
+def test_gear_under_the_cap_is_allowed():
+    result = items_rules.check_eligibility(
+        items_rules.GEAR, "Kobe", LEDGER, "2026-08-07", already_has_special=False
+    )
+    assert result.allowed
+    assert (result.used, result.cap) == (2, 3)
+
+
+def test_gear_at_the_cap_is_refused():
+    ledger = LEDGER + [
+        ["2026-08-07 13:00:00", "Kobe", "Asta's Belt", "Gear", "O", "1", "fff"]
+    ]
+    result = items_rules.check_eligibility(
+        items_rules.GEAR, "Kobe", ledger, "2026-08-07", already_has_special=False
+    )
+    assert not result.allowed
+    assert "3/3" in result.reason
+
+
+def test_pending_requests_count_toward_the_cap():
+    result = items_rules.check_eligibility(
+        items_rules.GEAR,
+        "Kobe",
+        LEDGER,
+        "2026-08-07",
+        already_has_special=False,
+        pending_gear=1,
+    )
+    assert not result.allowed
+
+
+def test_the_cap_is_configurable():
+    result = items_rules.check_eligibility(
+        items_rules.GEAR, "Kobe", LEDGER, "2026-08-07", already_has_special=False, cap=2
+    )
+    assert not result.allowed

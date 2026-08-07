@@ -262,3 +262,53 @@ def parse_request(
         f"No player named {tail!r} in the sheet.{hint} "
         "The IGN goes last: `!request <item name> <IGN>`"
     )
+
+
+@dataclass(frozen=True)
+class Eligibility:
+    allowed: bool
+    reason: str
+    used: int = 0
+    cap: int = 0
+
+
+def check_eligibility(
+    item_type: str,
+    ign: str,
+    ledger_rows: list[list[str]],
+    today: str,
+    *,
+    already_has_special: bool,
+    pending_gear: int = 0,
+    cap: int = DEFAULT_GEAR_DAILY_CAP,
+) -> Eligibility:
+    """Whether this player may receive this item right now.
+
+    Called twice per approval: once at !request for fast feedback, and
+    again inside the write lock when an officer clicks approve. The
+    second call is not redundant -- without it, a member queues several
+    requests before any is approved and every one of them passes the
+    first check.
+
+    pending_gear is why the first call is meaningful at all: queued but
+    unapproved gear requests count, so a member cannot stack four
+    requests and have officers approve them one at a time, each
+    individually looking within the cap.
+    """
+    if item_type == SPECIAL:
+        if already_has_special:
+            return Eligibility(
+                allowed=False,
+                reason="already has this special log -- it can only be received once",
+            )
+        return Eligibility(allowed=True, reason="eligible")
+
+    used = gear_used_today(ledger_rows, ign, today) + pending_gear
+    if used >= cap:
+        return Eligibility(
+            allowed=False,
+            reason=f"already at the daily gear limit ({used}/{cap}) -- resets at midnight PHT",
+            used=used,
+            cap=cap,
+        )
+    return Eligibility(allowed=True, reason="eligible", used=used, cap=cap)

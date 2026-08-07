@@ -693,7 +693,7 @@ def test_the_cap_is_configurable():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/python -m pytest tests/test_items_rules.py -k eligib -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -q`
 Expected: FAIL with `AttributeError: module 'items_rules' has no attribute 'check_eligibility'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -2259,7 +2259,7 @@ def test_a_duplicate_is_refused_even_from_a_different_account():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/python -m pytest tests/test_items_bot.py -k evaluate -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -q`
 Expected: FAIL with `AttributeError: module 'items_bot' has no attribute 'evaluate_request'`
 
 - [ ] **Step 3: Write minimal implementation**
