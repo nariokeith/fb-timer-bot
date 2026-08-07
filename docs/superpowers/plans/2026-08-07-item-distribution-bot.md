@@ -3213,7 +3213,7 @@ git commit -m "Add member helper commands and bot startup"
 
 
 def test_the_item_bot_is_supervised():
-    names = [spec.name for spec in supervisor.CHILDREN]
+    names = [spec.name for spec in CHILDREN]
     assert "items" in names
 
 
@@ -3224,14 +3224,16 @@ def test_the_item_bot_stays_stopped_when_not_configured():
     for the same shared resources, which is exactly what the default
     NO_RESTART_CODES policy exists to prevent.
     """
-    spec = next(s for s in supervisor.CHILDREN if s.name == "items")
-    assert not supervisor.should_restart(78, spec.no_restart_codes)
+    spec = next(s for s in CHILDREN if s.name == "items")
+    assert not should_restart(EXIT_NOT_CONFIGURED, spec.no_restart_codes)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/test_supervisor.py -k item -v`
 Expected: FAIL with `AssertionError: assert 'items' in ['timer', 'attendance']`
+
+Note: `tests/test_supervisor.py` already does `from supervisor import CHILDREN, EXIT_NOT_CONFIGURED, NO_RESTART_CODES, ChildSpec, Supervisor, should_restart` — use those bare names, do not add a `supervisor.` prefix or a new import.
 
 - [ ] **Step 3: Add the child spec**
 

@@ -81,6 +81,22 @@ def _pid_alive(pid):
     return True
 
 
+def test_the_item_bot_is_supervised():
+    names = [spec.name for spec in CHILDREN]
+    assert "items" in names
+
+
+def test_the_item_bot_stays_stopped_when_not_configured():
+    """Exit 78 must not crash-loop.
+
+    A crash-looping child on a 0.1 CPU instance competes with the timer
+    for the same shared resources, which is exactly what the default
+    NO_RESTART_CODES policy exists to prevent.
+    """
+    spec = next(s for s in CHILDREN if s.name == "items")
+    assert not should_restart(EXIT_NOT_CONFIGURED, spec.no_restart_codes)
+
+
 def _run_harness(child_name, child_argv, restart_delay=0):
     """Spawn `supervisor.py`'s real Supervisor.run() as its own OS process.
 
