@@ -2452,7 +2452,7 @@ def test_panel_lines_number_each_request_and_show_its_status():
         cap=3,
         today="2026-08-07",
     )
-    assert lines[0].startswith("1.")
+    assert lines[0].startswith("**1.")
     assert "Dajz" in lines[0] and "Asta's Heart" in lines[0]
     assert "2/3" in lines[1], "a gear line shows how many the player used today"
 

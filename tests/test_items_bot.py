@@ -259,6 +259,204 @@ def test_pending_gear_requests_count_toward_the_cap():
     assert not outcome.accepted
 
 
+def _queued(request_id, ign, item, type_):
+    return items_state.PendingRequest(
+        id=request_id, user_id=1, ign=ign, item=item, type=type_,
+        requested_at="2026-08-07 09:00:00",
+    )
+
+
+def test_panel_lines_number_each_request_and_show_its_status():
+    lines = items_bot.panel_lines(
+        [
+            _queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL),
+            _queued("b", "Kobe", "Asta's Belt", items_rules.GEAR),
+        ],
+        SNAPSHOT,
+        cap=3,
+        today="2026-08-07",
+    )
+    assert lines[0].startswith("**1.")
+    assert "Dajz" in lines[0] and "Asta's Heart" in lines[0]
+    assert "2/3" in lines[1], "a gear line shows how many the player used today"
+
+
+def test_panel_lines_flag_a_player_at_the_cap():
+    ledger = SNAPSHOT.ledger_rows + [
+        ["2026-08-07 11:00:00", "Kobe", "Asta's Belt", "Gear", "O", "1", "ccc"]
+    ]
+    lines = items_bot.panel_lines(
+        [_queued("b", "Kobe", "Asta's Belt", items_rules.GEAR)],
+        snapshot_with(ledger_rows=ledger), cap=3, today="2026-08-07",
+    )
+    assert "⚠️" in lines[0]
+
+
+def test_panel_lines_flag_a_special_the_player_already_holds():
+    """Kobe already has Asta's Heart in SPECIAL_GRID_ROWS."""
+    lines = items_bot.panel_lines(
+        [_queued("a", "Kobe", "Asta's Heart", items_rules.SPECIAL)],
+        SNAPSHOT, cap=3, today="2026-08-07",
+    )
+    assert "already has it" in lines[0]
+
+
+def test_panel_lines_show_a_requests_note():
+    request = items_state.PendingRequest(
+        id="a", user_id=1, ign="Dajz", item="Asta's Heart",
+        type=items_rules.SPECIAL, requested_at="2026-08-07 09:00:00",
+        note="previously requested as Kobe",
+    )
+    lines = items_bot.panel_lines([request], SNAPSHOT, cap=3, today="2026-08-07")
+    assert "previously requested as Kobe" in lines[0]
+
+
+def test_panel_lines_number_from_the_page_start():
+    lines = items_bot.panel_lines(
+        [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)],
+        SNAPSHOT, cap=3, today="2026-08-07", start=26,
+    )
+    assert lines[0].startswith("**26.")
+
+
+def test_pages_chunks_the_queue_so_every_request_is_reachable():
+    queue = [_queued(f"id{n}", "Dajz", "Asta's Heart", items_rules.SPECIAL) for n in range(60)]
+    chunks = items_bot.pages(queue)
+    assert [len(c) for c in chunks] == [25, 25, 10]
+    assert sum(len(c) for c in chunks) == 60
+
+
+def test_pages_of_an_empty_queue_is_one_empty_page():
+    assert items_bot.pages([]) == [[]]
+
+
+def test_a_panel_remembers_which_page_it_shows():
+    """Page 2 must redraw as page 2, not be replaced by page 1."""
+    queue = [_queued(f"id{n}", "Dajz", "Asta's Heart", items_rules.SPECIAL) for n in range(30)]
+    panel = items_bot.DistributePanel(items_bot.pages(queue)[1], start=26)
+    assert panel.start == 26
+
+
+def test_an_empty_queue_says_so():
+    embed = items_bot.build_panel_embed([], SNAPSHOT, cap=3, today="2026-08-07")
+    assert "no pending" in embed.description.lower()
+
+
+def test_deny_removes_the_request_and_writes_nothing():
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    message = asyncio.run(items_bot.deny("a"))
+    assert items_bot._STATE.queue == []
+    assert "Dajz" in message
+
+
+def test_denying_an_already_resolved_request_reports_it():
+    items_bot._STATE.queue = []
+    message = asyncio.run(items_bot.deny("gone"))
+    assert "already" in message.lower()
+
+
+def test_approving_an_already_resolved_request_writes_nothing(monkeypatch):
+    items_bot._STATE.queue = []
+    calls = []
+    monkeypatch.setattr(
+        items_sheet, "commit_approval", lambda *a, **k: calls.append(k)
+    )
+    message = asyncio.run(items_bot.approve("gone", "Keith"))
+    assert calls == []
+    assert "already" in message.lower()
+
+
+def test_approve_commits_and_removes_the_request(monkeypatch):
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    calls = []
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(
+        items_sheet, "commit_approval",
+        lambda spreadsheet, **kwargs: calls.append(kwargs) or "B3",
+    )
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+
+    message = asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert len(calls) == 1
+    assert calls[0]["ign"] == "Dajz"
+    assert calls[0]["officer"] == "Keith"
+    assert items_bot._STATE.queue == []
+    assert "Dajz" in message
+
+
+def test_approve_rechecks_the_cap_and_refuses_a_stale_request(monkeypatch):
+    """The second cap check is the point of this test.
+
+    The request passed the check when it was queued. By the time an
+    officer clicks, the player has been given their third gear log by
+    hand, so the approval must be refused even though the request is
+    still sitting in the queue.
+    """
+    items_bot._STATE.queue = [_queued("a", "Kobe", "Asta's Belt", items_rules.GEAR)]
+    full_ledger = SNAPSHOT.ledger_rows + [
+        ["2026-08-07 11:00:00", "Kobe", "Benji's Heart", "Gear", "O", "1", "ccc"]
+    ]
+    monkeypatch.setattr(
+        items_sheet, "read_snapshot",
+        lambda spreadsheet: snapshot_with(ledger_rows=full_ledger),
+    )
+    calls = []
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: calls.append(k))
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+
+    message = asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert calls == [], "no write when the cap is already reached"
+    assert items_bot._STATE.queue, "a refused approval leaves the request queued"
+    assert "limit" in message.lower()
+
+
+def test_a_failed_sheet_write_leaves_the_request_queued(monkeypatch):
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("sheets is down")
+
+    monkeypatch.setattr(items_sheet, "commit_approval", boom)
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+
+    message = asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert items_bot._STATE.queue, "nothing may be lost when the sheet fails"
+    assert "sheets is down" in message
+
+
+def test_a_partial_write_dequeues_and_hands_over_the_row(monkeypatch):
+    """The cell is written; a retry would double-count.
+
+    So the request must NOT stay queued, and the officers must be told
+    exactly what to paste into the ledger.
+    """
+    items_bot._STATE.queue = [_queued("a", "Kobe", "Asta's Belt", items_rules.GEAR)]
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+
+    row = ["2026-08-07 14:00:00", "Kobe", "Asta's Belt", "Gear", "Keith", "1", "a"]
+
+    def partial(*args, **kwargs):
+        raise items_sheet.LedgerWriteError("B2", row, RuntimeError("ledger is down"))
+
+    monkeypatch.setattr(items_sheet, "commit_approval", partial)
+
+    message = asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert items_bot._STATE.queue == [], "a written cell must not be re-approvable"
+    assert "B2" in message
+    assert "Asta's Belt" in message
+    assert "do not approve this again" in message.lower()
+
+
+async def _noop_save(channel=None):
+    return []
+
+
 def test_a_duplicate_pending_request_is_refused():
     state = items_state.State(
         queue=[

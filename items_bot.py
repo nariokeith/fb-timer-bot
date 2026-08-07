@@ -297,3 +297,304 @@ async def request_cmd(ctx, *, argument: str = ""):
                 f"requests were dropped and must be re-requested: {names}",
             )
         )
+
+
+# Discord allows at most 25 options in a select menu.
+MAX_PANEL_OPTIONS = 25
+
+
+def panel_lines(
+    requests: list[items_state.PendingRequest],
+    snapshot: items_sheet.Snapshot,
+    cap: int,
+    today: str,
+    start: int = 1,
+) -> list[str]:
+    """One display line per pending request, with its current standing.
+
+    The standing is recomputed at render time, not stored: an officer
+    needs to see the position as it is now, which may differ from when
+    the member requested.
+    """
+    lines = []
+    for number, request in enumerate(requests, start=start):
+        if request.type == items_rules.GEAR:
+            used = items_rules.gear_used_today(snapshot.ledger_rows, request.ign, today)
+            flag = "⚠️" if used >= cap else "✅"
+            status = f"{flag} {used}/{cap} today"
+        elif items_sheet.holds_special(snapshot, request.ign, request.item):
+            status = "⚠️ already has it"
+        else:
+            status = "✅ eligible"
+        line = (
+            f"**{number}. {request.ign}** — {request.item}  "
+            f"`[{request.type}]`  {status}"
+        )
+        if request.note:
+            line += f"\n     ⚠️ {request.note}"
+        lines.append(line)
+    return lines
+
+
+def build_panel_embed(
+    requests: list[items_state.PendingRequest],
+    snapshot: items_sheet.Snapshot,
+    cap: int,
+    today: str,
+    start: int = 1,
+) -> discord.Embed:
+    if not requests:
+        return _embed("📦 Pending Item Requests", "There are no pending requests.", 0x95A5A6)
+    body = "\n".join(panel_lines(requests, snapshot, cap, today, start))
+    return _embed("📦 Pending Item Requests", body, 0x3498DB)
+
+
+async def deny(request_id: str) -> str:
+    """Drop a request. Writes nothing to any tab."""
+    async with _SHEET_LOCK:
+        removed = items_state.remove_request(_STATE, request_id)
+        if removed is None:
+            return "That request was already handled by another officer."
+        channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
+        if channel is not None:
+            await save_state(channel)
+    return f"Denied **{removed.item}** for **{removed.ign}**. Nothing was written to the sheet."
+
+
+async def approve(request_id: str, officer_name: str) -> str:
+    """Write the item to the sheet and the ledger, then drop the request.
+
+    The whole sequence -- re-read, re-check the cap, write -- happens
+    under _SHEET_LOCK. Splitting it would let two officers both read
+    "2 used today" and both write.
+    """
+    async with _SHEET_LOCK:
+        request = items_state.find_request(_STATE, request_id)
+        if request is None:
+            return "That request was already handled by another officer."
+
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            return f"Could not read the sheet, so nothing was written: {exc}"
+
+        eligibility = items_rules.check_eligibility(
+            request.type,
+            request.ign,
+            snapshot.ledger_rows,
+            today_pht(),
+            already_has_special=items_sheet.holds_special(
+                snapshot, request.ign, request.item
+            ),
+            cap=gear_cap(),
+        )
+        if not eligibility.allowed:
+            return (
+                f"Not approved: **{request.ign}** {eligibility.reason}. "
+                "The request is still in the queue."
+            )
+
+        try:
+            await asyncio.to_thread(
+                lambda: items_sheet.commit_approval(
+                    _SPREADSHEET,
+                    ign=request.ign,
+                    item=request.item,
+                    item_type=request.type,
+                    timestamp=items_rules.format_timestamp(items_rules.now_pht()),
+                    officer=officer_name,
+                    user_id=request.user_id,
+                    request_id=request.id,
+                )
+            )
+        except items_sheet.LedgerWriteError as exc:
+            # The item cell IS written. Retrying would double-count a
+            # gear increment and could never succeed for a special log,
+            # so drop the request and hand the officers the exact row.
+            items_state.remove_request(_STATE, request_id)
+            channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
+            if channel is not None:
+                await save_state(channel)
+            pasteable = " | ".join(exc.row)
+            return (
+                f"⚠️ **{request.item}** was given to **{request.ign}** "
+                f"(cell {exc.address} is updated), but the Distribution Log "
+                f"row could not be written: {exc}\n"
+                f"Do NOT approve this again — add this row to "
+                f"`{items_sheet.LEDGER_TAB}` by hand:\n```\n{pasteable}\n```"
+            )
+        except Exception as exc:
+            return f"Sheet write failed, request kept in the queue: {exc}"
+
+        items_state.remove_request(_STATE, request_id)
+        channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
+        if channel is not None:
+            await save_state(channel)
+
+    return f"Approved **{request.item}** for **{request.ign}**."
+
+
+class DistributePanel(discord.ui.View):
+    """Select a request, then approve or deny it.
+
+    A select plus two buttons rather than a pair of buttons per request:
+    Discord allows five action rows of five components, which would cap
+    the panel at five requests. A select handles 25.
+    """
+
+    def __init__(self, requests: list[items_state.PendingRequest], *, start: int = 1):
+        super().__init__(timeout=PANEL_TIMEOUT)
+        self.selected: str | None = None
+        # The page this panel shows, so refresh_panel redraws THIS page.
+        self.start = start
+        # Set by the sender so on_timeout can edit the panel.
+        self.message: discord.Message | None = None
+
+        options = [
+            discord.SelectOption(
+                label=f"{n}. {r.ign} — {r.item}"[:100],
+                value=r.id,
+                description=f"{r.type} · requested {r.requested_at}"[:100],
+            )
+            for n, r in enumerate(requests[:MAX_PANEL_OPTIONS], start=start)
+        ]
+        self.picker = discord.ui.Select(placeholder="Choose a request…", options=options)
+        self.picker.callback = self._on_pick
+        self.add_item(self.picker)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """The private channel is the authorization gate.
+
+        Discord already stops anyone who cannot see the channel from
+        clicking. This re-checks against the CURRENTLY recorded officer
+        channel -- not the one captured when the panel was built -- so
+        that moving the officer channel with !setofficerchannel
+        immediately makes panels left behind in the old channel inert.
+        """
+        if not is_officer_channel(interaction.channel_id):
+            await interaction.response.send_message(
+                "This panel only works in the current officers' channel.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        """Say the panel expired instead of failing silently.
+
+        Once the timeout elapses discord.py stops dispatching component
+        interactions, so without this an officer clicking an old panel
+        gets Discord's generic "interaction failed" and no explanation.
+        The queue itself is untouched -- only this view is dead.
+        """
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content="⏳ This panel expired. Run `!distribute` for a fresh one.",
+                view=self,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def _on_pick(self, interaction: discord.Interaction):
+        self.selected = self.picker.values[0]
+        await interaction.response.defer()
+
+    async def _require_selection(self, interaction: discord.Interaction) -> bool:
+        if self.selected is None:
+            await interaction.response.send_message(
+                "Pick a request from the dropdown first.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
+    async def approve_button(self, interaction: discord.Interaction, _button):
+        if not await self._require_selection(interaction):
+            return
+        await interaction.response.defer()
+        result = await approve(self.selected, interaction.user.display_name)
+        self.selected = None
+        await interaction.followup.send(result)
+        await refresh_panel(interaction, self.start)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
+    async def deny_button(self, interaction: discord.Interaction, _button):
+        if not await self._require_selection(interaction):
+            return
+        await interaction.response.defer()
+        result = await deny(self.selected)
+        self.selected = None
+        await interaction.followup.send(result)
+        await refresh_panel(interaction, self.start)
+
+
+def pages(requests: list[items_state.PendingRequest]) -> list[list[items_state.PendingRequest]]:
+    """Split the queue into panel-sized chunks.
+
+    Discord allows at most 25 options in a select, so a queue longer
+    than that needs more than one panel. Chunking and posting one panel
+    per chunk is real pagination: every request is reachable. Showing
+    only the first 25 and asking officers to re-run the command would
+    not be -- re-running shows the same 25.
+    """
+    return [
+        requests[i : i + MAX_PANEL_OPTIONS]
+        for i in range(0, len(requests), MAX_PANEL_OPTIONS)
+    ] or [[]]
+
+
+async def send_panels(destination, snapshot, requests) -> None:
+    """Post one panel per page of the queue."""
+    cap = gear_cap()
+    today = today_pht()
+    chunks = pages(requests)
+    for index, chunk in enumerate(chunks):
+        start = index * MAX_PANEL_OPTIONS + 1
+        embed = build_panel_embed(chunk, snapshot, cap, today, start=start)
+        if len(chunks) > 1:
+            embed.set_footer(text=f"Page {index + 1} of {len(chunks)}")
+        view = DistributePanel(chunk, start=start) if chunk else None
+        message = await destination.send(embed=embed, view=view)
+        if view is not None:
+            view.message = message
+
+
+async def refresh_panel(interaction: discord.Interaction, start: int) -> None:
+    """Redraw one page of the queue in place after a request resolves.
+
+    `start` is the page this panel is showing, so page 2 stays page 2
+    rather than being replaced by page 1's contents. Other pages go
+    stale, which is harmless: approve() and deny() both re-check the
+    queue, so a click on a stale entry reports that it was already
+    handled rather than acting twice.
+    """
+    try:
+        snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+    except Exception:
+        return
+    offset = start - 1
+    requests = list(_STATE.queue)[offset : offset + MAX_PANEL_OPTIONS]
+    embed = build_panel_embed(requests, snapshot, gear_cap(), today_pht(), start=start)
+    view = DistributePanel(requests, start=start) if requests else None
+    await interaction.message.edit(embed=embed, view=view)
+    if view is not None:
+        view.message = interaction.message
+
+
+@bot.command(name="distribute")
+async def distribute_cmd(ctx):
+    """Show the pending requests with approve/deny controls."""
+    if not is_officer_channel(ctx.channel.id):
+        return  # silently ignored outside the officers' channel
+
+    try:
+        snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+    except Exception as exc:
+        await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+        return
+
+    await send_panels(ctx, snapshot, list(_STATE.queue))
