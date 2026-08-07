@@ -167,3 +167,98 @@ def resolve_item(
     suggestions = _suggest(query, specials + gears)
     hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
     raise ItemLookupError(f"No item column named {query!r}.{hint}")
+
+
+class RequestParseError(RuntimeError):
+    """The !request argument does not resolve to one item and one player."""
+
+
+@dataclass(frozen=True)
+class ParsedRequest:
+    item: ResolvedItem
+    ign: str
+
+
+def resolve_ign(query: str, roster: list[str]) -> str | None:
+    """The roster entry this name refers to, or None.
+
+    Exact (normalized) match, plus attendance_roster.ALIASES so a member
+    typing their decorated in-game name ('ツRyuuツ') reaches their sheet
+    row ('Ryuu'). Some in-game names share no characters at all with
+    their sheet row, so aliases are the only possible resolution path
+    for those players -- no fuzzy threshold could ever match them.
+
+    Fuzzy matching is deliberately not used: a wrong match here would
+    credit an item to someone else, permanently.
+    """
+    index = {normalize(player): player for player in roster if player.strip()}
+    wanted = normalize(query)
+    if wanted in index:
+        return index[wanted]
+    for alias, target in ALIASES.items():
+        if normalize(alias) == wanted and normalize(target) in index:
+            return index[normalize(target)]
+    return None
+
+
+def parse_request(
+    argument: str,
+    roster: list[str],
+    special_headers: list[str],
+    gear_headers: list[str],
+) -> ParsedRequest:
+    """Split '<item name> <IGN>' where BOTH parts may contain spaces.
+
+    Position-based splitting cannot work: the roster contains
+    'chinchong ni Mumu'. Every split point is tried instead, and a split
+    is accepted only when its suffix is a known player AND its prefix is
+    a known item. Longest IGN first, so 'chinchong ni Mumu' wins over a
+    hypothetical player called 'Mumu'.
+    """
+    words = argument.split()
+    if len(words) < 2:
+        raise RequestParseError(
+            "Usage: `!request <item name> <IGN>` -- for example "
+            "`!request Asta's Heart Kobe`"
+        )
+
+    matches: list[ParsedRequest] = []
+    item_errors: list[str] = []
+    saw_known_ign = False
+
+    # split at index i => words[:i] is the item, words[i:] is the IGN.
+    # Descending i would try the SHORTEST ign first; ascending tries the
+    # longest, which is what disambiguates multi-word names.
+    for i in range(1, len(words)):
+        candidate_ign = " ".join(words[i:])
+        player = resolve_ign(candidate_ign, roster)
+        if player is None:
+            continue
+        saw_known_ign = True
+        try:
+            item = resolve_item(
+                " ".join(words[:i]), special_headers, gear_headers
+            )
+        except ItemLookupError as exc:
+            item_errors.append(str(exc))
+            continue
+        matches.append(ParsedRequest(item=item, ign=player))
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        readings = "; ".join(f"{m.item.name!r} for {m.ign!r}" for m in matches)
+        raise RequestParseError(
+            f"That could be read more than one way ({readings}). "
+            "Refusing to guess."
+        )
+    if saw_known_ign:
+        raise RequestParseError(item_errors[0])
+
+    tail = words[-1]
+    suggestions = get_close_matches(tail, roster, n=3, cutoff=0.6)
+    hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+    raise RequestParseError(
+        f"No player named {tail!r} in the sheet.{hint} "
+        "The IGN goes last: `!request <item name> <IGN>`"
+    )

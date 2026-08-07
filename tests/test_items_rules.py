@@ -113,3 +113,70 @@ def test_the_player_name_column_is_never_treated_as_an_item():
 def test_a_blank_query_is_refused():
     with pytest.raises(items_rules.ItemLookupError):
         items_rules.resolve_item("   ", SPECIAL_HEADERS, GEAR_HEADERS)
+
+
+ROSTER = ["Kobe", "Dajz", "chinchong ni Mumu", "Smth"]
+
+
+def _parse(argument):
+    return items_rules.parse_request(argument, ROSTER, SPECIAL_HEADERS, GEAR_HEADERS)
+
+
+def test_parses_a_single_word_ign():
+    parsed = _parse("Asta's Heart Kobe")
+    assert (parsed.item.name, parsed.ign) == ("Asta's Heart", "Kobe")
+
+
+def test_parses_an_ign_containing_spaces():
+    parsed = _parse("Asta's Heart chinchong ni Mumu")
+    assert (parsed.item.name, parsed.ign) == ("Asta's Heart", "chinchong ni Mumu")
+
+
+def test_parses_a_gear_item():
+    parsed = _parse("Asta's Belt Dajz")
+    assert (parsed.item.name, parsed.item.type) == ("Asta's Belt", items_rules.GEAR)
+
+
+def test_extra_whitespace_does_not_matter():
+    parsed = _parse("  Asta's   Heart    Kobe ")
+    assert parsed.ign == "Kobe"
+
+
+def test_an_unknown_ign_is_refused_and_named():
+    with pytest.raises(items_rules.RequestParseError) as exc:
+        _parse("Asta's Heart Kobee")
+    assert "Kobee" in str(exc.value) or "Kobe" in str(exc.value)
+
+
+def test_an_unknown_item_is_refused():
+    with pytest.raises(items_rules.RequestParseError):
+        _parse("Nonexistent Thing Kobe")
+
+
+def test_a_bare_ign_with_no_item_is_refused():
+    with pytest.raises(items_rules.RequestParseError):
+        _parse("Kobe")
+
+
+def test_an_empty_argument_is_refused():
+    with pytest.raises(items_rules.RequestParseError):
+        _parse("")
+
+
+def test_an_alias_resolves_to_the_sheet_row():
+    """'ツRyuuツ' shares no Latin characters with 'Ryuu'.
+
+    Aliases are the only possible resolution path for names like this --
+    no fuzzy threshold, however low, could ever match them.
+    """
+    parsed = items_rules.parse_request(
+        "Asta's Heart ツRyuuツ", ["Ryuu"], SPECIAL_HEADERS, GEAR_HEADERS
+    )
+    assert parsed.ign == "Ryuu"
+
+
+def test_an_alias_whose_target_is_absent_does_not_resolve():
+    with pytest.raises(items_rules.RequestParseError):
+        items_rules.parse_request(
+            "Asta's Heart ツRyuuツ", ["Kobe"], SPECIAL_HEADERS, GEAR_HEADERS
+        )
