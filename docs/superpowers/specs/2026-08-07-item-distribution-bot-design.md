@@ -137,18 +137,27 @@ whose prefix resolves to a known item.
 The bot echoes its interpretation back ("Requesting **Asta's Heart** for
 **Kobe**") so a mis-parse is visible immediately.
 
-Resolution, both using `attendance_roster.match_names`' fuzzy matcher:
+Resolution is **exact** (case- and whitespace-insensitive), with
+`attendance_roster.ALIASES` applied to the IGN:
 
-- IGN against column A of `Special Logs`.
+- IGN against column A of `Special Logs`, then through `ALIASES` (so a member
+  typing their decorated in-game name, e.g. `ツRyuuツ`, resolves to the sheet row
+  `Ryuu`).
 - Item against the header rows of both item tabs.
 
-Unknown or ambiguous input is refused with the near-misses named. The bot never
-creates a player row or a column.
+Fuzzy matching is deliberately **not** used on either part, unlike
+`attendance_roster.match_names`. Fuzzy matching earns its place there because it
+is cleaning up OCR output, where no human is available to retype. Here a human
+is typing, item names differ by a single word (`Asta's Belt` vs `Asta's Heart`),
+and an approval is a permanent record — so a near miss is refused with the close
+names offered as suggestions. The bot never creates a player row or a column.
 
 **IGN memory.** The bot records `discord_user_id -> last IGN used` in its state.
-A later request with a different IGN prompts for confirmation ("You used `Kobe`
-before — is `Kobee` correct?"). This is the guard against the typo risk inherent
-in members typing their own IGN.
+A later request under a different IGN is **not** refused — a member may
+legitimately request for an alt. Instead the request is queued carrying a note,
+and the officer panel shows `⚠️ previously requested as Kobe`. The person with
+the authority to judge it sees it, which is the same principle as showing them
+the allocation history rather than hard-blocking.
 
 Rejections at request time:
 
@@ -156,7 +165,9 @@ Rejections at request time:
 - Item not found / ambiguous / present in both tabs
 - Special log the player already has (checkbox is `TRUE`)
 - Gear log when approvals-today + pending-gear-requests already ≥ 3
-- A duplicate of a request the member already has pending
+- A duplicate: the same item is already queued for that IGN, by anyone. Keyed on
+  IGN rather than on the requesting Discord account, so the same item cannot be
+  queued twice for one player from two accounts.
 
 ### `!distribute` — officer channel only
 
@@ -243,6 +254,7 @@ simultaneous approvals both read "2 today" and both write, yielding 4.
 | Failure | Behaviour |
 |---|---|
 | Sheet unreachable on ✓ | Report the failure; **request stays queued**. Nothing is lost. |
+| Item cell written but the ledger append fails | The request is **removed** from the queue and the officers get a loud message with the exact row to paste by hand. Leaving it queued would be worse: a retry would increment a gear count a second time, and a special-log retry could never succeed because the checkbox is now ticked. |
 | Sheet unreachable on `!request` | Refuse with "sheet unreachable", do not queue. |
 | `Gear Logs` tab absent | `!request` for a gear item refuses with a clear message naming the missing tab. Special logs keep working. |
 | Player row missing | Refuse. The bot never adds a row. |
