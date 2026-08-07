@@ -20,7 +20,7 @@
 - All blocking `gspread` calls go through `asyncio.to_thread`; every read-then-write sequence is serialized by a module-level `asyncio.Lock`.
 - The `Gear Logs` tab is still being edited by the user. Never cache or hardcode an item list — read headers live on every request.
 - Reuse, do not reimplement: `attendance_roster.normalize` / `match_names`, `attendance_sheet.open_spreadsheet` / `read_headers` / `read_players` / `find_column` / `get_or_create_tab` / `SheetStructureError`, `attendance_bosses.header_base`.
-- Run tests with `.venv/bin/pytest`. Commit after every task.
+- Run tests with `.venv/bin/python -m pytest` (NOT `.venv/bin/pytest` — that does not put the repo root on sys.path, so every `import items_*` fails at collection). Commit after every task.
 
 ---
 
@@ -84,7 +84,7 @@ def test_now_pht_is_timezone_aware_in_manila():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'items_rules'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -169,7 +169,7 @@ def gear_used_today(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Add the cap-counting tests**
@@ -209,7 +209,7 @@ def test_short_rows_are_skipped_not_fatal():
 
 - [ ] **Step 6: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 7: Commit**
@@ -282,7 +282,7 @@ def test_a_blank_query_is_refused():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -k resolve -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -k resolve -v`
 Expected: FAIL with `AttributeError: module 'items_rules' has no attribute 'resolve_item'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -368,7 +368,7 @@ def resolve_item(
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -466,7 +466,7 @@ def test_an_alias_whose_target_is_absent_does_not_resolve():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -k parse -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -k parse -v`
 Expected: FAIL with `AttributeError: module 'items_rules' has no attribute 'parse_request'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -572,7 +572,7 @@ def parse_request(
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -657,7 +657,7 @@ def test_the_cap_is_configurable():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -k eligib -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -k eligib -v`
 Expected: FAIL with `AttributeError: module 'items_rules' has no attribute 'check_eligibility'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -718,7 +718,7 @@ def check_eligibility(
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -811,7 +811,7 @@ def test_new_request_ids_are_unique():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_state.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_state.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'items_state'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -962,7 +962,7 @@ def decode_state(content: str) -> State | None:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_state.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_state.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Write the failing test for queue operations**
@@ -1004,7 +1004,7 @@ def test_removing_an_already_removed_request_returns_none():
 
 - [ ] **Step 6: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_state.py -k "pending or find or remove" -v`
+Run: `.venv/bin/python -m pytest tests/test_items_state.py -k "pending or find or remove" -v`
 Expected: FAIL with `AttributeError: module 'items_state' has no attribute 'pending_gear_for'`
 
 - [ ] **Step 7: Implement the queue operations**
@@ -1047,7 +1047,7 @@ Add `from attendance_roster import normalize` re-export usage: `items_rules` alr
 
 - [ ] **Step 8: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_state.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_state.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 9: Commit**
@@ -1176,7 +1176,7 @@ def test_find_row_refuses_an_unknown_player():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_sheet.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_sheet.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'items_sheet'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1337,7 +1337,7 @@ def holds_special(snapshot: Snapshot, ign: str, item: str) -> bool:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_sheet.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_sheet.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -1517,7 +1517,7 @@ def test_a_failed_ledger_append_is_reported_as_its_own_unretryable_error(monkeyp
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_sheet.py -k record -v`
+Run: `.venv/bin/python -m pytest tests/test_items_sheet.py -k record -v`
 Expected: FAIL with `AttributeError: module 'items_sheet' has no attribute 'record_special'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1669,7 +1669,7 @@ def commit_approval(
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_sheet.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_sheet.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -1864,7 +1864,7 @@ def test_saving_twice_edits_the_same_message_rather_than_posting_again():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'items_bot'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -2001,7 +2001,7 @@ async def load_state(channel) -> bool:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Add the setofficerchannel command and its test**
@@ -2061,7 +2061,7 @@ def test_is_officer_channel_is_false_before_setup():
 
 - [ ] **Step 6: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 7: Commit**
@@ -2223,7 +2223,7 @@ def test_a_duplicate_is_refused_even_from_a_different_account():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -k evaluate -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -k evaluate -v`
 Expected: FAIL with `AttributeError: module 'items_bot' has no attribute 'evaluate_request'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -2371,7 +2371,7 @@ async def request_cmd(ctx, *, argument: str = ""):
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -2605,7 +2605,7 @@ Add near the top of the test file, so `_noop_save` is defined before use at impo
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -k "panel or approve or deny" -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -k "panel or approve or deny" -v`
 Expected: FAIL with `AttributeError: module 'items_bot' has no attribute 'panel_lines'`
 
 - [ ] **Step 3: Implement the panel rendering and the resolve functions**
@@ -2750,7 +2750,7 @@ async def approve(request_id: str, officer_name: str) -> str:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Add the view and the command**
@@ -2927,7 +2927,7 @@ async def distribute_cmd(ctx):
 
 - [ ] **Step 6: Run the tests**
 
-Run: `.venv/bin/pytest tests/ -v`
+Run: `.venv/bin/python -m pytest tests/ -v`
 Expected: PASS — all item tests plus the existing attendance suite unchanged
 
 - [ ] **Step 7: Commit**
@@ -3003,7 +3003,7 @@ def test_cancellable_reports_when_nothing_is_pending():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -k "cancellable or requests_for" -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -k "cancellable or requests_for" -v`
 Expected: FAIL with `AttributeError: module 'items_bot' has no attribute 'requests_for_user'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -3146,7 +3146,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/ -v`
+Run: `.venv/bin/python -m pytest tests/ -v`
 Expected: PASS — all suites
 
 - [ ] **Step 5: Commit**
@@ -3194,7 +3194,7 @@ def test_the_item_bot_stays_stopped_when_not_configured():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_supervisor.py -k item -v`
+Run: `.venv/bin/python -m pytest tests/test_supervisor.py -k item -v`
 Expected: FAIL with `AssertionError: assert 'items' in ['timer', 'attendance']`
 
 - [ ] **Step 3: Add the child spec**
@@ -3216,7 +3216,7 @@ CHILDREN = [
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_supervisor.py -v`
+Run: `.venv/bin/python -m pytest tests/test_supervisor.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Add the env vars to render.yaml**
@@ -3257,7 +3257,7 @@ Add a section covering: the three commands, the two rules, the `!setofficerchann
 
 - [ ] **Step 8: Run the full suite**
 
-Run: `.venv/bin/pytest tests/ -v`
+Run: `.venv/bin/python -m pytest tests/ -v`
 Expected: PASS — including every pre-existing attendance and supervisor test, unchanged
 
 - [ ] **Step 9: Commit**
