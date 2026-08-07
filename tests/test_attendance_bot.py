@@ -1510,12 +1510,16 @@ def test_the_points_annotation_collision_names_the_offending_fragment():
 
 def test_an_ambiguous_fragment_refuses_the_whole_command():
     grid = [
-        ["Player Name", "Points", "Catena Prime", "Catena Rex"],
-        ["Kobe", "44", "", ""],
+        ["Player Name", "Points", "Clemantis", "Catena Prime", "Catena Rex"],
+        ["Kobe", "44", "", "", ""],
     ]
     sh = _multi_sheet(grid=grid)
+
+    # The FIRST fragment resolves cleanly; the second is ambiguous. The
+    # whole command must still be refused, not just the bad fragment
+    # dropped -- otherwise Clemantis is logged alone and nobody notices.
     with pytest.raises(BossAmbiguous) as caught:
-        attendance_bot._load_context(sh, "catena")
+        attendance_bot._load_context(sh, "clemantis - catena")
 
     assert "catena" in str(caught.value).casefold()
 
@@ -1651,3 +1655,184 @@ def test_the_preview_lists_every_boss_with_its_own_points(monkeypatch):
     for expected in ("Clemantis +1", "Lady Dalia +1", "Lucus +3"):
         assert expected in description
     assert "**5** points each" in description
+
+
+# --------------------------------------------------------------------------
+# (MB-1) The anti-zip-short guard. A hand-edited or half-written _BotLog row
+# whose boss count and points count disagree must be refused BEFORE any
+# write -- zipping short would under-reverse real people's points.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_writes(monkeypatch):
+    """Records every apply_writes call so a test can prove there were none."""
+    calls = []
+
+    def spy(worksheet, payload):
+        calls.append(payload)
+
+    monkeypatch.setattr(attendance_bot, "apply_writes", spy)
+    return calls
+
+
+def _undo_sheet_with(monkeypatch, **overrides):
+    logged = _entry(tab=TAB, players=json.dumps(["xSigarilyas"]), **overrides)
+    sh = _multi_sheet(log=_log_tab([str(logged[f]) for f in LOG_HEADER]))
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    return sh
+
+
+def test_two_bosses_with_a_single_bare_points_cell_is_refused(
+    monkeypatch, no_writes
+):
+    sh = _undo_sheet_with(
+        monkeypatch,
+        boss=json.dumps(["Clemantis", "Lucus"]),
+        points_each="3",
+    )
+
+    with pytest.raises(SheetStructureError) as caught:
+        attendance_bot._reverse_last()
+
+    assert "refusing to guess" in str(caught.value)
+    # Refused BEFORE writing, not merely raising eventually.
+    assert not no_writes
+    assert not sh.worksheet(TAB).batches
+
+
+def test_one_boss_with_two_points_values_is_refused(monkeypatch, no_writes):
+    sh = _undo_sheet_with(
+        monkeypatch,
+        boss="Lucus",
+        points_each=json.dumps([1, 3]),
+    )
+
+    with pytest.raises(SheetStructureError) as caught:
+        attendance_bot._reverse_last()
+
+    assert "refusing to guess" in str(caught.value)
+    assert not no_writes
+    assert not sh.worksheet(TAB).batches
+
+
+# --------------------------------------------------------------------------
+# (MB-2) Atomicity under failure. The property the whole design turns on:
+# a boss that fails partway through means NOTHING is written, not a partial
+# set of columns under a log row that describes neither state.
+# --------------------------------------------------------------------------
+
+
+def test_a_boss_failing_partway_through_writes_nothing_at_all(monkeypatch):
+    # Clemantis has a column; Lucus does not.
+    grid = [
+        ["Player Name", "Points", "Clemantis", "Lady Dalia"],
+        ["ARCILynN", "51", "", ""],
+        ["Kobe", "44", "2", "1"],
+    ]
+    sh = _multi_sheet(grid=grid)
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    entry = _entry(
+        boss=json.dumps(["Clemantis", "Lucus"]),
+        points_each=json.dumps([1, 3]),
+        players=json.dumps(["Kobe"]),
+    )
+
+    with pytest.raises(SheetStructureError):
+        attendance_bot._commit(
+            TAB, ["Clemantis", "Lucus"], ["Kobe"], [1, 3], entry, False
+        )
+
+    # Clemantis resolved fine and would have been written by a per-boss
+    # apply_writes loop. One payload, one write, so nothing landed.
+    assert not sh.worksheet(TAB).batches
+
+
+def test_an_undo_failing_partway_through_removes_nothing_at_all(monkeypatch):
+    grid = [
+        ["Player Name", "Points", "Clemantis", "Lady Dalia"],
+        ["xSigarilyas", "49", "2", "1"],
+    ]
+    logged = _entry(
+        tab=TAB,
+        boss=json.dumps(["Clemantis", "Lucus"]),
+        points_each=json.dumps([1, 3]),
+        players=json.dumps(["xSigarilyas"]),
+    )
+    sh = _multi_sheet(grid=grid, log=_log_tab([str(logged[f]) for f in LOG_HEADER]))
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    with pytest.raises(SheetStructureError):
+        attendance_bot._reverse_last()
+
+    assert not sh.worksheet(TAB).batches
+
+
+# --------------------------------------------------------------------------
+# (MB-3) The boss list must survive in the do-not-re-run messages: an
+# officer who cannot see which columns were paid cannot reconcile them.
+# --------------------------------------------------------------------------
+
+TEN_BOSSES = [
+    "Clemantis", "Lady Dalia", "Catena", "General Aquleus", "Lucus",
+    "Libitina", "Rakajeth", "Icaruthia", "Nevaeh", "Camalia",
+]
+TEN_POINTS = [1, 1, 1, 1, 3, 3, 3, 3, 3, 3]
+
+
+def test_every_boss_survives_in_the_partly_written_message():
+    exc = attendance_bot.PointsWrittenButNotLogged(
+        tab="Week 17.1",
+        boss=TEN_BOSSES,
+        points=TEN_POINTS,
+        players=BIG_ROSTER,
+        cause_text=BIG_CAUSE,
+    )
+    description = exc.description
+
+    assert len(description) <= DISCORD_EMBED_DESCRIPTION_LIMIT
+    for boss in TEN_BOSSES:
+        assert boss in description, f"{boss} was clipped out of the reconcile list"
+    for sentence in PARTLY_WRITTEN_SENTENCES:
+        assert sentence in description
+
+
+def test_every_boss_survives_in_the_partly_undone_message():
+    exc = attendance_bot.PointsRemovedButNotMarked(
+        entry={
+            "tab": "Week 17.1",
+            "boss": json.dumps(TEN_BOSSES),
+            "points_each": json.dumps(TEN_POINTS),
+            "players": json.dumps(BIG_ROSTER),
+        },
+        cause_text=BIG_CAUSE,
+    )
+    description = exc.description
+
+    assert len(description) <= DISCORD_EMBED_DESCRIPTION_LIMIT
+    for boss in TEN_BOSSES:
+        assert boss in description
+    for sentence in PARTLY_UNDONE_SENTENCES:
+        assert sentence in description
+
+
+def test_the_undo_confirmation_never_says_removed_none(monkeypatch):
+    # _peek_boss_summary returning None once rendered "Removed None from".
+    assert attendance_bot._peek_boss_summary({}) is None
+    assert attendance_bot._peek_boss_summary({"boss": "", "points_each": ""}) is None
+
+    logged = _entry(
+        tab=TAB,
+        boss="",
+        points_each="",
+        players=json.dumps(["xSigarilyas"]),
+    )
+    sh = _multi_sheet(log=_log_tab([str(logged[f]) for f in LOG_HEADER]))
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    ctx = FakeCtx(FakeMember([FakeRole(123)]))
+    asyncio.run(attendance_bot.undo_attendance_cmd.callback(ctx))
+
+    description = ctx.sent[-1][1]["embed"].description
+    assert "None" not in description

@@ -94,12 +94,23 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # instead of "do not re-run", re-runs, and the points land twice -- the
 # outcome those exceptions exist to prevent. The variable parts are
 # therefore clamped individually, so the fixed instructional text (which
-# carries the whole meaning) survives intact under any input. Budget:
-# 800 + 2200 + 100 + 100 = 3200, against roughly 600 characters of fixed
-# text, leaving comfortable headroom under 4096.
+# carries the whole meaning) survives intact under any input.
+#
+# Budget: 800 (cause) + 1700 (players) + 600 (boss summary) + 100 (tab)
+# = 3200, against roughly 600 characters of fixed text -- the same total
+# as before, so the measured headroom under 4096 is unchanged.
+#
+# The boss summary got its own, much larger budget rather than sharing
+# NAME_LIMIT with the tab name: a rally naming ten bosses runs past 100
+# characters, and the tail would be dropped behind an ellipsis in exactly
+# the message telling the officer WHICH columns to reconcile by hand. An
+# officer who cannot see which bosses were paid cannot fix the sheet.
+# The 500 came from the player list, which still holds far more than the
+# guild's 49-name roster (about 1370 characters) without clamping.
 EMBED_DESCRIPTION_LIMIT = 4096
 CAUSE_LIMIT = 800
-PLAYERS_LIMIT = 2200
+PLAYERS_LIMIT = 1700
+BOSS_SUMMARY_LIMIT = 600
 NAME_LIMIT = 100
 
 
@@ -165,7 +176,7 @@ class PointsWrittenButNotLogged(RuntimeError):
     @property
     def description(self) -> str:
         return (
-            f"**{_clip(_boss_summary(self.bosses, self.points_each), NAME_LIMIT)}** "
+            f"**{_clip(_boss_summary(self.bosses, self.points_each), BOSS_SUMMARY_LIMIT)}** "
             f"**were added** to **{_clip(self.tab, NAME_LIMIT)}** for "
             f"{len(self.players)} player"
             f"{'s' if len(self.players) != 1 else ''}, but the audit log row "
@@ -214,9 +225,10 @@ class PointsRemovedButNotMarked(RuntimeError):
             # the do-not-re-run warning must render whatever the cells hold.
             summary = f"{self.entry.get('boss', '')} {self.entry.get('points_each', '')}"
         return (
-            f"**{_clip(summary, NAME_LIMIT)}** points have **already** "
-            f"been removed from **{_clip(self.entry['tab'], NAME_LIMIT)}**, "
-            f"but the log entry could not be marked reversed.\n\n"
+            f"The points for **{_clip(summary, BOSS_SUMMARY_LIMIT)}** have "
+            f"**already** been removed from "
+            f"**{_clip(self.entry['tab'], NAME_LIMIT)}**, but the log entry "
+            f"could not be marked reversed.\n\n"
             f"Please do **not re-run** `!undoattendance` — the entry still "
             f"looks live, so running it again would remove those points "
             f"twice. Mark the row reversed by hand instead.\n\n"
@@ -403,11 +415,12 @@ def _peek_boss_summary(entry) -> str | None:
         return None
     try:
         bosses = _parse_boss_names(entry.get("boss", ""))
-        return _boss_summary(
+        summary = _boss_summary(
             bosses, _parse_points_list(entry.get("points_each", ""), len(bosses))
         )
     except SheetStructureError:
-        return str(entry.get("boss", "")) or None
+        return str(entry.get("boss", "")).strip() or None
+    return summary or None
 
 
 def _timestamp() -> str:
@@ -1299,7 +1312,8 @@ async def undo_attendance_cmd(ctx: commands.Context):
     await ctx.send(
         embed=make_embed(
             "↩️ Attendance Reversed",
-            f"Removed {_peek_boss_summary(entry)} from **{entry['tab']}**.",
+            f"Removed {_peek_boss_summary(entry) or 'the last attendance entry'}"
+            f" from **{entry['tab']}**.",
             footer=f"Originally logged {entry['timestamp']} "
                    f"by {entry['confirmed_by']}",
         )

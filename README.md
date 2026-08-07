@@ -55,7 +55,10 @@ worth 3 (each is annotated `- 3` in the sheet itself).
 
 Boss names resolve from the target tab's header row by exact match, then
 unique prefix, then unique substring — so `!attendance dalia` finds
-*Lady Dalia*.
+*Lady Dalia*. `Venatus` and `Viorent` deliberately have no attendance
+column and are refused. Two in-game names are aliased in code because
+they differ from the sheet: `KobePH` → `Kobe`, and `面白い` →
+`chinchong ni Mumu`.
 
 One rally often kills several bosses with the same roster, so several can
 be named in one command, separated by ` - ` (space dash space):
@@ -72,10 +75,7 @@ that failed, rather than quietly logging the rest. Repeats collapse
 whole submission together. Commas are not separators, and plain spaces
 cannot be, because names like `Lady Dalia` and `General Aquleus` contain
 spaces. Note that the sheet annotates point values with the same ` - `,
-so `!attendance lucus - 3` is read as two bosses and refused on the `3`. `Venatus` and `Viorent` deliberately have no attendance
-column and are refused. Two in-game names are aliased in code because
-they differ from the sheet: `KobePH` → `Kobe`, and `面白い` →
-`chinchong ni Mumu`.
+so `!attendance lucus - 3` is read as two bosses and refused on the `3`.
 
 ### Two bots, one service
 
