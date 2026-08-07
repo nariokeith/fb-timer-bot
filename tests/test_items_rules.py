@@ -52,3 +52,64 @@ def test_ign_matching_ignores_case_and_spacing():
 
 def test_short_rows_are_skipped_not_fatal():
     assert items_rules.gear_used_today([["2026-08-07 09:00:00"]], "Kobe", "2026-08-07") == 0
+
+
+import pytest
+
+SPECIAL_HEADERS = ["Player Name", "Asta's Heart", "Amentis' Foot", "Benji's Blood"]
+GEAR_HEADERS = ["Player Name", "Asta's Belt", "Benji's Heart"]
+
+
+def test_resolves_an_item_to_the_tab_that_holds_it():
+    found = items_rules.resolve_item("Asta's Heart", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert (found.name, found.type) == ("Asta's Heart", items_rules.SPECIAL)
+
+
+def test_resolves_a_gear_item():
+    found = items_rules.resolve_item("Asta's Belt", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert (found.name, found.type) == ("Asta's Belt", items_rules.GEAR)
+
+
+def test_matching_ignores_case():
+    found = items_rules.resolve_item("asta's belt", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert found.name == "Asta's Belt"
+
+
+def test_a_partial_item_name_is_refused_but_lists_the_matches():
+    """A member who types 'Asta' should be shown the Asta items.
+
+    difflib scores 'Asta' against "Asta's Heart" at 0.5, so this only
+    works because _suggest searches substrings before close matches.
+    """
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_item("Asta", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "Asta's Heart" in str(exc.value)
+
+
+def test_a_typo_is_refused_but_offers_the_close_match():
+    """No substring overlap here -- this is the close-match path."""
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_item("Astas Hesrt", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "Asta's Heart" in str(exc.value)
+
+
+def test_an_item_resembling_nothing_gets_no_suggestions():
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_item("zzzzzzzz", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "Did you mean" not in str(exc.value)
+
+
+def test_an_item_in_both_tabs_is_refused_rather_than_guessed():
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_item("Shared", ["Player Name", "Shared"], ["Player Name", "Shared"])
+    assert "both" in str(exc.value).lower()
+
+
+def test_the_player_name_column_is_never_treated_as_an_item():
+    with pytest.raises(items_rules.ItemLookupError):
+        items_rules.resolve_item("Player Name", SPECIAL_HEADERS, GEAR_HEADERS)
+
+
+def test_a_blank_query_is_refused():
+    with pytest.raises(items_rules.ItemLookupError):
+        items_rules.resolve_item("   ", SPECIAL_HEADERS, GEAR_HEADERS)

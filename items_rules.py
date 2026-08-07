@@ -72,3 +72,98 @@ def gear_used_today(
         if pht_day(row[timestamp_column]) == today:
             count += 1
     return count
+
+
+from dataclasses import dataclass
+from difflib import get_close_matches
+
+from attendance_bosses import header_base
+
+PLAYER_COLUMN_HEADER = "Player Name"
+
+
+class ItemLookupError(RuntimeError):
+    """The item name does not resolve to exactly one column."""
+
+
+@dataclass(frozen=True)
+class ResolvedItem:
+    name: str
+    type: str
+
+
+def item_names(headers: list[str]) -> list[str]:
+    """Header cells that name an item.
+
+    header_base strips a ' - N' annotation, matching the attendance
+    sheet's header convention. Blanks (spacer columns) and the player
+    column are not items.
+    """
+    names = []
+    for cell in headers:
+        base = header_base(cell)
+        if not base or base == PLAYER_COLUMN_HEADER:
+            continue
+        names.append(base)
+    return names
+
+
+def _suggest(query: str, names: list[str]) -> list[str]:
+    """Item names worth offering after a failed lookup.
+
+    Substring hits come first and carry the weight: a member who types
+    'Asta' wants to see every Asta item, but difflib scores 'Asta'
+    against "Asta's Heart" at 0.5 -- below any cutoff loose enough to be
+    safe -- so close-matching alone would offer nothing at all. Close
+    matches still follow, to catch the transposed-letter typo that a
+    substring search cannot.
+    """
+    wanted = normalize(query)
+    hits = [name for name in names if wanted and wanted in normalize(name)]
+    for name in get_close_matches(query, names, n=3, cutoff=0.6):
+        if name not in hits:
+            hits.append(name)
+    return hits[:3]
+
+
+def _exact(query: str, names: list[str]) -> str | None:
+    wanted = normalize(query)
+    for name in names:
+        if normalize(name) == wanted:
+            return name
+    return None
+
+
+def resolve_item(
+    query: str, special_headers: list[str], gear_headers: list[str]
+) -> ResolvedItem:
+    """Which item this is, and which tab it lives in.
+
+    Requires an exact (case- and spacing-insensitive) header match. Fuzzy
+    matching is deliberately NOT used here: item names differ by one word
+    ("Asta's Belt" vs "Asta's Heart"), so a near match would hand out the
+    wrong item -- and unlike attendance, an approval is a permanent
+    record. Close names are offered as suggestions instead.
+    """
+    if not query.strip():
+        raise ItemLookupError("No item name given.")
+
+    specials = item_names(special_headers)
+    gears = item_names(gear_headers)
+
+    in_special = _exact(query, specials)
+    in_gear = _exact(query, gears)
+
+    if in_special and in_gear:
+        raise ItemLookupError(
+            f"{in_special!r} appears in both Special Logs and Gear Logs; "
+            "refusing to guess which one is meant. Remove the duplicate column."
+        )
+    if in_special:
+        return ResolvedItem(name=in_special, type=SPECIAL)
+    if in_gear:
+        return ResolvedItem(name=in_gear, type=GEAR)
+
+    suggestions = _suggest(query, specials + gears)
+    hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+    raise ItemLookupError(f"No item column named {query!r}.{hint}")

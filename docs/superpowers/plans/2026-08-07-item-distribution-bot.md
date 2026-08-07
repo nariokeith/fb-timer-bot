@@ -258,10 +258,28 @@ def test_matching_ignores_case():
     assert found.name == "Asta's Belt"
 
 
-def test_an_unknown_item_is_refused_with_near_misses_named():
+def test_a_partial_item_name_is_refused_but_lists_the_matches():
+    """A member who types 'Asta' should be shown the Asta items.
+
+    difflib scores 'Asta' against "Asta's Heart" at 0.5, so this only
+    works because _suggest searches substrings before close matches.
+    """
     with pytest.raises(items_rules.ItemLookupError) as exc:
         items_rules.resolve_item("Asta", SPECIAL_HEADERS, GEAR_HEADERS)
     assert "Asta's Heart" in str(exc.value)
+
+
+def test_a_typo_is_refused_but_offers_the_close_match():
+    """No substring overlap here -- this is the close-match path."""
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_item("Astas Hesrt", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "Asta's Heart" in str(exc.value)
+
+
+def test_an_item_resembling_nothing_gets_no_suggestions():
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_item("zzzzzzzz", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "Did you mean" not in str(exc.value)
 
 
 def test_an_item_in_both_tabs_is_refused_rather_than_guessed():
@@ -323,6 +341,24 @@ def item_names(headers: list[str]) -> list[str]:
     return names
 
 
+def _suggest(query: str, names: list[str]) -> list[str]:
+    """Item names worth offering after a failed lookup.
+
+    Substring hits come first and carry the weight: a member who types
+    'Asta' wants to see every Asta item, but difflib scores 'Asta'
+    against "Asta's Heart" at 0.5 -- below any cutoff loose enough to be
+    safe -- so close-matching alone would offer nothing at all. Close
+    matches still follow, to catch the transposed-letter typo that a
+    substring search cannot.
+    """
+    wanted = normalize(query)
+    hits = [name for name in names if wanted and wanted in normalize(name)]
+    for name in get_close_matches(query, names, n=3, cutoff=0.6):
+        if name not in hits:
+            hits.append(name)
+    return hits[:3]
+
+
 def _exact(query: str, names: list[str]) -> str | None:
     wanted = normalize(query)
     for name in names:
@@ -361,7 +397,7 @@ def resolve_item(
     if in_gear:
         return ResolvedItem(name=in_gear, type=GEAR)
 
-    suggestions = get_close_matches(query, specials + gears, n=3, cutoff=0.6)
+    suggestions = _suggest(query, specials + gears)
     hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
     raise ItemLookupError(f"No item column named {query!r}.{hint}")
 ```
