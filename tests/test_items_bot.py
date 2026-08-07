@@ -174,3 +174,135 @@ def test_is_officer_channel_only_matches_the_recorded_channel():
 def test_is_officer_channel_is_false_before_setup():
     items_bot._STATE.officer_channel_id = None
     assert not items_bot.is_officer_channel(99)
+
+
+import items_rules
+import items_sheet
+
+SPECIAL_HEADER_ROW = ["Player Name", "Asta's Heart", "Amentis' Foot"]
+
+# Kobe already holds Asta's Heart; nobody else does.
+SPECIAL_GRID_ROWS = [
+    SPECIAL_HEADER_ROW,
+    ["Kobe", "TRUE", "FALSE"],
+    ["Dajz", "FALSE", "FALSE"],
+    ["chinchong ni Mumu", "FALSE", "FALSE"],
+]
+
+
+def snapshot_with(ledger_rows=None, special_grid=None):
+    return items_sheet.Snapshot(
+        roster=["Kobe", "Dajz", "chinchong ni Mumu"],
+        special_headers=SPECIAL_HEADER_ROW,
+        gear_headers=["Player Name", "Asta's Belt", "Benji's Heart"],
+        ledger_rows=ledger_rows
+        if ledger_rows is not None
+        else [
+            ["2026-08-07 09:00:00", "Kobe", "Asta's Belt", "Gear", "O", "1", "aaa"],
+            ["2026-08-07 10:00:00", "Kobe", "Benji's Heart", "Gear", "O", "1", "bbb"],
+        ],
+        special_grid=special_grid if special_grid is not None else SPECIAL_GRID_ROWS,
+    )
+
+
+SNAPSHOT = snapshot_with()
+
+
+def _evaluate(argument, state=None, user_id=1, snapshot=None):
+    return items_bot.evaluate_request(
+        argument,
+        user_id,
+        snapshot if snapshot is not None else SNAPSHOT,
+        state if state is not None else items_state.State(),
+        cap=3,
+        today="2026-08-07",
+    )
+
+
+def test_a_valid_special_request_is_accepted():
+    outcome = _evaluate("Asta's Heart Dajz")
+    assert outcome.accepted
+    assert outcome.request.item == "Asta's Heart"
+    assert outcome.request.type == items_rules.SPECIAL
+
+
+def test_a_multi_word_ign_is_accepted():
+    outcome = _evaluate("Asta's Heart chinchong ni Mumu")
+    assert outcome.accepted
+    assert outcome.request.ign == "chinchong ni Mumu"
+
+
+def test_a_special_the_player_already_holds_is_refused():
+    outcome = _evaluate("Asta's Heart Kobe")
+    assert not outcome.accepted
+    assert "already" in outcome.message.lower()
+
+
+def test_a_gear_request_at_the_cap_is_refused_before_officers_see_it():
+    ledger = SNAPSHOT.ledger_rows + [
+        ["2026-08-07 11:00:00", "Kobe", "Asta's Belt", "Gear", "O", "1", "ccc"]
+    ]
+    outcome = _evaluate("Asta's Belt Kobe", snapshot=snapshot_with(ledger_rows=ledger))
+    assert not outcome.accepted
+
+
+def test_pending_gear_requests_count_toward_the_cap():
+    state = items_state.State(
+        queue=[
+            items_state.PendingRequest(
+                id="x", user_id=1, ign="Kobe", item="Asta's Belt",
+                type=items_rules.GEAR, requested_at="2026-08-07 10:30:00",
+            )
+        ]
+    )
+    outcome = _evaluate("Asta's Belt Kobe", state=state)
+    assert not outcome.accepted
+
+
+def test_a_duplicate_pending_request_is_refused():
+    state = items_state.State(
+        queue=[
+            items_state.PendingRequest(
+                id="x", user_id=1, ign="Dajz", item="Asta's Heart",
+                type=items_rules.SPECIAL, requested_at="2026-08-07 10:30:00",
+            )
+        ]
+    )
+    outcome = _evaluate("Asta's Heart Dajz", state=state)
+    assert not outcome.accepted
+    assert "pending" in outcome.message.lower()
+
+
+def test_an_unparseable_request_is_refused_with_the_reason():
+    outcome = _evaluate("Asta's Heart Nobody")
+    assert not outcome.accepted
+    assert "Nobody" in outcome.message
+
+
+def test_an_ign_differing_from_last_time_is_noted_not_refused():
+    """Requesting for an alt is legitimate; the officer judges it."""
+    state = items_state.State(igns={"1": "Kobe"})
+    outcome = _evaluate("Asta's Heart Dajz", state=state, user_id=1)
+    assert outcome.accepted
+    assert "Kobe" in outcome.request.note
+
+
+def test_the_same_ign_as_last_time_carries_no_note():
+    state = items_state.State(igns={"1": "Dajz"})
+    outcome = _evaluate("Asta's Heart Dajz", state=state, user_id=1)
+    assert outcome.accepted
+    assert outcome.request.note == ""
+
+
+def test_a_duplicate_is_refused_even_from_a_different_account():
+    """Keyed on IGN, not on who asked."""
+    state = items_state.State(
+        queue=[
+            items_state.PendingRequest(
+                id="x", user_id=999, ign="Dajz", item="Asta's Heart",
+                type=items_rules.SPECIAL, requested_at="2026-08-07 10:30:00",
+            )
+        ]
+    )
+    outcome = _evaluate("Asta's Heart Dajz", state=state, user_id=1)
+    assert not outcome.accepted

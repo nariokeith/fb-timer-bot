@@ -158,3 +158,142 @@ async def setofficerchannel_cmd(ctx):
             "keeps its request queue in a pinned message here. Don't delete it.",
         )
     )
+
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class RequestOutcome:
+    accepted: bool
+    message: str
+    request: items_state.PendingRequest | None = None
+
+
+def evaluate_request(
+    argument: str,
+    user_id: int,
+    snapshot: items_sheet.Snapshot,
+    state: items_state.State,
+    *,
+    cap: int,
+    today: str,
+) -> RequestOutcome:
+    """Decide a !request without touching Discord or the network.
+
+    Pure: the snapshot already carries the special-log checkbox grid, so
+    every question this asks is answered from values passed in. That is
+    what makes the whole request path testable without a network.
+    """
+    try:
+        parsed = items_rules.parse_request(
+            argument, snapshot.roster, snapshot.special_headers, snapshot.gear_headers
+        )
+    except (items_rules.RequestParseError, items_rules.ItemLookupError) as exc:
+        return RequestOutcome(accepted=False, message=str(exc))
+
+    # A member requesting under a different IGN than last time is NOT
+    # refused -- requesting for an alt is legitimate. It is flagged for
+    # the officer instead, who is the one with the standing to judge it.
+    # Blocking here would punish the honest case to catch a typo that
+    # the roster check has already largely prevented.
+    note = ""
+    remembered = state.igns.get(str(user_id))
+    if remembered and items_rules.normalize(remembered) != items_rules.normalize(parsed.ign):
+        note = f"previously requested as {remembered}"
+
+    # Keyed on IGN, not on the requesting account: the same item must
+    # not sit in the queue twice for one player, whoever asked.
+    for queued in state.queue:
+        if (
+            items_rules.normalize(queued.ign) == items_rules.normalize(parsed.ign)
+            and items_rules.normalize(queued.item) == items_rules.normalize(parsed.item.name)
+        ):
+            return RequestOutcome(
+                accepted=False,
+                message=f"**{parsed.item.name}** is already pending for **{parsed.ign}**.",
+            )
+
+    eligibility = items_rules.check_eligibility(
+        parsed.item.type,
+        parsed.ign,
+        snapshot.ledger_rows,
+        today,
+        already_has_special=items_sheet.holds_special(
+            snapshot, parsed.ign, parsed.item.name
+        ),
+        pending_gear=items_state.pending_gear_for(state, parsed.ign),
+        cap=cap,
+    )
+    if not eligibility.allowed:
+        return RequestOutcome(
+            accepted=False, message=f"**{parsed.ign}** {eligibility.reason}."
+        )
+
+    return RequestOutcome(
+        accepted=True,
+        message=(
+            f"Requested **{parsed.item.name}** ({parsed.item.type}) for "
+            f"**{parsed.ign}**. An officer will review it."
+        ),
+        request=items_state.PendingRequest(
+            id=items_state.new_request_id(),
+            user_id=user_id,
+            ign=parsed.ign,
+            item=parsed.item.name,
+            type=parsed.item.type,
+            requested_at=items_rules.format_timestamp(items_rules.now_pht()),
+            note=note,
+        ),
+    )
+
+
+@bot.command(name="request")
+async def request_cmd(ctx, *, argument: str = ""):
+    """Ask an officer for an item."""
+    if _STATE.officer_channel_id is None:
+        await ctx.send(
+            embed=error_embed(
+                "Not set up yet",
+                "An admin must run `!setofficerchannel` in the officers' "
+                "channel before requests can be taken.",
+            )
+        )
+        return
+
+    async with _SHEET_LOCK:
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        outcome = evaluate_request(
+            argument,
+            ctx.author.id,
+            snapshot,
+            _STATE,
+            cap=gear_cap(),
+            today=today_pht(),
+        )
+
+        if not outcome.accepted:
+            await ctx.send(embed=error_embed("Request refused", outcome.message))
+            return
+
+        _STATE.queue.append(outcome.request)
+        _STATE.igns[str(ctx.author.id)] = outcome.request.ign
+
+        channel = bot.get_channel(_STATE.officer_channel_id)
+        dropped = await save_state(channel) if channel else []
+
+    await ctx.send(embed=ok_embed("Request queued", outcome.message))
+    if dropped and channel:
+        names = ", ".join(f"{d.item} ({d.ign})" for d in dropped)
+        await channel.send(
+            embed=error_embed(
+                "Queue overflowed",
+                f"The queue no longer fits in one message. These oldest "
+                f"requests were dropped and must be re-requested: {names}",
+            )
+        )
