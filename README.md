@@ -25,10 +25,11 @@ All schedule times and typed kill times ("9PM") are interpreted in the `BOT_TZ` 
 
 | Command | What it does |
 |---|---|
-| `!attendance <boss>` | Officers only. Attach an in-game roster screenshot; the bot reads the names and adds that boss's points to the Point System sheet. Shows a preview first — nothing is written until an officer reacts ✅. |
+| `!attendance <boss>` | Officers only. Attach one or more in-game roster screenshots; the bot reads every image, merges the names and adds that boss's points to the Point System sheet. Shows a preview first — nothing is written until an officer reacts ✅. |
+| `!attendance <boss> - <boss> - <boss>` | Same, for a rally that killed several bosses with one roster, e.g. `!attendance clemantis - dalia - catena`. Each boss gets its own point value, all in one write, and one `!undoattendance` reverses the lot. |
 | `!undoattendance` | Officers only. Reverses the most recent attendance log. |
 | `!setweek <tab>` | Officers only. Sets which sheet tab attendance goes into, e.g. `Week 17.1`. |
-| `!setofficerrole @role` | Admins only. Sets which role may record attendance. |
+| `!setofficerrole @role [@role ...]` | Admins only. Sets every role that may record attendance, replacing the current set. |
 | `!attendancehelp` | Lists the attendance commands. |
 
 ## Run locally
@@ -58,6 +59,23 @@ unique prefix, then unique substring — so `!attendance dalia` finds
 column and are refused. Two in-game names are aliased in code because
 they differ from the sheet: `KobePH` → `Kobe`, and `面白い` →
 `chinchong ni Mumu`.
+
+One rally often kills several bosses with the same roster, so several can
+be named in one command, separated by ` - ` (space dash space):
+
+```
+!attendance clemantis - dalia - catena
+```
+
+Each boss is resolved and scored on its own, and every column is written
+in a single update — so the command either logs all of them or none. If
+any name fails to resolve the whole command is refused, naming the part
+that failed, rather than quietly logging the rest. Repeats collapse
+(`dalia - dalia` is one boss), and one `!undoattendance` reverses the
+whole submission together. Commas are not separators, and plain spaces
+cannot be, because names like `Lady Dalia` and `General Aquleus` contain
+spaces. Note that the sheet annotates point values with the same ` - `,
+so `!attendance lucus - 3` is read as two bosses and refused on the `3`.
 
 ### Two bots, one service
 
@@ -169,13 +187,18 @@ Checklist:
 3. `!setofficerrole @Officer`, then `!setweek "bot test"`.
 4. A non-officer running `!attendance Lucus` is refused.
 5. `!attendance lucus` with a real screenshot shows a preview; check the
-   matched names against the screenshot by eye.
+   matched names against the screenshot by eye. Posting two screenshots
+   on the one message reads both, and the preview says how many names
+   came from each.
 6. React ✅ → the `bot test` tab's `Lucus` column gains 3 for each matched
    player, and column B recalculates itself.
 7. Re-post the same screenshot → the preview carries the "Already Logged"
    warning.
 8. `!undoattendance` → the points come back off and `_BotLog` shows
    `reversed`.
+9. `!attendance clemantis - dalia` → the preview lists both bosses with
+   their own point values and the per-player total; confirming writes
+   both columns at once, and one `!undoattendance` takes both back off.
 
 Two fail-closed behaviours are deliberate, not bugs — expect them:
 

@@ -94,12 +94,23 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # instead of "do not re-run", re-runs, and the points land twice -- the
 # outcome those exceptions exist to prevent. The variable parts are
 # therefore clamped individually, so the fixed instructional text (which
-# carries the whole meaning) survives intact under any input. Budget:
-# 800 + 2200 + 100 + 100 = 3200, against roughly 600 characters of fixed
-# text, leaving comfortable headroom under 4096.
+# carries the whole meaning) survives intact under any input.
+#
+# Budget: 800 (cause) + 1700 (players) + 600 (boss summary) + 100 (tab)
+# = 3200, against roughly 600 characters of fixed text -- the same total
+# as before, so the measured headroom under 4096 is unchanged.
+#
+# The boss summary got its own, much larger budget rather than sharing
+# NAME_LIMIT with the tab name: a rally naming ten bosses runs past 100
+# characters, and the tail would be dropped behind an ellipsis in exactly
+# the message telling the officer WHICH columns to reconcile by hand. An
+# officer who cannot see which bosses were paid cannot fix the sheet.
+# The 500 came from the player list, which still holds far more than the
+# guild's 49-name roster (about 1370 characters) without clamping.
 EMBED_DESCRIPTION_LIMIT = 4096
 CAUSE_LIMIT = 800
-PLAYERS_LIMIT = 2200
+PLAYERS_LIMIT = 1700
+BOSS_SUMMARY_LIMIT = 600
 NAME_LIMIT = 100
 
 
@@ -147,20 +158,25 @@ class PointsWrittenButNotLogged(RuntimeError):
     """
 
     def __init__(self, *, tab, boss, points, players, cause_text):
+        # boss/points may be a single value (one boss) or matching lists
+        # (several bosses in one command); normalised so the message
+        # renders the same way for both.
+        self.bosses = boss if isinstance(boss, list) else [boss]
+        self.points_each = points if isinstance(points, list) else [points]
         self.tab = tab
         self.boss = boss
         self.points = points
         self.players = list(players)
         self.cause_text = cause_text
         super().__init__(
-            f"points for {boss} were added to {tab} but the log row was not "
-            f"written: {cause_text}"
+            f"points for {self.bosses} were added to {tab} but the log row "
+            f"was not written: {cause_text}"
         )
 
     @property
     def description(self) -> str:
         return (
-            f"**+{self.points}** for **{_clip(self.boss, NAME_LIMIT)}** "
+            f"**{_clip(_boss_summary(self.bosses, self.points_each), BOSS_SUMMARY_LIMIT)}** "
             f"**were added** to **{_clip(self.tab, NAME_LIMIT)}** for "
             f"{len(self.players)} player"
             f"{'s' if len(self.players) != 1 else ''}, but the audit log row "
@@ -199,11 +215,20 @@ class PointsRemovedButNotMarked(RuntimeError):
             # Display only: even if the players cell were somehow
             # unparseable, the do-not-re-run warning must still render.
             players = [str(self.entry.get("players", ""))]
+        try:
+            bosses = _parse_boss_names(self.entry.get("boss", ""))
+            summary = _boss_summary(
+                bosses, _parse_points_list(self.entry.get("points_each", ""), len(bosses))
+            )
+        except SheetStructureError:
+            # Display only, same reasoning as the players fallback above:
+            # the do-not-re-run warning must render whatever the cells hold.
+            summary = f"{self.entry.get('boss', '')} {self.entry.get('points_each', '')}"
         return (
-            f"**{self.entry['points_each']}** points for "
-            f"**{_clip(self.entry['boss'], NAME_LIMIT)}** have **already** "
-            f"been removed from **{_clip(self.entry['tab'], NAME_LIMIT)}**, "
-            f"but the log entry could not be marked reversed.\n\n"
+            f"The points for **{_clip(summary, BOSS_SUMMARY_LIMIT)}** have "
+            f"**already** been removed from "
+            f"**{_clip(self.entry['tab'], NAME_LIMIT)}**, but the log entry "
+            f"could not be marked reversed.\n\n"
             f"Please do **not re-run** `!undoattendance` — the entry still "
             f"looks live, so running it again would remove those points "
             f"twice. Mark the row reversed by hand instead.\n\n"
@@ -214,6 +239,129 @@ class PointsRemovedButNotMarked(RuntimeError):
 
 class AlreadyLoggedDuringPreview(RuntimeError):
     """Another officer confirmed this same screenshot during the 180s wait."""
+
+
+class BossQueryError(ValueError):
+    """The typed boss list is malformed -- e.g. an empty fragment."""
+
+
+# One rally often kills several bosses with the same roster, so one
+# command logs them all: "!attendance clemantis - dalia - catena".
+#
+# " - " (space dash space) is the separator, and the only one. Plain
+# spaces cannot work: "Lady Dalia" and "General Aquleus" contain spaces,
+# so the bot could not tell where one name ends and the next begins.
+BOSS_SEPARATOR = " - "
+
+
+def _parse_boss_query(query: str) -> list[str]:
+    """The boss fragments typed in one !attendance command.
+
+    A query with no separator is a single boss, exactly as before.
+
+    Note the deliberate collision: sheet headers annotate point values
+    with this same separator ("Lucus - 3"), so "!attendance lucus - 3"
+    splits into "lucus" and "3". "3" then fails to resolve, which is the
+    correct outcome -- the caller's error names the offending fragment so
+    the officer can see why.
+
+    An empty fragment (a trailing or doubled dash) is refused rather than
+    dropped: silently ignoring it would hide a typo in a command that
+    writes points.
+    """
+    fragments = [fragment.strip() for fragment in query.split(BOSS_SEPARATOR)]
+
+    if any(not fragment for fragment in fragments):
+        raise BossQueryError(
+            f"`{query.strip()}` has an empty boss name in it. Bosses are "
+            f"separated by ` - `, e.g. `!attendance clemantis - dalia`."
+        )
+
+    # Deduplicated here on what was typed; resolved names are deduplicated
+    # again afterwards, so "dalia - Lady Dalia" also collapses to one.
+    seen: dict[str, str] = {}
+    for fragment in fragments:
+        seen.setdefault(fragment.casefold(), fragment)
+    return list(seen.values())
+
+
+def _parse_boss_names(raw) -> list[str]:
+    """Boss names from a log row's `boss` cell, in either stored format.
+
+    New rows store a JSON list (one entry per boss in the submission).
+    Rows written before multi-boss support hold a single bare name, and
+    the guild's live sheet already contains them -- so both must read, or
+    !undoattendance would break on every existing row.
+
+    LOG_HEADER is unchanged: same column, new value format, no migration.
+    """
+    text = str(raw).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            raise SheetStructureError(
+                f"_BotLog row 'boss' cell is not valid JSON: {text!r}"
+            ) from None
+        if not isinstance(parsed, list) or not all(
+            isinstance(name, str) for name in parsed
+        ):
+            raise SheetStructureError(
+                f"_BotLog row 'boss' cell is not a JSON list of strings: {text!r}"
+            )
+        return [name.strip() for name in parsed if name.strip()]
+    return [text]
+
+
+def _parse_points_list(raw, boss_count: int) -> list[int]:
+    """Per-boss point values from a log row's `points_each` cell.
+
+    Same both-formats rule as _parse_boss_names. A bare value belongs to
+    a single-boss row. A count that disagrees with the boss list is
+    refused rather than zipped short -- guessing there would subtract the
+    wrong amount from real people.
+    """
+    text = str(raw).strip()
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            raise SheetStructureError(
+                f"_BotLog row 'points_each' cell is not valid JSON: {text!r}"
+            ) from None
+        if not isinstance(parsed, list):
+            raise SheetStructureError(
+                f"_BotLog row 'points_each' cell is not a JSON list: {text!r}"
+            )
+        try:
+            points = [int(value) for value in parsed]
+        except (TypeError, ValueError):
+            raise SheetStructureError(
+                f"_BotLog row 'points_each' cell holds a non-number: {text!r}"
+            ) from None
+    else:
+        try:
+            points = [int(float(text))]
+        except (TypeError, ValueError):
+            raise SheetStructureError(
+                f"_BotLog row 'points_each' cell is not a number: {text!r}"
+            ) from None
+
+    if len(points) != boss_count:
+        raise SheetStructureError(
+            f"_BotLog row has {boss_count} boss(es) but {len(points)} point "
+            f"value(s): {text!r}; refusing to guess which belongs to which"
+        )
+    return points
+
+
+def _boss_summary(bosses, points) -> str:
+    """e.g. "Clemantis +1 · Lady Dalia +1 · Catena +1"."""
+    return " · ".join(
+        f"{name} +{value}" for name, value in zip(list(bosses), list(points))
+    )
 
 
 def _timeout_description(
@@ -255,6 +403,24 @@ def _timeout_description(
         f"re-running now would {outcome} the same points a second time."
         f"{players_text}"
     )
+
+
+def _peek_boss_summary(entry) -> str | None:
+    """"Clemantis +1 · Lucus +3" for a log row, or None if unreadable.
+
+    Best-effort and display-only: used by messages that must still render
+    when a cell is malformed or in a format this code did not expect.
+    """
+    if not entry:
+        return None
+    try:
+        bosses = _parse_boss_names(entry.get("boss", ""))
+        summary = _boss_summary(
+            bosses, _parse_points_list(entry.get("points_each", ""), len(bosses))
+        )
+    except SheetStructureError:
+        return str(entry.get("boss", "")).strip() or None
+    return summary or None
 
 
 def _timestamp() -> str:
@@ -393,33 +559,49 @@ def _load_context(spreadsheet, boss_query: str) -> dict:
 
     worksheet = spreadsheet.worksheet(tab)
     grid = worksheet.get_all_values()
-    boss = resolve_boss(read_headers(worksheet, grid), boss_query)
+    headers = read_headers(worksheet, grid)
+
+    # Every fragment is resolved independently, and ANY failure refuses
+    # the WHOLE command. Logging the bosses that did resolve would
+    # silently underpay for the ones dropped -- the same shape as reading
+    # only the first screenshot, and just as invisible in the preview.
+    bosses: list[str] = []
+    for fragment in _parse_boss_query(boss_query):
+        try:
+            boss = resolve_boss(headers, fragment)
+        except BossNotFound as exc:
+            raise BossNotFound(f"{fragment!r} — {exc}") from None
+        except BossAmbiguous as exc:
+            raise BossAmbiguous(f"{fragment!r} — {exc}") from None
+        if boss not in bosses:  # "dalia - Lady Dalia" is one boss
+            bosses.append(boss)
 
     # find_column's result is deliberately discarded: calling it here only
-    # fails fast, before a Gemini request, if the boss has no column or
-    # has two. The index itself must not be carried across the preview --
+    # fails fast, before a Gemini request, if a boss has no column or has
+    # two. The index itself must not be carried across the preview --
     # see _commit.
-    find_column(worksheet, boss, grid)
+    for boss in bosses:
+        find_column(worksheet, boss, grid)
 
     return {
         "tab": tab,
-        "boss": boss,
-        "points": boss_points(boss),
+        "bosses": bosses,
+        "points": [boss_points(boss) for boss in bosses],
         "players": read_players(worksheet, grid),
     }
 
 
 def _commit(
     tab: str,
-    boss: str,
+    bosses: list[str],
     players: list[str],
-    points: int,
+    points: list[int],
     entry: dict,
     was_duplicate: bool,
 ) -> None:
     """Add the points and record the log entry. Run only via _locked.
 
-    Takes the boss NAME, not a column index. attendance_sheet locates
+    Takes boss NAMES, not column indices. attendance_sheet locates
     cells by content precisely so that reordering columns breaks nothing;
     caching an index across the up-to-180-second preview would put that
     coupling back, and an inserted column would silently send the write
@@ -451,10 +633,17 @@ def _commit(
 
     worksheet = spreadsheet.worksheet(tab)
     grid = worksheet.get_all_values()
-    column = find_column(worksheet, boss, grid)
-    apply_writes(
-        worksheet, plan_point_writes(worksheet, players, column, points, grid)
-    )
+
+    # One grid read, one payload, ONE apply_writes across every boss.
+    # Looping apply_writes per boss would let a failure partway through
+    # leave some bosses paid and others not, with a single log row that
+    # describes neither state accurately. Different bosses are different
+    # columns, so concatenating the payloads cannot conflict.
+    payload = []
+    for boss, value in zip(bosses, points):
+        column = find_column(worksheet, boss, grid)
+        payload.extend(plan_point_writes(worksheet, players, column, value, grid))
+    apply_writes(worksheet, payload)
 
     # Past this line the points are in the sheet. Anything that fails now
     # must be reported as a partial write, never as "nothing was written".
@@ -463,7 +652,7 @@ def _commit(
     except Exception as exc:
         raise PointsWrittenButNotLogged(
             tab=tab,
-            boss=boss,
+            boss=bosses,
             points=points,
             players=players,
             cause_text=error_text(exc),
@@ -479,17 +668,19 @@ def _reverse_last() -> dict | None:
 
     row_number, entry = found
     players = _parse_players(entry["players"])
+    bosses = _parse_boss_names(entry["boss"])
+    points = _parse_points_list(entry["points_each"], len(bosses))
     worksheet = spreadsheet.worksheet(entry["tab"])
     grid = worksheet.get_all_values()
-    # Resolved by name inside the lock, same reasoning as _commit.
-    column = find_column(worksheet, entry["boss"], grid)
 
-    apply_writes(
-        worksheet,
-        plan_point_writes(
-            worksheet, players, column, -int(entry["points_each"]), grid
-        ),
-    )
+    # One submission is one attendance event, so one undo reverses every
+    # boss in it -- in a single write, for the same reason _commit uses
+    # one. Each column is still resolved by NAME inside the lock.
+    payload = []
+    for boss, value in zip(bosses, points):
+        column = find_column(worksheet, boss, grid)
+        payload.extend(plan_point_writes(worksheet, players, column, -value, grid))
+    apply_writes(worksheet, payload)
 
     # Past this line the points are gone from the sheet.
     try:
@@ -719,7 +910,11 @@ async def on_command_error(ctx, error):
 
 @bot.command(name="attendance")
 async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
-    """Log attendance from a roster screenshot: !attendance <boss> + image"""
+    """Log attendance from roster screenshots.
+
+    !attendance <boss> + image(s), or several bosses at once:
+    !attendance clemantis - dalia - catena
+    """
     spreadsheet = await _open_spreadsheet_or_reject(ctx)
     if spreadsheet is None:
         return
@@ -732,7 +927,9 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         await _reject(
             ctx,
             "❓ Which Boss?",
-            "Usage: `!attendance <boss>` with a roster screenshot attached.",
+            "Usage: `!attendance <boss>` with a roster screenshot "
+            "attached.\n\nSeveral bosses from one rally, separated by "
+            "` - `:\n`!attendance clemantis - dalia - catena`",
             footer="e.g. !attendance Lucus",
         )
         return
@@ -773,13 +970,24 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     try:
         context = await asyncio.to_thread(_load_context, spreadsheet, boss_name)
     except (BossNotFound, BossAmbiguous) as exc:
-        await working.edit(embed=make_embed("❓ Unknown Boss", error_text(exc)))
+        await working.edit(
+            embed=make_embed(
+                "❓ Unknown Boss",
+                f"{error_text(exc)}\n\n**Nothing was written.** Every boss "
+                f"named must resolve, so none are logged when one does not.",
+            )
+        )
+        return
+    except BossQueryError as exc:
+        await working.edit(embed=make_embed("❓ Which Bosses?", error_text(exc)))
         return
     except Exception as exc:
         await working.edit(embed=make_embed("❌ Sheet Problem", error_text(exc)))
         return
 
-    boss, points = context["boss"], context["points"]
+    bosses, points = context["bosses"], context["points"]
+    boss_summary = _boss_summary(bosses, points)
+    total_points = sum(points)
 
     raw_names: list[str] = []
     image_hashes: list[str] = []
@@ -790,7 +998,8 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
             embed=make_embed(
                 "\U0001f50e Reading Screenshot"
                 f"{'s' if len(images) != 1 else ''}",
-                f"Working on **{boss}** — image {position} of {len(images)}...",
+                f"Working on **{boss_summary}** — image {position} of "
+                f"{len(images)}...",
             )
         )
         mime = (attachment.content_type or "").split(";")[0].strip()
@@ -867,8 +1076,8 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     players = [m.player for m in matched]
     embed = make_embed(
         "\U0001f4cb Confirm Attendance",
-        f"**{boss}** — **+{points}** point{'s' if points != 1 else ''} each, "
-        f"into **{context['tab']}**",
+        f"{boss_summary} — **{total_points}** point"
+        f"{'s' if total_points != 1 else ''} each, into **{context['tab']}**",
         footer=f"React {CONFIRM_EMOJI} within {PREVIEW_TIMEOUT}s to write. "
                "Nothing is saved until you do.",
     )
@@ -937,8 +1146,10 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     entry = {
         "timestamp": _timestamp(),
         "tab": context["tab"],
-        "boss": boss,
-        "points_each": points,
+        # JSON lists, one entry per boss. The column names are unchanged,
+        # so no header migration -- see _parse_boss_names.
+        "boss": json.dumps(bosses),
+        "points_each": json.dumps(points),
         "message_id": str(ctx.message.id),
         # First image's id. attachment_id is only row identity for
         # mark_entry_reversed's re-check, never duplicate detection, so
@@ -957,7 +1168,7 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         await _locked(
             _commit,
             context["tab"],
-            boss,
+            bosses,
             players,
             points,
             entry,
@@ -996,8 +1207,10 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
                 verb="writing",
                 outcome="add",
                 tab=context["tab"],
-                boss=boss,
-                points=points,
+                # The summary already carries each boss's own value, so
+                # points is omitted rather than rendered as a list.
+                boss=boss_summary,
+                points=None,
                 players=players,
             ),
             footer=f"Confirmed by {confirmer}",
@@ -1015,8 +1228,10 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     await working.edit(
         embed=make_embed(
             "✅ Attendance Recorded",
-            f"**+{points}** for **{boss}** — {len(players)} player"
-            f"{'s' if len(players) != 1 else ''} in **{context['tab']}**.",
+            f"{boss_summary} — **{total_points}** point"
+            f"{'s' if total_points != 1 else ''} each for {len(players)} "
+            f"player{'s' if len(players) != 1 else ''} in "
+            f"**{context['tab']}**.",
             footer=f"Confirmed by {confirmer} • !undoattendance reverses this",
         )
     )
@@ -1073,10 +1288,12 @@ async def undo_attendance_cmd(ctx: commands.Context):
                 verb="undoing the last attendance entry",
                 outcome="remove",
                 tab=pending_entry["tab"] if pending_entry else None,
-                boss=pending_entry["boss"] if pending_entry else None,
-                points=(
-                    int(pending_entry["points_each"]) if pending_entry else None
-                ),
+                # Summarised across every boss in the entry, so a
+                # multi-boss reversal names all of them. Best-effort like
+                # the players peek above: a legacy or odd cell must not
+                # stop the timeout warning from rendering.
+                boss=_peek_boss_summary(pending_entry),
+                points=None,
                 players=players,
             ),
         )
@@ -1095,8 +1312,8 @@ async def undo_attendance_cmd(ctx: commands.Context):
     await ctx.send(
         embed=make_embed(
             "↩️ Attendance Reversed",
-            f"Removed **{entry['points_each']}** points for "
-            f"**{entry['boss']}** from **{entry['tab']}**.",
+            f"Removed {_peek_boss_summary(entry) or 'the last attendance entry'}"
+            f" from **{entry['tab']}**.",
             footer=f"Originally logged {entry['timestamp']} "
                    f"by {entry['confirmed_by']}",
         )
@@ -1190,7 +1407,8 @@ async def attendance_help_cmd(ctx: commands.Context):
     embed.add_field(
         name="!attendance <boss>",
         value="Attach one or more roster screenshots — every image is read "
-              "and the names are merged. Officers only.",
+              "and the names are merged. Several bosses from one rally: "
+              "`!attendance clemantis - dalia - catena`. Officers only.",
         inline=False,
     )
     embed.add_field(

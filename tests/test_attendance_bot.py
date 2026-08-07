@@ -16,6 +16,7 @@ import sys
 from types import SimpleNamespace
 
 import attendance_bot
+from attendance_bosses import BossAmbiguous, BossNotFound
 from attendance_bot import _is_officer, error_text
 
 
@@ -284,7 +285,7 @@ def test_commit_that_fails_after_writing_points_says_so(spreadsheet, monkeypatch
     monkeypatch.setattr(attendance_bot, "append_log_entry", boom)
 
     with pytest.raises(attendance_bot.PointsWrittenButNotLogged) as caught:
-        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+        attendance_bot._commit(TAB, ["Lucus"], ["Kobe"], [3], _entry(), False)
 
     # The points really did land, so the officer must not be told otherwise.
     assert sh.worksheet(TAB).batches, "points should already be in the sheet"
@@ -308,7 +309,7 @@ def test_commit_that_fails_while_writing_points_writes_nothing(
     )
 
     with pytest.raises(SheetStructureError):
-        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+        attendance_bot._commit(TAB, ["Lucus"], ["Kobe"], [3], _entry(), False)
 
     assert not sh.worksheet(TAB).batches
     assert not isinstance(
@@ -358,7 +359,7 @@ def test_commit_follows_the_boss_name_when_the_column_moves(spreadsheet):
     assert SAMPLE_GRID[0][2].startswith("Lucus")  # was column 3 at preview time
 
     sh = spreadsheet(_sheets(grid=shifted))
-    attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+    attendance_bot._commit(TAB, ["Lucus"], ["Kobe"], [3], _entry(), False)
 
     ranges = [cell["range"] for batch in sh.worksheet(TAB).batches for cell in batch]
     assert ranges == ["D4"], f"write followed a stale index instead of the name: {ranges}"
@@ -366,7 +367,7 @@ def test_commit_follows_the_boss_name_when_the_column_moves(spreadsheet):
 
 def test_commit_takes_a_boss_name_not_a_column_index():
     parameters = inspect.signature(attendance_bot._commit).parameters
-    assert "boss" in parameters
+    assert "bosses" in parameters
     assert "column" not in parameters
     assert "find_column" in inspect.getsource(attendance_bot._commit)
 
@@ -379,7 +380,7 @@ def test_commit_refuses_when_the_boss_column_vanished_mid_preview(spreadsheet):
     sh = spreadsheet(_sheets(grid=without_lucus))
 
     with pytest.raises(SheetStructureError):
-        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+        attendance_bot._commit(TAB, ["Lucus"], ["Kobe"], [3], _entry(), False)
 
     assert not sh.worksheet(TAB).batches
 
@@ -394,7 +395,7 @@ def test_commit_aborts_if_the_screenshot_was_logged_during_the_preview(spreadshe
     # was_duplicate=False: the preview showed no warning, so this row
     # appeared while the officer was deciding.
     with pytest.raises(attendance_bot.AlreadyLoggedDuringPreview):
-        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), False)
+        attendance_bot._commit(TAB, ["Lucus"], ["Kobe"], [3], _entry(), False)
 
     assert not sh.worksheet(TAB).batches
 
@@ -405,7 +406,7 @@ def test_commit_allows_a_duplicate_the_officer_was_warned_about(spreadsheet):
 
     # was_duplicate=True: the preview carried the "Already Logged" warning
     # and the officer confirmed anyway, which is a legitimate re-log.
-    attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, _entry(), True)
+    attendance_bot._commit(TAB, ["Lucus"], ["Kobe"], [3], _entry(), True)
 
     assert sh.worksheet(TAB).batches
 
@@ -597,7 +598,7 @@ def test_commit_treats_a_repost_with_a_new_attachment_id_as_a_duplicate(spreadsh
 
     repost = _entry(attachment_id="brand-new-upload-id", image_sha256="same-hash")
     with pytest.raises(attendance_bot.AlreadyLoggedDuringPreview):
-        attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, repost, False)
+        attendance_bot._commit(TAB, ["Lucus"], ["Kobe"], [3], repost, False)
 
     assert not sh.worksheet(TAB).batches
 
@@ -608,7 +609,7 @@ def test_commit_does_not_flag_a_different_screenshot_as_a_duplicate(spreadsheet)
     sh = spreadsheet(_sheets(log=_log_tab(row)))
 
     different = _entry(attachment_id="upload-2", image_sha256="hash-2")
-    attendance_bot._commit(TAB, "Lucus", ["Kobe"], 3, different, False)
+    attendance_bot._commit(TAB, ["Lucus"], ["Kobe"], [3], different, False)
 
     assert sh.worksheet(TAB).batches
 
@@ -859,7 +860,7 @@ def test_load_context_does_not_open_its_own_spreadsheet_handle(monkeypatch):
     attendance_bot.write_config(sh, "target_tab", TAB)
 
     context = attendance_bot._load_context(sh, "Lucus")
-    assert context["boss"] == "Lucus"
+    assert context["bosses"] == ["Lucus"]
 
 
 import time  # noqa: E402  (kept near its first use, above)
@@ -1437,3 +1438,401 @@ def test_the_reaction_gate_accepts_any_configured_role(monkeypatch):
     outsider = FakeMember([FakeRole(999)])
     outsider.id = 8
     assert check(reaction, outsider) is False
+
+
+# --------------------------------------------------------------------------
+# Several bosses in one command: "!attendance clemantis - dalia - catena".
+# One rally often kills a few bosses with the same roster, so one command
+# is one attendance event, and one !undoattendance reverses all of it.
+# --------------------------------------------------------------------------
+
+MULTI_GRID = [
+    ["Player Name", "Points", "Clemantis", "Lady Dalia", "Catena", "Lucus - 3"],
+    ["ARCILynN", "51", "", "", "", ""],
+    ["xSigarilyas", "49", "2", "1", "", "3"],
+    ["Kobe", "44", "", "", "", ""],
+]
+
+
+def _multi_sheet(grid=None, log=None):
+    sheets = {TAB: FakeWorksheet(grid or MULTI_GRID, title=TAB)}
+    if log is not None:
+        sheets[LOG_TAB] = log
+    sh = FakeSpreadsheet(sheets)
+    attendance_bot.write_config(sh, "target_tab", TAB)
+    attendance_bot.write_config(sh, "officer_role_ids", json.dumps([123]))
+    return sh
+
+
+def test_three_bosses_resolve_with_their_own_point_values():
+    sh = _multi_sheet()
+    context = attendance_bot._load_context(sh, "clemantis - dalia - catena")
+
+    assert context["bosses"] == ["Clemantis", "Lady Dalia", "Catena"]
+    assert context["points"] == [1, 1, 1]
+
+
+def test_a_single_boss_with_no_dash_is_unchanged():
+    sh = _multi_sheet()
+    context = attendance_bot._load_context(sh, "lucus")
+
+    assert context["bosses"] == ["Lucus"]
+    assert context["points"] == [3]
+
+
+def test_mixed_point_values_are_kept_per_boss():
+    sh = _multi_sheet()
+    context = attendance_bot._load_context(sh, "lucus - clemantis")
+
+    assert context["bosses"] == ["Lucus", "Clemantis"]
+    assert context["points"] == [3, 1]
+
+
+def test_one_unresolvable_fragment_refuses_the_whole_command():
+    sh = _multi_sheet()
+    with pytest.raises(BossNotFound) as caught:
+        attendance_bot._load_context(sh, "clemantis - nosuchboss - catena")
+
+    # The officer must be able to see WHICH part was wrong.
+    assert "nosuchboss" in str(caught.value)
+
+
+def test_the_points_annotation_collision_names_the_offending_fragment():
+    # Sheet headers annotate points with the same " - " ("Lucus - 3"), so
+    # "!attendance lucus - 3" splits into "lucus" and "3". Failing is
+    # correct; the message just has to say which fragment failed.
+    sh = _multi_sheet()
+    with pytest.raises(BossNotFound) as caught:
+        attendance_bot._load_context(sh, "lucus - 3")
+
+    assert "'3'" in str(caught.value) or '"3"' in str(caught.value)
+
+
+def test_an_ambiguous_fragment_refuses_the_whole_command():
+    grid = [
+        ["Player Name", "Points", "Clemantis", "Catena Prime", "Catena Rex"],
+        ["Kobe", "44", "", "", ""],
+    ]
+    sh = _multi_sheet(grid=grid)
+
+    # The FIRST fragment resolves cleanly; the second is ambiguous. The
+    # whole command must still be refused, not just the bad fragment
+    # dropped -- otherwise Clemantis is logged alone and nobody notices.
+    with pytest.raises(BossAmbiguous) as caught:
+        attendance_bot._load_context(sh, "clemantis - catena")
+
+    assert "catena" in str(caught.value).casefold()
+
+
+def test_a_repeated_boss_is_deduplicated():
+    sh = _multi_sheet()
+    context = attendance_bot._load_context(sh, "dalia - dalia")
+    assert context["bosses"] == ["Lady Dalia"]
+
+    # Also when the same boss is named two different ways.
+    context = attendance_bot._load_context(sh, "dalia - Lady Dalia")
+    assert context["bosses"] == ["Lady Dalia"]
+
+
+@pytest.mark.parametrize("query", ["clemantis - ", " - catena", "clemantis -  - catena"])
+def test_an_empty_fragment_is_refused(query):
+    sh = _multi_sheet()
+    with pytest.raises(attendance_bot.BossQueryError):
+        attendance_bot._load_context(sh, query)
+
+
+def test_all_bosses_are_written_in_one_apply_writes(monkeypatch):
+    sh = _multi_sheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    entry = _entry(
+        boss=json.dumps(["Clemantis", "Lady Dalia", "Catena"]),
+        points_each=json.dumps([1, 1, 1]),
+        players=json.dumps(["Kobe"]),
+    )
+    attendance_bot._commit(
+        TAB,
+        ["Clemantis", "Lady Dalia", "Catena"],
+        ["Kobe"],
+        [1, 1, 1],
+        entry,
+        False,
+    )
+
+    # One batch, not one per boss: a failure partway through a per-boss
+    # loop would leave some bosses paid and others not, with a log row
+    # describing neither state.
+    assert len(sh.worksheet(TAB).batches) == 1
+    ranges = {cell["range"] for cell in sh.worksheet(TAB).batches[0]}
+    assert ranges == {"C4", "D4", "E4"}
+
+
+def test_each_boss_column_gains_its_own_value(monkeypatch):
+    sh = _multi_sheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    # xSigarilyas is row 3 and starts at Clemantis=2, Lady Dalia=1, Lucus=3.
+    entry = _entry(
+        boss=json.dumps(["Clemantis", "Lucus"]),
+        points_each=json.dumps([1, 3]),
+        players=json.dumps(["xSigarilyas"]),
+    )
+    attendance_bot._commit(
+        TAB, ["Clemantis", "Lucus"], ["xSigarilyas"], [1, 3], entry, False
+    )
+
+    written = {
+        cell["range"]: cell["values"][0][0]
+        for cell in sh.worksheet(TAB).batches[0]
+    }
+    assert written == {"C3": 3, "F3": 6}
+
+
+def test_undo_reverses_every_boss_in_one_write(monkeypatch):
+    logged = _entry(
+        tab=TAB,
+        boss=json.dumps(["Clemantis", "Lucus"]),
+        points_each=json.dumps([1, 3]),
+        players=json.dumps(["xSigarilyas"]),
+    )
+    sh = _multi_sheet(log=_log_tab([str(logged[f]) for f in LOG_HEADER]))
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    attendance_bot._reverse_last()
+
+    assert len(sh.worksheet(TAB).batches) == 1
+    written = {
+        cell["range"]: cell["values"][0][0]
+        for cell in sh.worksheet(TAB).batches[0]
+    }
+    # The fixture grid already holds the post-award values (Clemantis 2,
+    # Lucus 3), so undoing +1/+3 leaves 1 and a cleared blank.
+    assert written == {"C3": 1, "F3": ""}
+
+
+def test_a_legacy_single_boss_log_row_still_undoes(monkeypatch):
+    # Rows already in the guild's live sheet hold bare strings, not JSON.
+    logged = _entry(
+        tab=TAB,
+        boss="Lucus",
+        points_each="3",
+        players=json.dumps(["xSigarilyas"]),
+    )
+    sh = _multi_sheet(log=_log_tab([str(logged[f]) for f in LOG_HEADER]))
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    attendance_bot._reverse_last()
+
+    written = {
+        cell["range"]: cell["values"][0][0]
+        for cell in sh.worksheet(TAB).batches[0]
+    }
+    # 3 - 3 = 0, and a zeroed boss cell is cleared back to blank.
+    assert written == {"F3": ""}
+
+
+def test_the_preview_lists_every_boss_with_its_own_points(monkeypatch):
+    sh = _multi_sheet()
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
+
+    preview = {}
+
+    async def capture(event, check=None, timeout=None):
+        preview["embed"] = ctx.sent[0][2].embed
+        return (SimpleNamespace(), "Officer#1")
+
+    monkeypatch.setattr(attendance_bot.bot, "wait_for", capture)
+
+    ctx = FakeCtx(FakeMember([FakeRole(123)]), attachments=[FakeAttachment()])
+    asyncio.run(
+        attendance_bot.attendance_cmd.callback(
+            ctx, boss_name="clemantis - dalia - lucus"
+        )
+    )
+
+    description = preview["embed"].description
+    for expected in ("Clemantis +1", "Lady Dalia +1", "Lucus +3"):
+        assert expected in description
+    assert "**5** points each" in description
+
+
+# --------------------------------------------------------------------------
+# (MB-1) The anti-zip-short guard. A hand-edited or half-written _BotLog row
+# whose boss count and points count disagree must be refused BEFORE any
+# write -- zipping short would under-reverse real people's points.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_writes(monkeypatch):
+    """Records every apply_writes call so a test can prove there were none."""
+    calls = []
+
+    def spy(worksheet, payload):
+        calls.append(payload)
+
+    monkeypatch.setattr(attendance_bot, "apply_writes", spy)
+    return calls
+
+
+def _undo_sheet_with(monkeypatch, **overrides):
+    logged = _entry(tab=TAB, players=json.dumps(["xSigarilyas"]), **overrides)
+    sh = _multi_sheet(log=_log_tab([str(logged[f]) for f in LOG_HEADER]))
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+    return sh
+
+
+def test_two_bosses_with_a_single_bare_points_cell_is_refused(
+    monkeypatch, no_writes
+):
+    sh = _undo_sheet_with(
+        monkeypatch,
+        boss=json.dumps(["Clemantis", "Lucus"]),
+        points_each="3",
+    )
+
+    with pytest.raises(SheetStructureError) as caught:
+        attendance_bot._reverse_last()
+
+    assert "refusing to guess" in str(caught.value)
+    # Refused BEFORE writing, not merely raising eventually.
+    assert not no_writes
+    assert not sh.worksheet(TAB).batches
+
+
+def test_one_boss_with_two_points_values_is_refused(monkeypatch, no_writes):
+    sh = _undo_sheet_with(
+        monkeypatch,
+        boss="Lucus",
+        points_each=json.dumps([1, 3]),
+    )
+
+    with pytest.raises(SheetStructureError) as caught:
+        attendance_bot._reverse_last()
+
+    assert "refusing to guess" in str(caught.value)
+    assert not no_writes
+    assert not sh.worksheet(TAB).batches
+
+
+# --------------------------------------------------------------------------
+# (MB-2) Atomicity under failure. The property the whole design turns on:
+# a boss that fails partway through means NOTHING is written, not a partial
+# set of columns under a log row that describes neither state.
+# --------------------------------------------------------------------------
+
+
+def test_a_boss_failing_partway_through_writes_nothing_at_all(monkeypatch):
+    # Clemantis has a column; Lucus does not.
+    grid = [
+        ["Player Name", "Points", "Clemantis", "Lady Dalia"],
+        ["ARCILynN", "51", "", ""],
+        ["Kobe", "44", "2", "1"],
+    ]
+    sh = _multi_sheet(grid=grid)
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    entry = _entry(
+        boss=json.dumps(["Clemantis", "Lucus"]),
+        points_each=json.dumps([1, 3]),
+        players=json.dumps(["Kobe"]),
+    )
+
+    with pytest.raises(SheetStructureError):
+        attendance_bot._commit(
+            TAB, ["Clemantis", "Lucus"], ["Kobe"], [1, 3], entry, False
+        )
+
+    # Clemantis resolved fine and would have been written by a per-boss
+    # apply_writes loop. One payload, one write, so nothing landed.
+    assert not sh.worksheet(TAB).batches
+
+
+def test_an_undo_failing_partway_through_removes_nothing_at_all(monkeypatch):
+    grid = [
+        ["Player Name", "Points", "Clemantis", "Lady Dalia"],
+        ["xSigarilyas", "49", "2", "1"],
+    ]
+    logged = _entry(
+        tab=TAB,
+        boss=json.dumps(["Clemantis", "Lucus"]),
+        points_each=json.dumps([1, 3]),
+        players=json.dumps(["xSigarilyas"]),
+    )
+    sh = _multi_sheet(grid=grid, log=_log_tab([str(logged[f]) for f in LOG_HEADER]))
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    with pytest.raises(SheetStructureError):
+        attendance_bot._reverse_last()
+
+    assert not sh.worksheet(TAB).batches
+
+
+# --------------------------------------------------------------------------
+# (MB-3) The boss list must survive in the do-not-re-run messages: an
+# officer who cannot see which columns were paid cannot reconcile them.
+# --------------------------------------------------------------------------
+
+TEN_BOSSES = [
+    "Clemantis", "Lady Dalia", "Catena", "General Aquleus", "Lucus",
+    "Libitina", "Rakajeth", "Icaruthia", "Nevaeh", "Camalia",
+]
+TEN_POINTS = [1, 1, 1, 1, 3, 3, 3, 3, 3, 3]
+
+
+def test_every_boss_survives_in_the_partly_written_message():
+    exc = attendance_bot.PointsWrittenButNotLogged(
+        tab="Week 17.1",
+        boss=TEN_BOSSES,
+        points=TEN_POINTS,
+        players=BIG_ROSTER,
+        cause_text=BIG_CAUSE,
+    )
+    description = exc.description
+
+    assert len(description) <= DISCORD_EMBED_DESCRIPTION_LIMIT
+    for boss in TEN_BOSSES:
+        assert boss in description, f"{boss} was clipped out of the reconcile list"
+    for sentence in PARTLY_WRITTEN_SENTENCES:
+        assert sentence in description
+
+
+def test_every_boss_survives_in_the_partly_undone_message():
+    exc = attendance_bot.PointsRemovedButNotMarked(
+        entry={
+            "tab": "Week 17.1",
+            "boss": json.dumps(TEN_BOSSES),
+            "points_each": json.dumps(TEN_POINTS),
+            "players": json.dumps(BIG_ROSTER),
+        },
+        cause_text=BIG_CAUSE,
+    )
+    description = exc.description
+
+    assert len(description) <= DISCORD_EMBED_DESCRIPTION_LIMIT
+    for boss in TEN_BOSSES:
+        assert boss in description
+    for sentence in PARTLY_UNDONE_SENTENCES:
+        assert sentence in description
+
+
+def test_the_undo_confirmation_never_says_removed_none(monkeypatch):
+    # _peek_boss_summary returning None once rendered "Removed None from".
+    assert attendance_bot._peek_boss_summary({}) is None
+    assert attendance_bot._peek_boss_summary({"boss": "", "points_each": ""}) is None
+
+    logged = _entry(
+        tab=TAB,
+        boss="",
+        points_each="",
+        players=json.dumps(["xSigarilyas"]),
+    )
+    sh = _multi_sheet(log=_log_tab([str(logged[f]) for f in LOG_HEADER]))
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
+
+    ctx = FakeCtx(FakeMember([FakeRole(123)]))
+    asyncio.run(attendance_bot.undo_attendance_cmd.callback(ctx))
+
+    description = ctx.sent[-1][1]["embed"].description
+    assert "None" not in description
