@@ -114,6 +114,7 @@ async def load_state(channel) -> bool:
     """
     global _STATE_MESSAGE
     candidates = [message async for message in channel.pins(limit=50)]
+    candidates += [message async for message in channel.history(limit=100)]
     for message in candidates:
         decoded = items_state.decode_state(message.content)
         if decoded is None:
@@ -149,6 +150,9 @@ def is_officer_channel(channel_id: int) -> bool:
 @commands.has_permissions(administrator=True)
 async def setofficerchannel_cmd(ctx):
     """Record this channel as the officers' channel."""
+    global _STATE_MESSAGE
+    if _STATE.officer_channel_id != ctx.channel.id:
+        _STATE_MESSAGE = None
     _STATE.officer_channel_id = ctx.channel.id
     await save_state(ctx.channel)
     await ctx.send(
@@ -222,7 +226,7 @@ def evaluate_request(
         already_has_special=items_sheet.holds_special(
             snapshot, parsed.ign, parsed.item.name
         ),
-        pending_gear=items_state.pending_gear_for(state, parsed.ign),
+        pending_gear=items_state.pending_gear_for(state, parsed.ign, today),
         cap=cap,
     )
     if not eligibility.allowed:
@@ -281,11 +285,26 @@ async def request_cmd(ctx, *, argument: str = ""):
             await ctx.send(embed=error_embed("Request refused", outcome.message))
             return
 
+        previous_ign = _STATE.igns.get(str(ctx.author.id))
         _STATE.queue.append(outcome.request)
         _STATE.igns[str(ctx.author.id)] = outcome.request.ign
 
         channel = bot.get_channel(_STATE.officer_channel_id)
-        dropped = await save_state(channel) if channel else []
+        if channel is None:
+            _STATE.queue.remove(outcome.request)
+            if previous_ign is None:
+                _STATE.igns.pop(str(ctx.author.id), None)
+            else:
+                _STATE.igns[str(ctx.author.id)] = previous_ign
+            await ctx.send(
+                embed=error_embed(
+                    "Officer channel unreachable",
+                    "Your request was not recorded. Please try again after an "
+                    "admin restores the officer channel.",
+                )
+            )
+            return
+        dropped = await save_state(channel)
 
     await ctx.send(embed=ok_embed("Request queued", outcome.message))
     if dropped and channel:
@@ -378,6 +397,16 @@ async def approve(request_id: str, officer_name: str) -> str:
         except Exception as exc:
             return f"Could not read the sheet, so nothing was written: {exc}"
 
+        if items_sheet.already_recorded(snapshot, request.id):
+            items_state.remove_request(_STATE, request_id)
+            channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
+            if channel is not None:
+                await save_state(channel)
+            return (
+                f"**{request.item}** for **{request.ign}** was already recorded. "
+                "Nothing was written again."
+            )
+
         eligibility = items_rules.check_eligibility(
             request.type,
             request.ign,
@@ -444,7 +473,9 @@ class DistributePanel(discord.ui.View):
 
     def __init__(self, requests: list[items_state.PendingRequest], *, start: int = 1):
         super().__init__(timeout=PANEL_TIMEOUT)
-        self.selected: str | None = None
+        # A panel is shared by several officers at once; one officer's
+        # dropdown choice must never become another officer's approval.
+        self.selected: dict[int, str] = {}
         # The page this panel shows, so refresh_panel redraws THIS page.
         self.start = start
         # Set by the sender so on_timeout can edit the panel.
@@ -500,11 +531,11 @@ class DistributePanel(discord.ui.View):
             pass
 
     async def _on_pick(self, interaction: discord.Interaction):
-        self.selected = self.picker.values[0]
+        self.selected[interaction.user.id] = self.picker.values[0]
         await interaction.response.defer()
 
     async def _require_selection(self, interaction: discord.Interaction) -> bool:
-        if self.selected is None:
+        if interaction.user.id not in self.selected:
             await interaction.response.send_message(
                 "Pick a request from the dropdown first.", ephemeral=True
             )
@@ -516,8 +547,8 @@ class DistributePanel(discord.ui.View):
         if not await self._require_selection(interaction):
             return
         await interaction.response.defer()
-        result = await approve(self.selected, interaction.user.display_name)
-        self.selected = None
+        result = await approve(self.selected[interaction.user.id], interaction.user.display_name)
+        self.selected.pop(interaction.user.id, None)
         await interaction.followup.send(result)
         await refresh_panel(interaction, self.start)
 
@@ -526,8 +557,8 @@ class DistributePanel(discord.ui.View):
         if not await self._require_selection(interaction):
             return
         await interaction.response.defer()
-        result = await deny(self.selected)
-        self.selected = None
+        result = await deny(self.selected[interaction.user.id])
+        self.selected.pop(interaction.user.id, None)
         await interaction.followup.send(result)
         await refresh_panel(interaction, self.start)
 

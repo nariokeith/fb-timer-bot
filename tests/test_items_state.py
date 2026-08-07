@@ -41,6 +41,11 @@ def test_decoding_a_corrupt_payload_returns_none():
     assert items_state.decode_state(f"{items_state.STATE_MARKER}\n```json\n{{oops\n```") is None
 
 
+def test_decoding_a_non_numeric_channel_id_returns_none():
+    content = f'{items_state.STATE_MARKER}\n```json\n{{"officer_channel_id":"bad"}}\n```'
+    assert items_state.decode_state(content) is None
+
+
 def test_a_fresh_state_has_no_officer_channel():
     assert items_state.State().officer_channel_id is None
 
@@ -55,6 +60,17 @@ def test_oversize_state_drops_the_oldest_requests_and_reports_them():
     assert dropped, "oversize state must report what it dropped"
     assert dropped[0].id == "id000", "the OLDEST request is dropped first"
     assert items_state.decode_state(content).officer_channel_id == 99
+
+
+def test_oversize_ign_memory_is_trimmed_after_the_queue_is_preserved():
+    state = items_state.State(igns={str(n): "A very long remembered IGN value" for n in range(300)})
+    content, dropped = items_state.encode_state(state)
+    restored = items_state.decode_state(content)
+    assert len(content) <= items_state.MAX_CONTENT
+    assert dropped == []
+    assert "0" not in state.igns
+    assert "0" not in restored.igns
+    assert "299" in restored.igns
 
 
 def test_new_request_ids_are_unique():
@@ -73,8 +89,13 @@ def test_pending_gear_counts_only_that_players_gear_requests():
             _request("d", ign="Dajz", type_=items_rules.GEAR),
         ]
     )
-    assert items_state.pending_gear_for(state, "Kobe") == 2
-    assert items_state.pending_gear_for(state, "kobe") == 2
+    assert items_state.pending_gear_for(state, "Kobe", "2026-08-07") == 2
+    assert items_state.pending_gear_for(state, "kobe", "2026-08-07") == 2
+
+
+def test_pending_gear_does_not_cross_the_pht_day_boundary():
+    state = items_state.State(queue=[_request("a", ign="Kobe", type_=items_rules.GEAR)])
+    assert items_state.pending_gear_for(state, "Kobe", "2026-08-08") == 0
 
 
 def test_find_request_returns_none_when_absent():

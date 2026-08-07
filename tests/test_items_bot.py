@@ -35,9 +35,11 @@ class FakeMessage:
 
 
 class FakeChannel:
-    def __init__(self, channel_id=99, pins=None):
+    def __init__(self, channel_id=99, pins=None, history=None):
         self.id = channel_id
+        self.mention = f"#channel-{channel_id}"
         self._pins = list(pins or [])
+        self._history = list(history or [])
         self.sent: list[str] = []
 
     def pins(self, limit=50):
@@ -50,6 +52,13 @@ class FakeChannel:
 
         async def _iterator():
             for message in list(self._pins)[:limit]:
+                yield message
+
+        return _iterator()
+
+    def history(self, limit=100):
+        async def _iterator():
+            for message in list(self._history)[:limit]:
                 yield message
 
         return _iterator()
@@ -134,6 +143,19 @@ def test_save_then_load_restores_the_queue():
     assert [r.id for r in items_bot._STATE.queue] == ["aaa"]
 
 
+def test_load_state_recovers_an_unpinned_state_message_from_history():
+    state = items_state.State(officer_channel_id=99, queue=[
+        items_state.PendingRequest("aaa", 1, "Kobe", "Asta's Heart", "Special", "2026-08-07 09:00:00")
+    ])
+    content, _ = items_state.encode_state(state)
+    message = FakeMessage(content, message_id=3)
+    channel = FakeChannel(history=[message])
+
+    assert asyncio.run(items_bot.load_state(channel))
+    assert [r.id for r in items_bot._STATE.queue] == ["aaa"]
+    assert items_bot._STATE_MESSAGE is message
+
+
 def test_dropped_requests_are_removed_from_memory_too():
     """Storage and memory must not disagree about what is queued."""
     channel = FakeChannel()
@@ -174,6 +196,44 @@ def test_is_officer_channel_only_matches_the_recorded_channel():
 def test_is_officer_channel_is_false_before_setup():
     items_bot._STATE.officer_channel_id = None
     assert not items_bot.is_officer_channel(99)
+
+
+class FakeCtx:
+    def __init__(self, channel, user_id=1):
+        self.channel = channel
+        self.author = type("Author", (), {"id": user_id})()
+        self.sent = []
+
+    async def send(self, **kwargs):
+        self.sent.append(kwargs)
+
+
+def test_moving_officer_channel_discards_the_old_state_message(monkeypatch):
+    old_message = FakeMessage("old")
+    items_bot._STATE.officer_channel_id = 10
+    items_bot._STATE_MESSAGE = old_message
+    channel = FakeChannel(99)
+    ctx = FakeCtx(channel)
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+
+    asyncio.run(items_bot.setofficerchannel_cmd.callback(ctx))
+
+    assert items_bot._STATE_MESSAGE is None
+    assert items_bot._STATE.officer_channel_id == 99
+
+
+def test_unreachable_officer_channel_does_not_keep_a_queued_request(monkeypatch):
+    items_bot._STATE.officer_channel_id = 99
+    items_bot._STATE.igns = {"1": "Kobe"}
+    ctx = FakeCtx(FakeChannel(1))
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: None)
+
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Heart Dajz"))
+
+    assert items_bot._STATE.queue == []
+    assert items_bot._STATE.igns == {"1": "Kobe"}
+    assert "unreachable" in ctx.sent[-1]["embed"].title.lower()
 
 
 import items_rules
@@ -255,8 +315,19 @@ def test_pending_gear_requests_count_toward_the_cap():
             )
         ]
     )
-    outcome = _evaluate("Asta's Belt Kobe", state=state)
+    outcome = _evaluate("Benji's Heart Kobe", state=state)
     assert not outcome.accepted
+
+
+def test_yesterdays_pending_gear_does_not_count_toward_todays_cap():
+    state = items_state.State(queue=[
+        items_state.PendingRequest(
+            id="x", user_id=1, ign="Kobe", item="Asta's Belt",
+            type=items_rules.GEAR, requested_at="2026-08-06 23:59:00",
+        )
+    ])
+    outcome = _evaluate("Benji's Heart Kobe", state=state)
+    assert outcome.accepted
 
 
 def _queued(request_id, ign, item, type_):
@@ -337,6 +408,17 @@ def test_a_panel_remembers_which_page_it_shows():
     assert panel.start == 26
 
 
+def test_a_panel_keeps_each_officers_selection_separate():
+    panel = items_bot.DistributePanel([
+        _queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL),
+        _queued("b", "Kobe", "Asta's Belt", items_rules.GEAR),
+    ])
+    panel.selected[101] = "a"
+    panel.selected[202] = "b"
+    assert panel.selected[101] == "a"
+    assert panel.selected[202] == "b"
+
+
 def test_an_empty_queue_says_so():
     embed = items_bot.build_panel_embed([], SNAPSHOT, cap=3, today="2026-08-07")
     assert "no pending" in embed.description.lower()
@@ -364,6 +446,23 @@ def test_approving_an_already_resolved_request_writes_nothing(monkeypatch):
     message = asyncio.run(items_bot.approve("gone", "Keith"))
     assert calls == []
     assert "already" in message.lower()
+
+
+def test_approve_removes_an_already_recorded_request_without_writing(monkeypatch):
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    recorded = snapshot_with(ledger_rows=SNAPSHOT.ledger_rows + [
+        ["2026-08-07 11:00:00", "Dajz", "Asta's Heart", "Special", "O", "1", "a"]
+    ])
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: recorded)
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+    calls = []
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: calls.append(k))
+
+    message = asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert calls == []
+    assert items_bot._STATE.queue == []
+    assert "already recorded" in message.lower()
 
 
 def test_approve_commits_and_removes_the_request(monkeypatch):

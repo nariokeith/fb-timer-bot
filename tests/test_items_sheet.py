@@ -50,6 +50,14 @@ def test_snapshot_excludes_the_ledger_header_row():
     assert all(row[0] != "Timestamp (PHT)" for row in snapshot.ledger_rows)
 
 
+def test_snapshot_refuses_a_reordered_ledger_header():
+    spreadsheet = make_spreadsheet()
+    spreadsheet.worksheet(items_sheet.LEDGER_TAB)._rows[0][0:2] = ["IGN", "Timestamp (PHT)"]
+    with pytest.raises(SheetStructureError) as exc:
+        items_sheet.read_snapshot(spreadsheet)
+    assert "Distribution Log" in str(exc.value)
+
+
 def test_a_missing_gear_tab_yields_empty_gear_headers():
     spreadsheet = FakeSpreadsheet(
         {items_sheet.SPECIAL_TAB: FakeWorksheet(SPECIAL_GRID, title=items_sheet.SPECIAL_TAB)}
@@ -100,6 +108,13 @@ def test_find_row_refuses_an_unknown_player():
         items_sheet.find_row(worksheet, "Nobody")
 
 
+def test_find_row_refuses_duplicate_normalized_players():
+    worksheet = FakeWorksheet([SPECIAL_GRID[0], ["Kobe", "FALSE"], [" kobe ", "FALSE"]])
+    with pytest.raises(SheetStructureError) as exc:
+        items_sheet.find_row(worksheet, "Kobe")
+    assert "2, 3" in str(exc.value)
+
+
 def test_record_special_ticks_the_right_cell():
     spreadsheet = make_spreadsheet()
     address = items_sheet.record_special(spreadsheet, "Dajz", "Asta's Heart")
@@ -115,6 +130,22 @@ def test_record_special_refuses_when_already_ticked():
         items_sheet.record_special(spreadsheet, "Kobe", "Asta's Heart")
     assert "already" in str(exc.value).lower()
     assert spreadsheet.worksheet(items_sheet.SPECIAL_TAB).batches == []
+
+
+def test_record_special_refuses_an_unknown_checkbox_value():
+    grid = [row[:] for row in SPECIAL_GRID]
+    grid[2][1] = "officer note"
+    spreadsheet = FakeSpreadsheet({items_sheet.SPECIAL_TAB: FakeWorksheet(grid, title=items_sheet.SPECIAL_TAB)})
+    with pytest.raises(SheetStructureError) as exc:
+        items_sheet.record_special(spreadsheet, "Dajz", "Asta's Heart")
+    assert "officer note" in str(exc.value)
+    assert spreadsheet.worksheet(items_sheet.SPECIAL_TAB).batches == []
+
+
+def test_already_recorded_finds_request_ids_in_the_ledger():
+    snapshot = items_sheet.read_snapshot(make_spreadsheet())
+    assert items_sheet.already_recorded(snapshot, "aaa")
+    assert not items_sheet.already_recorded(snapshot, "missing")
 
 
 def test_record_gear_increments_an_existing_count():

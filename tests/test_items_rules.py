@@ -182,6 +182,12 @@ def test_an_alias_whose_target_is_absent_does_not_resolve():
         )
 
 
+def test_duplicate_normalized_roster_names_are_refused():
+    with pytest.raises(items_rules.RequestParseError) as exc:
+        items_rules.resolve_ign("Kobe", ["Kobe", " kobe "])
+    assert "Kobe" in str(exc.value) and "kobe" in str(exc.value)
+
+
 def test_a_special_the_player_lacks_is_allowed():
     result = items_rules.check_eligibility(
         items_rules.SPECIAL, "Kobe", [], "2026-08-07", already_has_special=False

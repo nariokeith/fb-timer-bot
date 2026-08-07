@@ -91,6 +91,12 @@ def read_snapshot(spreadsheet) -> Snapshot:
         raise SheetStructureError(f"Worksheet {SPECIAL_TAB!r} is missing or empty")
     gear_grid = _grid_or_empty(spreadsheet, GEAR_TAB)
     ledger_grid = _grid_or_empty(spreadsheet, LEDGER_TAB)
+    if ledger_grid and ledger_grid[HEADER_ROW - 1] != LEDGER_HEADER:
+        raise SheetStructureError(
+            f"Worksheet {LEDGER_TAB!r} has an unexpected header "
+            f"{ledger_grid[HEADER_ROW - 1]!r}; expected {LEDGER_HEADER!r}. "
+            "Refusing to guess ledger column positions."
+        )
 
     special = spreadsheet.worksheet(SPECIAL_TAB)
     return Snapshot(
@@ -110,14 +116,27 @@ def find_row(worksheet, ign: str, grid: list[list[str]] | None = None) -> int:
     """
     grid = grid if grid is not None else worksheet.get_all_values()
     wanted = normalize(ign)
+    matches = []
     for index, row in enumerate(grid[HEADER_ROW:], start=HEADER_ROW + 1):
         if not row:
             continue
         if normalize(row[PLAYER_COLUMN - 1]) == wanted:
-            return index
+            matches.append(index)
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise SheetStructureError(
+            f"Multiple rows for {ign!r} in worksheet {worksheet.title!r}: "
+            f"{', '.join(map(str, matches))}; refusing to guess"
+        )
     raise SheetStructureError(
         f"No row for {ign!r} in worksheet {worksheet.title!r}"
     )
+
+
+def already_recorded(snapshot: Snapshot, request_id: str) -> bool:
+    """Whether the ledger already contains this request's audit row."""
+    return any(len(row) > 6 and row[6] == request_id for row in snapshot.ledger_rows)
 
 
 def holds_special(snapshot: Snapshot, ign: str, item: str) -> bool:
@@ -195,7 +214,14 @@ def record_special(spreadsheet, ign: str, item: str) -> str:
     row = find_row(worksheet, ign, grid)
     column = find_column(worksheet, item, grid)
 
-    if _cell(grid, row, column).strip().casefold() in CHECKED_VALUES:
+    raw = _cell(grid, row, column).strip()
+    state = raw.casefold()
+    if state not in {"", "false", "true"}:
+        raise SheetStructureError(
+            f"Cell for {ign} / {item!r} holds {raw!r}, which is not a checkbox "
+            "state; refusing to overwrite a value this bot does not understand"
+        )
+    if state in CHECKED_VALUES:
         raise SheetStructureError(
             f"{ign} already has {item!r} -- a special log is once only"
         )

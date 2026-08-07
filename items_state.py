@@ -101,17 +101,25 @@ def encode_state(state: State) -> tuple[str, list[PendingRequest]]:
     queue = list(state.queue)
     dropped: list[PendingRequest] = []
 
+    igns = state.igns
     while True:
         content = _render(
             {
                 "officer_channel_id": state.officer_channel_id,
                 "queue": [r.to_dict() for r in queue],
-                "igns": state.igns,
+                "igns": igns,
             }
         )
-        if len(content) <= MAX_CONTENT or not queue:
+        if len(content) <= MAX_CONTENT:
             return content, dropped
-        dropped.append(queue.pop(0))
+        if queue:
+            dropped.append(queue.pop(0))
+        elif igns:
+            # Queue entries are members' pending requests.  IGN memory is
+            # advisory, so discard its oldest entries first once necessary.
+            igns.pop(next(iter(igns)))
+        else:
+            return content, dropped
 
 
 def decode_state(content: str) -> State | None:
@@ -132,23 +140,28 @@ def decode_state(content: str) -> State | None:
         payload = json.loads(body)
         queue = [PendingRequest.from_dict(r) for r in payload.get("queue", [])]
         channel_id = payload.get("officer_channel_id")
+        channel_id = int(channel_id) if channel_id is not None else None
         igns = {str(k): str(v) for k, v in dict(payload.get("igns", {})).items()}
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
     return State(
-        officer_channel_id=int(channel_id) if channel_id is not None else None,
+        officer_channel_id=channel_id,
         queue=queue,
         igns=igns,
     )
 
 
-def pending_gear_for(state: State, ign: str) -> int:
+def pending_gear_for(state: State, ign: str, today: str) -> int:
     """Queued-but-unapproved gear requests for this player."""
     wanted = items_rules.normalize(ign)
     return sum(
         1
         for r in state.queue
-        if r.type == items_rules.GEAR and items_rules.normalize(r.ign) == wanted
+        if (
+            r.type == items_rules.GEAR
+            and items_rules.normalize(r.ign) == wanted
+            and items_rules.pht_day(r.requested_at) == today
+        )
     )
 
 

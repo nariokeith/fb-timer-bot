@@ -191,7 +191,17 @@ def resolve_ign(query: str, roster: list[str]) -> str | None:
     Fuzzy matching is deliberately not used: a wrong match here would
     credit an item to someone else, permanently.
     """
-    index = {normalize(player): player for player in roster if player.strip()}
+    index: dict[str, str] = {}
+    for player in roster:
+        if not player.strip():
+            continue
+        key = normalize(player)
+        if key in index and index[key] != player:
+            raise RequestParseError(
+                f"{index[key]!r} and {player!r} both normalise to the same "
+                f"name ({key!r}); refusing to guess"
+            )
+        index[key] = player
     wanted = normalize(query)
     if wanted in index:
         return index[wanted]
