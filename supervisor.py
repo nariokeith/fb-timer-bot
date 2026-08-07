@@ -234,6 +234,7 @@ CHILDREN = [
         "timer", [sys.executable, "-u", "bot.py"], no_restart_codes=frozenset()
     ),
     ChildSpec("attendance", [sys.executable, "-u", "attendance_bot.py"]),
+    ChildSpec("items", [sys.executable, "-u", "items_bot.py"]),
 ]
 
 

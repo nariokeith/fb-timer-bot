@@ -20,3 +20,9 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: ITEMS_DISCORD_TOKEN
+        sync: false
+      - key: ITEMS_SHEET_ID
+        sync: false
+      - key: ITEMS_GEAR_DAILY_CAP
+        value: "3"

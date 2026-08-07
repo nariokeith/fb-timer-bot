@@ -20,7 +20,7 @@
 - All blocking `gspread` calls go through `asyncio.to_thread`; every read-then-write sequence is serialized by a module-level `asyncio.Lock`.
 - The `Gear Logs` tab is still being edited by the user. Never cache or hardcode an item list — read headers live on every request.
 - Reuse, do not reimplement: `attendance_roster.normalize` / `match_names`, `attendance_sheet.open_spreadsheet` / `read_headers` / `read_players` / `find_column` / `get_or_create_tab` / `SheetStructureError`, `attendance_bosses.header_base`.
-- Run tests with `.venv/bin/pytest`. Commit after every task.
+- Run tests with `.venv/bin/python -m pytest` (NOT `.venv/bin/pytest` — that does not put the repo root on sys.path, so every `import items_*` fails at collection). Commit after every task.
 
 ---
 
@@ -84,7 +84,7 @@ def test_now_pht_is_timezone_aware_in_manila():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'items_rules'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -169,7 +169,7 @@ def gear_used_today(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Add the cap-counting tests**
@@ -209,7 +209,7 @@ def test_short_rows_are_skipped_not_fatal():
 
 - [ ] **Step 6: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 7: Commit**
@@ -258,10 +258,28 @@ def test_matching_ignores_case():
     assert found.name == "Asta's Belt"
 
 
-def test_an_unknown_item_is_refused_with_near_misses_named():
+def test_a_partial_item_name_is_refused_but_lists_the_matches():
+    """A member who types 'Asta' should be shown the Asta items.
+
+    difflib scores 'Asta' against "Asta's Heart" at 0.5, so this only
+    works because _suggest searches substrings before close matches.
+    """
     with pytest.raises(items_rules.ItemLookupError) as exc:
         items_rules.resolve_item("Asta", SPECIAL_HEADERS, GEAR_HEADERS)
     assert "Asta's Heart" in str(exc.value)
+
+
+def test_a_typo_is_refused_but_offers_the_close_match():
+    """No substring overlap here -- this is the close-match path."""
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_item("Astas Hesrt", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "Asta's Heart" in str(exc.value)
+
+
+def test_an_item_resembling_nothing_gets_no_suggestions():
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_item("zzzzzzzz", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "Did you mean" not in str(exc.value)
 
 
 def test_an_item_in_both_tabs_is_refused_rather_than_guessed():
@@ -282,7 +300,7 @@ def test_a_blank_query_is_refused():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -k resolve -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -k resolve -v`
 Expected: FAIL with `AttributeError: module 'items_rules' has no attribute 'resolve_item'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -323,6 +341,24 @@ def item_names(headers: list[str]) -> list[str]:
     return names
 
 
+def _suggest(query: str, names: list[str]) -> list[str]:
+    """Item names worth offering after a failed lookup.
+
+    Substring hits come first and carry the weight: a member who types
+    'Asta' wants to see every Asta item, but difflib scores 'Asta'
+    against "Asta's Heart" at 0.5 -- below any cutoff loose enough to be
+    safe -- so close-matching alone would offer nothing at all. Close
+    matches still follow, to catch the transposed-letter typo that a
+    substring search cannot.
+    """
+    wanted = normalize(query)
+    hits = [name for name in names if wanted and wanted in normalize(name)]
+    for name in get_close_matches(query, names, n=3, cutoff=0.6):
+        if name not in hits:
+            hits.append(name)
+    return hits[:3]
+
+
 def _exact(query: str, names: list[str]) -> str | None:
     wanted = normalize(query)
     for name in names:
@@ -361,14 +397,14 @@ def resolve_item(
     if in_gear:
         return ResolvedItem(name=in_gear, type=GEAR)
 
-    suggestions = get_close_matches(query, specials + gears, n=3, cutoff=0.6)
+    suggestions = _suggest(query, specials + gears)
     hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
     raise ItemLookupError(f"No item column named {query!r}.{hint}")
 ```
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -466,7 +502,7 @@ def test_an_alias_whose_target_is_absent_does_not_resolve():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -k parse -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -k parse -v`
 Expected: FAIL with `AttributeError: module 'items_rules' has no attribute 'parse_request'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -572,7 +608,7 @@ def parse_request(
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -657,7 +693,7 @@ def test_the_cap_is_configurable():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -k eligib -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -q`
 Expected: FAIL with `AttributeError: module 'items_rules' has no attribute 'check_eligibility'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -718,7 +754,7 @@ def check_eligibility(
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_rules.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_rules.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -811,7 +847,7 @@ def test_new_request_ids_are_unique():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_state.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_state.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'items_state'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -962,7 +998,7 @@ def decode_state(content: str) -> State | None:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_state.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_state.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Write the failing test for queue operations**
@@ -1004,7 +1040,7 @@ def test_removing_an_already_removed_request_returns_none():
 
 - [ ] **Step 6: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_state.py -k "pending or find or remove" -v`
+Run: `.venv/bin/python -m pytest tests/test_items_state.py -k "pending or find or remove" -v`
 Expected: FAIL with `AttributeError: module 'items_state' has no attribute 'pending_gear_for'`
 
 - [ ] **Step 7: Implement the queue operations**
@@ -1047,7 +1083,7 @@ Add `from attendance_roster import normalize` re-export usage: `items_rules` alr
 
 - [ ] **Step 8: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_state.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_state.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 9: Commit**
@@ -1145,14 +1181,21 @@ def test_holds_special_is_false_for_an_unknown_player_or_item():
     assert items_sheet.holds_special(snapshot, "Kobe", "No Such Item") is False
 
 
-def test_holds_special_needs_no_further_api_calls():
-    """The panel calls this once per line; it must not re-read the sheet."""
-    spreadsheet = make_spreadsheet()
-    snapshot = items_sheet.read_snapshot(spreadsheet)
-    worksheet = spreadsheet.worksheet(items_sheet.SPECIAL_TAB)
-    before = len(worksheet.get_all_values())
-    items_sheet.holds_special(snapshot, "Kobe", "Asta's Heart")
-    assert len(worksheet.get_all_values()) == before
+def test_holds_special_works_from_a_snapshot_alone():
+    """The panel calls this once per line, so it must not re-read the sheet.
+
+    Constructing the Snapshot by hand -- with no spreadsheet in reach --
+    is what proves it: if the implementation reached for the API, there
+    would be nothing here to reach for.
+    """
+    snapshot = items_sheet.Snapshot(
+        roster=["Kobe"],
+        special_headers=SPECIAL_GRID[0],
+        gear_headers=[],
+        ledger_rows=[],
+        special_grid=SPECIAL_GRID,
+    )
+    assert items_sheet.holds_special(snapshot, "Kobe", "Asta's Heart") is True
 
 
 def test_find_row_locates_a_player_case_insensitively():
@@ -1169,7 +1212,7 @@ def test_find_row_refuses_an_unknown_player():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_sheet.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_sheet.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'items_sheet'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1330,7 +1373,7 @@ def holds_special(snapshot: Snapshot, ign: str, item: str) -> bool:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_sheet.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_sheet.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -1510,7 +1553,7 @@ def test_a_failed_ledger_append_is_reported_as_its_own_unretryable_error(monkeyp
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_sheet.py -k record -v`
+Run: `.venv/bin/python -m pytest tests/test_items_sheet.py -k record -v`
 Expected: FAIL with `AttributeError: module 'items_sheet' has no attribute 'record_special'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1662,7 +1705,7 @@ def commit_approval(
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_sheet.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_sheet.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -1857,7 +1900,7 @@ def test_saving_twice_edits_the_same_message_rather_than_posting_again():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'items_bot'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1994,7 +2037,7 @@ async def load_state(channel) -> bool:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Add the setofficerchannel command and its test**
@@ -2054,7 +2097,7 @@ def test_is_officer_channel_is_false_before_setup():
 
 - [ ] **Step 6: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 7: Commit**
@@ -2216,7 +2259,7 @@ def test_a_duplicate_is_refused_even_from_a_different_account():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -k evaluate -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -q`
 Expected: FAIL with `AttributeError: module 'items_bot' has no attribute 'evaluate_request'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -2364,7 +2407,7 @@ async def request_cmd(ctx, *, argument: str = ""):
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Commit**
@@ -2409,7 +2452,7 @@ def test_panel_lines_number_each_request_and_show_its_status():
         cap=3,
         today="2026-08-07",
     )
-    assert lines[0].startswith("1.")
+    assert lines[0].startswith("**1.")
     assert "Dajz" in lines[0] and "Asta's Heart" in lines[0]
     assert "2/3" in lines[1], "a gear line shows how many the player used today"
 
@@ -2598,7 +2641,7 @@ Add near the top of the test file, so `_noop_save` is defined before use at impo
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -k "panel or approve or deny" -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -k "panel or approve or deny" -v`
 Expected: FAIL with `AttributeError: module 'items_bot' has no attribute 'panel_lines'`
 
 - [ ] **Step 3: Implement the panel rendering and the resolve functions**
@@ -2743,7 +2786,7 @@ async def approve(request_id: str, officer_name: str) -> str:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -v`
 Expected: PASS (all tests in the file)
 
 - [ ] **Step 5: Add the view and the command**
@@ -2920,7 +2963,7 @@ async def distribute_cmd(ctx):
 
 - [ ] **Step 6: Run the tests**
 
-Run: `.venv/bin/pytest tests/ -v`
+Run: `.venv/bin/python -m pytest tests/ -v`
 Expected: PASS — all item tests plus the existing attendance suite unchanged
 
 - [ ] **Step 7: Commit**
@@ -2996,7 +3039,7 @@ def test_cancellable_reports_when_nothing_is_pending():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_items_bot.py -k "cancellable or requests_for" -v`
+Run: `.venv/bin/python -m pytest tests/test_items_bot.py -k "cancellable or requests_for" -v`
 Expected: FAIL with `AttributeError: module 'items_bot' has no attribute 'requests_for_user'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -3139,7 +3182,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/ -v`
+Run: `.venv/bin/python -m pytest tests/ -v`
 Expected: PASS — all suites
 
 - [ ] **Step 5: Commit**
@@ -3170,7 +3213,7 @@ git commit -m "Add member helper commands and bot startup"
 
 
 def test_the_item_bot_is_supervised():
-    names = [spec.name for spec in supervisor.CHILDREN]
+    names = [spec.name for spec in CHILDREN]
     assert "items" in names
 
 
@@ -3181,14 +3224,16 @@ def test_the_item_bot_stays_stopped_when_not_configured():
     for the same shared resources, which is exactly what the default
     NO_RESTART_CODES policy exists to prevent.
     """
-    spec = next(s for s in supervisor.CHILDREN if s.name == "items")
-    assert not supervisor.should_restart(78, spec.no_restart_codes)
+    spec = next(s for s in CHILDREN if s.name == "items")
+    assert not should_restart(EXIT_NOT_CONFIGURED, spec.no_restart_codes)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/pytest tests/test_supervisor.py -k item -v`
+Run: `.venv/bin/python -m pytest tests/test_supervisor.py -k item -v`
 Expected: FAIL with `AssertionError: assert 'items' in ['timer', 'attendance']`
+
+Note: `tests/test_supervisor.py` already does `from supervisor import CHILDREN, EXIT_NOT_CONFIGURED, NO_RESTART_CODES, ChildSpec, Supervisor, should_restart` — use those bare names, do not add a `supervisor.` prefix or a new import.
 
 - [ ] **Step 3: Add the child spec**
 
@@ -3209,7 +3254,7 @@ CHILDREN = [
 
 - [ ] **Step 4: Run the tests**
 
-Run: `.venv/bin/pytest tests/test_supervisor.py -v`
+Run: `.venv/bin/python -m pytest tests/test_supervisor.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Add the env vars to render.yaml**
@@ -3250,7 +3295,7 @@ Add a section covering: the three commands, the two rules, the `!setofficerchann
 
 - [ ] **Step 8: Run the full suite**
 
-Run: `.venv/bin/pytest tests/ -v`
+Run: `.venv/bin/python -m pytest tests/ -v`
 Expected: PASS — including every pre-existing attendance and supervisor test, unchanged
 
 - [ ] **Step 9: Commit**

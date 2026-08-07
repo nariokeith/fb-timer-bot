@@ -209,6 +209,33 @@ Two fail-closed behaviours are deliberate, not bugs — expect them:
   note, a formula, `1,000`, `3.7`) makes the bot refuse rather than
   overwrite it. The error names the cell.
 
+## Item distribution
+
+Members request items from the separate item-distribution bot:
+
+| Command | What it does |
+|---|---|
+| `!request <item name> <IGN>` | Request an item, for example `!request Asta's Heart Kobe`. |
+| `!myrequests` | List your pending requests. |
+| `!cancelrequest [item name]` | Withdraw a pending request; name the item when you have more than one. |
+
+Two rules are enforced from the spreadsheet: a special log can be received
+once per player, ever; gear logs are limited to three per player per day,
+resetting at midnight in Manila time. An IGN must match the player's row in
+the Logs Tracker sheet.
+
+An administrator must first run `!setofficerchannel` in the private officer
+channel. That channel is where officers run `!distribute` and approve or deny
+requests; the bot stores its pending queue in a pinned message there.
+
+Create a third Discord application and enable **Message Content Intent** for
+its bot. Invite it with **View Channels**, **Send Messages**, **Embed Links**,
+**Read Message History**, and **Manage Messages** permissions. Share the Logs
+Tracker spreadsheet with the Google service account's `client_email` as an
+**Editor**. On Render, set `ITEMS_DISCORD_TOKEN`, `ITEMS_SHEET_ID`, and
+`GOOGLE_SERVICE_ACCOUNT_JSON`; `ITEMS_GEAR_DAILY_CAP` is optional and defaults
+to `3`.
+
 ## Deploy 24/7 on Render (free tier)
 
 Free-tier services sleep after 15 minutes without web traffic, so the bot runs a tiny web server and an external pinger keeps it awake. State is mirrored to a pinned Discord message because Render wipes the disk on every restart.
