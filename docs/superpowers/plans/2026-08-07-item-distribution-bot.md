@@ -1145,14 +1145,21 @@ def test_holds_special_is_false_for_an_unknown_player_or_item():
     assert items_sheet.holds_special(snapshot, "Kobe", "No Such Item") is False
 
 
-def test_holds_special_needs_no_further_api_calls():
-    """The panel calls this once per line; it must not re-read the sheet."""
-    spreadsheet = make_spreadsheet()
-    snapshot = items_sheet.read_snapshot(spreadsheet)
-    worksheet = spreadsheet.worksheet(items_sheet.SPECIAL_TAB)
-    before = len(worksheet.get_all_values())
-    items_sheet.holds_special(snapshot, "Kobe", "Asta's Heart")
-    assert len(worksheet.get_all_values()) == before
+def test_holds_special_works_from_a_snapshot_alone():
+    """The panel calls this once per line, so it must not re-read the sheet.
+
+    Constructing the Snapshot by hand -- with no spreadsheet in reach --
+    is what proves it: if the implementation reached for the API, there
+    would be nothing here to reach for.
+    """
+    snapshot = items_sheet.Snapshot(
+        roster=["Kobe"],
+        special_headers=SPECIAL_GRID[0],
+        gear_headers=[],
+        ledger_rows=[],
+        special_grid=SPECIAL_GRID,
+    )
+    assert items_sheet.holds_special(snapshot, "Kobe", "Asta's Heart") is True
 
 
 def test_find_row_locates_a_player_case_insensitively():
