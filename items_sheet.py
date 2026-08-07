@@ -148,3 +148,144 @@ def holds_special(snapshot: Snapshot, ign: str, item: str) -> bool:
             return False
         return row[column - 1].strip().casefold() in CHECKED_VALUES
     return False
+
+
+class LedgerWriteError(RuntimeError):
+    """The item cell was written but the ledger row was not.
+
+    This is NOT retryable, which is why it is its own type. Retrying
+    would increment a gear count a second time, and a special-log retry
+    could never succeed at all -- record_special refuses a checkbox that
+    is now ticked. The caller must drop the request and tell the
+    officers exactly which row to add by hand.
+    """
+
+    def __init__(self, address: str, row: list[str], cause: Exception):
+        super().__init__(
+            f"Wrote {address} but could not append the ledger row: {cause}"
+        )
+        self.address = address
+        self.row = row
+
+
+def _worksheet_or_refuse(spreadsheet, title: str):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        raise SheetStructureError(
+            f"Worksheet {title!r} does not exist in this spreadsheet yet"
+        ) from None
+
+
+def _cell(grid: list[list[str]], row: int, column: int) -> str:
+    cells = grid[row - 1] if len(grid) >= row else []
+    return cells[column - 1] if len(cells) >= column else ""
+
+
+def record_special(spreadsheet, ign: str, item: str) -> str:
+    """Tick this player's checkbox. Returns the A1 address written.
+
+    Refuses if it is already ticked. That is the special-log rule
+    enforced at the last possible moment -- the officer's click may be
+    minutes after the request was queued, and the sheet may have been
+    edited by hand in between.
+    """
+    worksheet = _worksheet_or_refuse(spreadsheet, SPECIAL_TAB)
+    grid = worksheet.get_all_values()
+    row = find_row(worksheet, ign, grid)
+    column = find_column(worksheet, item, grid)
+
+    if _cell(grid, row, column).strip().casefold() in CHECKED_VALUES:
+        raise SheetStructureError(
+            f"{ign} already has {item!r} -- a special log is once only"
+        )
+
+    address = gspread.utils.rowcol_to_a1(row, column)
+    worksheet.batch_update([{"range": address, "values": [[True]]}])
+    return address
+
+
+def record_gear(spreadsheet, ign: str, item: str) -> str:
+    """Add one to this player's count. Returns the A1 address written."""
+    worksheet = _worksheet_or_refuse(spreadsheet, GEAR_TAB)
+    grid = worksheet.get_all_values()
+    row = find_row(worksheet, ign, grid)
+    column = find_column(worksheet, item, grid)
+
+    raw = _cell(grid, row, column).strip()
+    if not raw:
+        current = 0
+    else:
+        try:
+            current = int(raw)
+        except ValueError:
+            raise SheetStructureError(
+                f"Cell for {ign} / {item!r} holds {raw!r}, which is not a "
+                "number; refusing to overwrite a value this bot does not "
+                "understand"
+            ) from None
+
+    address = gspread.utils.rowcol_to_a1(row, column)
+    worksheet.batch_update([{"range": address, "values": [[current + 1]]}])
+    return address
+
+
+def append_ledger_row(
+    spreadsheet,
+    *,
+    timestamp: str,
+    ign: str,
+    item: str,
+    item_type: str,
+    officer: str,
+    user_id: int,
+    request_id: str,
+) -> None:
+    """Append one audit row, creating the tab on first use."""
+    worksheet = get_or_create_tab(spreadsheet, LEDGER_TAB, LEDGER_HEADER)
+    worksheet.append_row(
+        [timestamp, ign, item, item_type, officer, str(user_id), request_id]
+    )
+
+
+def commit_approval(
+    spreadsheet,
+    *,
+    ign: str,
+    item: str,
+    item_type: str,
+    timestamp: str,
+    officer: str,
+    user_id: int,
+    request_id: str,
+) -> str:
+    """Write the item cell, then the ledger row. Returns the cell address.
+
+    Cell first, ledger second, deliberately. If the cell write fails
+    there must be no ledger row, or the daily cap would count an item
+    the player never received. The reverse gap (cell written, ledger
+    append fails) undercounts instead, which is recoverable by hand and
+    never denies anyone an item they are owed.
+    """
+    if item_type == items_rules.SPECIAL:
+        address = record_special(spreadsheet, ign, item)
+    elif item_type == items_rules.GEAR:
+        address = record_gear(spreadsheet, ign, item)
+    else:
+        raise SheetStructureError(f"Unknown item type {item_type!r}")
+
+    row = [timestamp, ign, item, item_type, officer, str(user_id), request_id]
+    try:
+        append_ledger_row(
+            spreadsheet,
+            timestamp=timestamp,
+            ign=ign,
+            item=item,
+            item_type=item_type,
+            officer=officer,
+            user_id=user_id,
+            request_id=request_id,
+        )
+    except Exception as exc:
+        raise LedgerWriteError(address, row, exc) from exc
+    return address
