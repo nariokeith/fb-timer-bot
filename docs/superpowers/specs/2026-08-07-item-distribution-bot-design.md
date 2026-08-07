@@ -56,8 +56,14 @@ the two.
 | Tab | Exists? | Cell type | On approval |
 |---|---|---|---|
 | `Special Logs` | yes | checkbox (`TRUE`/`FALSE`) | set to `TRUE` |
-| `Gear Logs` | user will create | integer count | increment by 1 (blank = 0) |
+| `Gear Logs` | in progress — mirrors `Special Logs` | integer count | increment by 1 (blank = 0) |
 | `Distribution Log` | **created by the bot** | append-only rows | append one row |
+
+**The `Gear Logs` tab is still being built** — the user is adding columns. The
+bot therefore reads the header row live on every request and never caches or
+hardcodes an item list, so newly added columns work the moment they are saved,
+with no redeploy. A gear item requested before its column exists is refused by
+name, exactly like any other unknown item.
 
 `Distribution Log` columns, in order:
 
@@ -118,10 +124,18 @@ each individually appearing to be within the cap.
 
 ### `!request <item name> <IGN>` — any member, any channel
 
-Parsing: the **last whitespace-separated token is the IGN**; everything before it
-is the item name. Both parts are free text, so the bot echoes back its
-interpretation ("Requesting **Asta's Heart** for **Kobe**") and a mis-parse is
-visible immediately.
+Parsing: **split by matching, not by position.** Both the item name and the IGN
+can contain spaces, so a fixed split point cannot work — the roster already
+contains `chinchong ni Mumu`. Instead the bot tries every possible split of the
+argument string, and accepts the one whose suffix resolves to a known IGN and
+whose prefix resolves to a known item.
+
+- Exactly one split resolves → use it.
+- No split resolves → refuse, naming whichever part failed and its near misses.
+- More than one split resolves → refuse and show both readings.
+
+The bot echoes its interpretation back ("Requesting **Asta's Heart** for
+**Kobe**") so a mis-parse is visible immediately.
 
 Resolution, both using `attendance_roster.match_names`' fuzzy matcher:
 
@@ -322,6 +336,9 @@ Coverage that matters:
 - State encode/decode round-trip; oversize state drops oldest and warns.
 - Two officers approving the same Request ID → exactly one write.
 - `!distribute` outside the officer channel is ignored.
+- Command parsing where the IGN contains spaces (`chinchong ni Mumu`), where the
+  item name contains spaces, and where both do.
+- A gear item whose column does not exist yet is refused, not created.
 
 ## Success criteria
 
