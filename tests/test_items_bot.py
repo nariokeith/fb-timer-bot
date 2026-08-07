@@ -504,3 +504,49 @@ def test_a_duplicate_is_refused_even_from_a_different_account():
     )
     outcome = _evaluate("Asta's Heart Dajz", state=state, user_id=1)
     assert not outcome.accepted
+
+
+def test_requests_for_user_returns_only_that_users_requests():
+    items_bot._STATE.queue = [
+        _queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL),
+        _queued("b", "Kobe", "Asta's Belt", items_rules.GEAR),
+    ]
+    items_bot._STATE.queue[1] = items_state.PendingRequest(
+        id="b", user_id=2, ign="Kobe", item="Asta's Belt",
+        type=items_rules.GEAR, requested_at="2026-08-07 09:00:00",
+    )
+    mine = items_bot.requests_for_user(items_bot._STATE, 1)
+    assert [r.id for r in mine] == ["a"]
+
+
+def test_cancellable_picks_the_only_pending_request():
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    found, error = items_bot.cancellable(items_bot._STATE, 1, "")
+    assert found.id == "a"
+    assert error is None
+
+
+def test_cancellable_needs_a_name_when_several_are_pending():
+    items_bot._STATE.queue = [
+        _queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL),
+        _queued("b", "Dajz", "Amentis' Foot", items_rules.SPECIAL),
+    ]
+    found, error = items_bot.cancellable(items_bot._STATE, 1, "")
+    assert found is None
+    assert "Asta's Heart" in error
+
+
+def test_cancellable_matches_by_item_name():
+    items_bot._STATE.queue = [
+        _queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL),
+        _queued("b", "Dajz", "Amentis' Foot", items_rules.SPECIAL),
+    ]
+    found, error = items_bot.cancellable(items_bot._STATE, 1, "amentis' foot")
+    assert found.id == "b"
+
+
+def test_cancellable_reports_when_nothing_is_pending():
+    items_bot._STATE.queue = []
+    found, error = items_bot.cancellable(items_bot._STATE, 1, "")
+    assert found is None
+    assert "no pending" in error.lower()

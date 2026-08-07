@@ -598,3 +598,135 @@ async def distribute_cmd(ctx):
         return
 
     await send_panels(ctx, snapshot, list(_STATE.queue))
+
+
+def requests_for_user(state: items_state.State, user_id: int) -> list[items_state.PendingRequest]:
+    return [r for r in state.queue if r.user_id == user_id]
+
+
+def cancellable(
+    state: items_state.State, user_id: int, item_query: str
+) -> tuple[items_state.PendingRequest | None, str | None]:
+    """Which of this member's pending requests !cancelrequest means.
+
+    Returns (request, error_message); exactly one is None.
+    """
+    mine = requests_for_user(state, user_id)
+    if not mine:
+        return None, "You have no pending requests."
+
+    query = item_query.strip()
+    if not query:
+        if len(mine) == 1:
+            return mine[0], None
+        names = ", ".join(f"`{r.item}`" for r in mine)
+        return None, f"You have several pending: {names}. Say which: `!cancelrequest <item name>`"
+
+    wanted = items_rules.normalize(query)
+    for request in mine:
+        if items_rules.normalize(request.item) == wanted:
+            return request, None
+    return None, f"You have no pending request for {query!r}."
+
+
+@bot.command(name="cancelrequest")
+async def cancelrequest_cmd(ctx, *, item_query: str = ""):
+    """Withdraw your own pending request."""
+    async with _SHEET_LOCK:
+        request, error = cancellable(_STATE, ctx.author.id, item_query)
+        if error is not None:
+            await ctx.send(embed=error_embed("Nothing cancelled", error))
+            return
+        items_state.remove_request(_STATE, request.id)
+        channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
+        if channel is not None:
+            await save_state(channel)
+    await ctx.send(
+        embed=ok_embed("Request cancelled", f"Withdrew **{request.item}** for **{request.ign}**.")
+    )
+
+
+@bot.command(name="myrequests")
+async def myrequests_cmd(ctx):
+    """List your pending requests."""
+    mine = requests_for_user(_STATE, ctx.author.id)
+    if not mine:
+        await ctx.send(embed=ok_embed("Nothing pending", "You have no pending requests."))
+        return
+    body = "\n".join(f"• **{r.item}** for **{r.ign}** — requested {r.requested_at}" for r in mine)
+    await ctx.send(embed=_embed("📋 Your Pending Requests", body, 0x3498DB))
+
+
+@bot.command(name="itemhelp")
+async def itemhelp_cmd(ctx):
+    """Explain the commands and the rules."""
+    await ctx.send(
+        embed=_embed(
+            "📦 Item Requests",
+            "**`!request <item name> <IGN>`** — ask for an item. "
+            "Example: `!request Asta's Heart Kobe`\n"
+            "**`!myrequests`** — see what you have pending\n"
+            "**`!cancelrequest [item name]`** — withdraw a request\n\n"
+            "**Rules**\n"
+            "• Special logs: one per player, ever.\n"
+            f"• Gear logs: {gear_cap()} per player per day, resetting at "
+            "midnight (Manila time).\n\n"
+            "Your IGN must match your row in the Logs Tracker sheet.",
+            0x3498DB,
+        )
+    )
+
+
+@bot.event
+async def on_ready():
+    print(f"[items] logged in as {bot.user}", flush=True)
+    if _STATE.officer_channel_id is None:
+        # Nothing to restore from until an admin has named the channel.
+        # Scan every readable text channel's pins once, so a redeploy
+        # recovers without anyone re-running !setofficerchannel.
+        for guild in bot.guilds:
+            for channel in guild.text_channels:
+                try:
+                    if await load_state(channel):
+                        print(f"[items] restored state from #{channel.name}", flush=True)
+                        return
+                except discord.HTTPException:
+                    continue
+        print("[items] no state found; run !setofficerchannel", flush=True)
+        return
+
+    channel = bot.get_channel(_STATE.officer_channel_id)
+    if channel is not None:
+        await load_state(channel)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(embed=error_embed("Not allowed", "That command is for administrators."))
+        return
+    print(f"[items] command error: {error!r}", flush=True)
+    await ctx.send(embed=error_embed("Something went wrong", str(error)))
+
+
+def main() -> None:
+    global _SPREADSHEET
+    missing = missing_credentials(os.environ)
+    if missing:
+        print(
+            f"[items] not configured, missing: {', '.join(missing)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(EXIT_NOT_CONFIGURED)
+
+    _SPREADSHEET = items_sheet.open_logs_tracker(
+        os.environ["ITEMS_SHEET_ID"], os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+    )
+    bot.run(os.environ["ITEMS_DISCORD_TOKEN"])
+
+
+if __name__ == "__main__":
+    main()
