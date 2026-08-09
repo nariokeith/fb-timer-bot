@@ -16,6 +16,7 @@ import asyncio
 import datetime
 import os
 import sys
+from difflib import get_close_matches
 
 import discord
 from discord.ext import commands
@@ -1349,5 +1350,279 @@ async def poll_cmd(ctx, *, argument: str = ""):
             "Raffle open",
             f"**{item}** — answer **{POLL_ANSWER}** above to enter. Closes at "
             f"{raffle.ends_at} PHT. Run `!list {item}` after that.",
+        )
+    )
+
+
+async def poll_voters(message) -> list[items_raffle.Voter]:
+    """Everyone who answered Yes, as (id, nickname) pairs.
+
+    The answer is found by its text rather than by index: an id is only
+    stable for a poll this bot created, and a raffle recorded before a
+    restart must still be readable.
+
+    A voter arrives as a Member when the members intent is on and the
+    guild is cached, and as a User otherwise. Only the Member carries the
+    server nickname, so a User is looked up once over HTTP before giving
+    up on the global name.
+    """
+    poll = getattr(message, "poll", None)
+    if poll is None or not poll.answers:
+        raise LookupError("that message no longer carries a poll")
+
+    answer = next(
+        (a for a in poll.answers if a.text.strip().casefold() == POLL_ANSWER.casefold()),
+        poll.answers[0],
+    )
+
+    guild = getattr(message, "guild", None)
+    voters: list[items_raffle.Voter] = []
+    async for voter in answer.voters():
+        display_name = getattr(voter, "display_name", "")
+        if guild is not None and not isinstance(voter, discord.Member):
+            try:
+                member = await guild.fetch_member(voter.id)
+            except Exception:
+                member = None
+            if member is not None:
+                display_name = member.display_name
+        voters.append(
+            items_raffle.Voter(user_id=voter.id, display_name=display_name)
+        )
+    return voters
+
+
+def render_pool(item: str, split: items_raffle.VoterSplit, winner: str = "") -> str:
+    """The three groups an officer needs, in one description."""
+    lines = [f"**Eligible for {item}** ({len(split.eligible)})"]
+    lines.append(
+        "\n".join(f"{n}. {ign}" for n, ign in enumerate(split.eligible, start=1))
+        or "_nobody_"
+    )
+    if split.already_have:
+        lines.append("")
+        lines.append("**Already has it** (excluded)")
+        lines.append(", ".join(split.already_have))
+    if split.unidentified:
+        lines.append("")
+        lines.append("**Couldn't identify** — sort these out by hand")
+        lines.append(" ".join(f"<@{voter.user_id}>" for voter in split.unidentified))
+    if winner:
+        lines.append("")
+        lines.append(f"🏆 **Winner: {winner}**")
+    return "\n".join(lines)
+
+
+@bot.command(name="list")
+async def list_cmd(ctx, *, argument: str = ""):
+    """Show who is eligible for a closed raffle."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    item_query = argument.strip()
+    raffle = items_state.find_raffle(_STATE, item_query) if item_query else None
+    if raffle is None:
+        await ctx.send(
+            embed=error_embed(
+                "Nothing to list",
+                f"No raffle for {item_query!r}. Usage: `!list <special log name>`",
+            )
+        )
+        return
+
+    if raffle.listed:
+        # Replayed verbatim, never recomputed: the pool a winner is drawn
+        # from must not be able to change between looking and drawing.
+        split = items_raffle.VoterSplit(eligible=list(raffle.eligible))
+        await ctx.send(
+            embed=ok_embed(
+                f"Raffle: {raffle.item}", render_pool(raffle.item, split, raffle.winner)
+            )
+        )
+        return
+
+    now = items_rules.format_timestamp(items_rules.now_pht())
+    if raffle.ends_at > now:
+        await ctx.send(
+            embed=error_embed(
+                "Poll still open",
+                f"**{raffle.item}** closes at {raffle.ends_at} PHT. "
+                "Drawing before then would leave out anyone who has not voted.",
+            )
+        )
+        return
+
+    try:
+        message = await ctx.channel.fetch_message(raffle.message_id)
+        voters = await poll_voters(message)
+    except Exception as exc:
+        await ctx.send(
+            embed=error_embed(
+                "Cannot read the poll",
+                f"The poll message for **{raffle.item}** could not be read "
+                f"({exc}). Run `!poll {raffle.item}` again to hold a new one.",
+            )
+        )
+        return
+
+    async with _SHEET_LOCK:
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        split = items_raffle.classify_voters(
+            voters,
+            snapshot.roster,
+            holds=lambda ign: items_sheet.holds_special(snapshot, ign, raffle.item),
+        )
+        updated = items_state.replace_raffle(
+            _STATE, raffle, eligible=tuple(split.eligible), listed=True
+        )
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+
+    await ctx.send(
+        embed=ok_embed(
+            f"Raffle: {updated.item}", render_pool(updated.item, split, updated.winner)
+        )
+    )
+
+
+@bot.command(name="winner")
+async def winner_cmd(ctx, *, argument: str = ""):
+    """Record the winner of a closed raffle."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    async with _SHEET_LOCK:
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        try:
+            item, ign = items_raffle.split_item_and_ign(
+                argument, items_state.raffle_item_names(_STATE), snapshot.roster
+            )
+        except items_raffle.RaffleArgumentError as exc:
+            await ctx.send(embed=error_embed("Winner refused", str(exc)))
+            return
+
+        raffle = items_state.find_raffle(_STATE, item)
+        now = items_rules.format_timestamp(items_rules.now_pht())
+
+        if raffle.winner:
+            await ctx.send(
+                embed=error_embed(
+                    "Winner refused",
+                    f"**{raffle.item}** has already been drawn: "
+                    f"**{raffle.winner}** won it.",
+                )
+            )
+            return
+        if raffle.ends_at > now:
+            await ctx.send(
+                embed=error_embed(
+                    "Poll still open",
+                    f"**{raffle.item}** closes at {raffle.ends_at} PHT.",
+                )
+            )
+            return
+        if not raffle.listed:
+            await ctx.send(
+                embed=error_embed(
+                    "Winner refused",
+                    f"Run `!list {raffle.item}` first. The winner is checked "
+                    "against the eligible list that command freezes.",
+                )
+            )
+            return
+
+        wanted = items_rules.normalize(ign)
+        on_list = next(
+            (name for name in raffle.eligible if items_rules.normalize(name) == wanted),
+            None,
+        )
+        if on_list is None:
+            suggestions = get_close_matches(ign, list(raffle.eligible), n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            await ctx.send(
+                embed=error_embed(
+                    "Winner refused",
+                    f"**{ign}** is not on the eligible list for "
+                    f"**{raffle.item}**.{hint}",
+                )
+            )
+            return
+
+        try:
+            await asyncio.to_thread(
+                lambda: items_sheet.commit_approval(
+                    _SPREADSHEET,
+                    ign=on_list,
+                    item=raffle.item,
+                    item_type=items_rules.SPECIAL,
+                    timestamp=now,
+                    officer=getattr(ctx.author, "display_name", str(ctx.author)),
+                    user_id=ctx.author.id,
+                    request_id=items_state.new_request_id(),
+                )
+            )
+        except items_sheet.LedgerWriteError as exc:
+            # The checkbox IS ticked. Re-running could only fail against
+            # a ticked box, so the raffle closes and the officer is given
+            # the exact ledger row instead.
+            items_state.replace_raffle(_STATE, raffle, winner=on_list)
+            channel = (
+                bot.get_channel(_STATE.officer_channel_id)
+                if _STATE.officer_channel_id is not None
+                else None
+            )
+            if channel is not None:
+                await save_state(channel)
+            pasteable = " | ".join(exc.row)
+            await ctx.send(
+                embed=error_embed(
+                    "Winner recorded, ledger not",
+                    f"**{on_list}** won **{raffle.item}** and cell "
+                    f"{exc.address} is ticked, but the Distribution Log row "
+                    f"could not be written: {exc}\nDo NOT run this again — "
+                    f"add this row to `{items_sheet.LEDGER_TAB}` by hand:\n"
+                    f"```\n{pasteable}\n```",
+                )
+            )
+            return
+        except Exception as exc:
+            await ctx.send(
+                embed=error_embed(
+                    "Sheet write failed",
+                    f"Nothing was recorded, the raffle is still open: {exc}",
+                )
+            )
+            return
+
+        items_state.replace_raffle(_STATE, raffle, winner=on_list)
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+
+    await ctx.send(
+        embed=ok_embed(
+            "Winner recorded",
+            f"🏆 **{on_list}** wins **{raffle.item}**. Their checkbox in "
+            f"`{items_sheet.SPECIAL_TAB}` is ticked, so they will not be "
+            "eligible for this log again.",
         )
     )
