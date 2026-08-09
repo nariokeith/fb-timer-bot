@@ -313,6 +313,16 @@ async def setofficerchannel_cmd(ctx):
 @commands.has_permissions(administrator=True)
 async def setqueuechannel_cmd(ctx):
     """Record this channel as the member-facing queue board."""
+    if _STATE.officer_channel_id is None:
+        await ctx.send(
+            embed=error_embed(
+                "Not set up yet",
+                "An admin must run `!setofficerchannel` in the officers' "
+                "channel before a queue board can be set.",
+            )
+        )
+        return
+
     previous_channel = (
         bot.get_channel(_STATE.queue_channel_id)
         if _STATE.queue_channel_id is not None

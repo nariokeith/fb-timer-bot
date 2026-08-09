@@ -736,6 +736,71 @@ def test_setqueuechannel_deletes_the_previous_board_message(monkeypatch):
     assert ctx.sent[-1]["embed"].title == "✅ Queue channel set"
 
 
+def test_setqueuechannel_requires_an_officer_channel_before_posting_a_board(monkeypatch):
+    queue_channel = FakeChannel(99)
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: queue_channel)
+    ctx = FakeCtx(queue_channel)
+
+    asyncio.run(items_bot.setqueuechannel_cmd.callback(ctx))
+
+    assert items_bot._STATE.queue_channel_id is None
+    assert items_bot._STATE.board_message_id is None
+    assert len(queue_channel.sent) == 1
+    assert queue_channel.sent[0].embed.title == "❌ Not set up yet"
+    assert "!setofficerchannel" in queue_channel.sent[0].embed.description
+
+
+def test_setqueuechannel_does_not_delete_the_previous_board_without_an_officer_channel(monkeypatch):
+    previous_board = FakeMessage("old board", message_id=7)
+    previous_channel = FakeChannel(88, pins=[previous_board])
+    queue_channel = FakeChannel(99)
+    items_bot._STATE.queue_channel_id = previous_channel.id
+    items_bot._STATE.board_message_id = previous_board.id
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {
+            previous_channel.id: previous_channel,
+            queue_channel.id: queue_channel,
+        }.get(channel_id),
+    )
+    ctx = FakeCtx(queue_channel)
+
+    asyncio.run(items_bot.setqueuechannel_cmd.callback(ctx))
+
+    assert not previous_board.deleted
+    assert items_bot._STATE.queue_channel_id == previous_channel.id
+    assert items_bot._STATE.board_message_id == previous_board.id
+    assert len(queue_channel.sent) == 1
+    assert queue_channel.sent[0].embed.title == "❌ Not set up yet"
+
+
+def test_setqueuechannel_posts_pins_and_saves_the_new_board_with_an_officer_channel(monkeypatch):
+    state_channel = FakeChannel(77)
+    queue_channel = FakeChannel(99)
+    items_bot._STATE.officer_channel_id = state_channel.id
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {
+            state_channel.id: state_channel,
+            queue_channel.id: queue_channel,
+        }.get(channel_id),
+    )
+    ctx = FakeCtx(queue_channel)
+
+    asyncio.run(items_bot.setqueuechannel_cmd.callback(ctx))
+
+    board = queue_channel.sent[0]
+    saved = items_state.decode_state(state_channel.sent[0].content).state
+    assert board.pinned
+    assert items_bot._STATE.queue_channel_id == queue_channel.id
+    assert items_bot._STATE.board_message_id == board.id
+    assert saved.queue_channel_id == queue_channel.id
+    assert saved.board_message_id == board.id
+    assert ctx.sent[-1]["embed"].title == "✅ Queue channel set"
+
+
 class FakeCtx:
     def __init__(self, channel, user_id=1):
         self.channel = channel
