@@ -2622,3 +2622,62 @@ def test_redrawing_a_winner_whose_box_is_already_ticked_says_so(monkeypatch):
     raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
     assert raffle.winner == "Jjew", "the raffle must not stay open forever"
     assert "already" in ctx.sent[-1]["embed"].description.casefold()
+
+
+def _state_fingerprint():
+    """Everything about the raffle set that a rollback must preserve."""
+    return sorted(r.to_dict().items().__str__() for r in items_bot._STATE.raffles)
+
+
+def test_every_poll_failure_path_leaves_the_raffle_set_untouched(monkeypatch):
+    """poll_cmd removes a superseded raffle and an eviction victim before
+    it knows the poll will succeed. Each early return must put both back.
+    """
+    _configured_raffle(monkeypatch)
+    _fill_every_raffle_slot(monkeypatch, ends="2026-08-09 12:00:00", drawn=("Log 0",))
+    # Give one slot a superseded-able raffle for the item we will re-poll.
+    items_bot._STATE.raffles[1] = items_state.Raffle(
+        item="Asta's Heart", channel_id=42, message_id=999,
+        created_at="2026-08-09 01:00:00", ends_at="2020-01-01 00:00:00",
+        listed=True, eligible=("Jjew", "Kobe"),
+    )
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart",
+                                 *[f"Log {n}" for n in range(items_state.MAX_RAFFLES)]))
+    before = _state_fingerprint()
+
+    # 1. Discord rejects the poll.
+    channel = PollRejectingChannel(42)
+    ctx = FakeCtx(channel)
+    ctx.author = FakeMember(roles=[FakeRole(10)])
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+    assert _state_fingerprint() == before, "send failure lost a raffle"
+
+    # 2. The resulting state would not fit in the pinned messages.
+    monkeypatch.setattr(items_state, "fits", lambda state: False)
+    ctx2, _ = _raffle_ctx()
+    asyncio.run(items_bot.poll_cmd.callback(ctx2, argument="Asta's Heart"))
+    assert _state_fingerprint() == before, "capacity refusal lost a raffle"
+    monkeypatch.undo()
+
+
+def test_a_refused_poll_keeps_the_superseded_raffle_listable(monkeypatch):
+    """Not just present in state -- still usable."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    items_bot._STATE.raffles = [items_state.Raffle(
+        item="Asta's Heart", channel_id=42, message_id=999,
+        created_at="2026-08-09 01:00:00", ends_at="2020-01-01 00:00:00",
+        listed=True, eligible=("Jjew",),
+    )]
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda spreadsheet, **kw: "B2")
+    channel = PollRejectingChannel(42)
+    _register_channel(channel)
+    ctx = FakeCtx(channel)
+    ctx.author = FakeMember(roles=[FakeRole(10)])
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert "Jjew" in ctx.sent[-1]["embed"].description
+    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winner == "Jjew"
