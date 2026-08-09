@@ -5,21 +5,25 @@ Discord token and its own spreadsheet, so nothing it does can affect
 either of them. See supervisor.py for why all three share one Render
 service.
 
-Authorization is the private officer channel itself: !distribute is
-accepted only there, and a button attached to a message in that channel
-can only be pressed by someone Discord already lets see the channel.
-There is no role configuration to drift.
+Authorization has two shapes. !distribute is accepted only in the private
+officer channel, so a button there can only be pressed by someone Discord
+already lets see the channel. The raffle commands cannot work that way --
+the poll must be visible to members -- so they are gated on configured
+roles instead.
 """
 
 import asyncio
+import datetime
 import os
 import sys
+from difflib import get_close_matches
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
 import items_rules
+import items_raffle
 import items_board
 import items_sheet
 import items_state
@@ -53,6 +57,12 @@ _SPREADSHEET = None
 
 intents = discord.Intents.default()
 intents.message_content = True
+# Poll voters arrive as Members only when this intent is on; otherwise
+# discord.py yields Users, whose display_name is the global name rather
+# than the 'BK | Jjew' server nickname the roster match reads. It is a
+# privileged intent and must also be enabled for this application in the
+# Discord Developer Portal.
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
@@ -377,6 +387,145 @@ async def setqueuechannel_cmd(ctx):
             "Queue channel set",
             f"The member queue board is now in {ctx.channel.mention}. The bot "
             "will keep it updated and pinned here.",
+        )
+    )
+
+
+# raffle_access returns this instead of a message when the command should
+# produce no reply at all. A distinct object rather than None, because
+# None already means "permitted".
+IGNORE = "\x00ignore"
+
+
+def has_raffle_role(author, role_ids: list[int]) -> bool:
+    """True if the author holds ANY configured raffle role."""
+    wanted = set(role_ids or ())
+    if not wanted:
+        return False
+    return any(role.id in wanted for role in getattr(author, "roles", []))
+
+
+def raffle_access(ctx) -> str | None:
+    """None if this raffle command may run, else a refusal or IGNORE.
+
+    Wrong-channel is silent: a raffle command typed elsewhere is far more
+    likely to be a typo than an attack, and a reply would only advertise
+    that the channel exists. The unconfigured case is the exception --
+    silence there is a dead end, so the one person who can fix it is told
+    and nobody else is.
+    """
+    if _STATE.raffle_channel_id is None:
+        permissions = getattr(ctx.author, "guild_permissions", None)
+        if getattr(permissions, "administrator", False):
+            return (
+                "No raffle channel is set. Run `!setrafflechannel` in the "
+                "channel where special log polls should be posted."
+            )
+        return IGNORE
+
+    if ctx.channel.id != _STATE.raffle_channel_id:
+        return IGNORE
+
+    if not _STATE.raffle_role_ids:
+        return (
+            "No raffle role is set. An admin must run "
+            "`!setraffleroles @role` before the raffle commands work."
+        )
+    if not has_raffle_role(ctx.author, _STATE.raffle_role_ids):
+        return "You need a raffle role to run this command."
+    return None
+
+
+async def _refuse_raffle(ctx, verdict: str) -> bool:
+    """Send the refusal if there is one. True when the caller must stop."""
+    if verdict is None:
+        return False
+    if verdict is not IGNORE:
+        await ctx.send(embed=error_embed("Not allowed", verdict))
+    return True
+
+
+@bot.command(name="setraffleroles")
+@commands.has_permissions(administrator=True)
+async def setraffleroles_cmd(ctx, *roles: discord.Role):
+    """Choose which roles may run the raffle commands."""
+    if not roles:
+        await ctx.send(
+            embed=error_embed(
+                "Which role?",
+                "Usage: `!setraffleroles @role [@role ...]`\n"
+                "Every role you list replaces the current set.",
+            )
+        )
+        return
+
+    # Deduplicated by id, order preserved, so mentioning a role twice
+    # does not store it twice. Keyed on the id rather than the object so
+    # this never depends on Role being hashable.
+    unique: dict[int, discord.Role] = {}
+    for role in roles:
+        unique.setdefault(role.id, role)
+
+    # Under the lock like every other state write: without it this can
+    # encode a raffle mid-draw, suspend inside message.edit, and land
+    # last -- persisting a winner-less copy of a raffle already ticked
+    # into the sheet.
+    async with _SHEET_LOCK:
+        previous = list(_STATE.raffle_role_ids)
+        _STATE.raffle_role_ids = list(unique)
+        if not items_state.fits(_STATE):
+            _STATE.raffle_role_ids = previous
+            await ctx.send(
+                embed=error_embed(
+                    "Too many roles",
+                    f"{len(unique)} roles will not fit in the bot's storage. "
+                    "Name fewer roles, or give one role to everyone who runs "
+                    "the raffle.",
+                )
+            )
+            return
+
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+    mentions = ", ".join(role.mention for role in unique.values())
+    await ctx.send(
+        embed=ok_embed(
+            "Raffle roles set",
+            f"{mentions} can now run `!poll`, `!list` and `!winner`.",
+        )
+    )
+
+
+@bot.command(name="setrafflechannel")
+@commands.has_permissions(administrator=True)
+async def setrafflechannel_cmd(ctx):
+    """Record this channel as the special log raffle channel."""
+    if _STATE.officer_channel_id is None:
+        await ctx.send(
+            embed=error_embed(
+                "Not set up yet",
+                "An admin must run `!setofficerchannel` in the officers' "
+                "channel before a raffle channel can be set.",
+            )
+        )
+        return
+
+    # Under the lock for the same reason as !setraffleroles: a config
+    # save that interleaves with a draw must not persist a stale copy.
+    async with _SHEET_LOCK:
+        _STATE.raffle_channel_id = ctx.channel.id
+        channel = bot.get_channel(_STATE.officer_channel_id)
+        if channel is not None:
+            await save_state(channel)
+    await ctx.send(
+        embed=ok_embed(
+            "Raffle channel set",
+            f"`!poll`, `!list` and `!winner` now work in {ctx.channel.mention}.",
         )
     )
 
@@ -945,6 +1094,46 @@ def requests_for_user(state: items_state.State, user_id: int) -> list[items_stat
     return [r for r in state.queue if r.user_id == user_id]
 
 
+def drop_special_requests(state: items_state.State) -> list[items_state.PendingRequest]:
+    """Remove every queued special log request, returning them.
+
+    Special logs are raffled now. A request queued under the old rules
+    can no longer be approved into a sensible outcome, and leaving it in
+    the queue would show members a board line that never resolves.
+    """
+    dropped = [r for r in state.queue if r.type == items_rules.SPECIAL]
+    for request in dropped:
+        state.queue.remove(request)
+    return dropped
+
+
+async def announce_dropped_specials(channel) -> None:
+    """Drop stranded special requests and tell the officers who was waiting.
+
+    Called from BOTH restore paths in on_ready. The pin-scanning path
+    recovers a queue just as completely as the configured-channel one, so
+    skipping it there would leave the stranded requests alive on exactly
+    the redeploy that has no officer channel configured yet.
+    """
+    dropped = drop_special_requests(_STATE)
+    if not dropped:
+        return
+
+    await save_state(channel)
+    await refresh_board()
+    lines = "\n".join(
+        f"• **{r.item}** for **{r.ign}** (<@{r.user_id}>)" for r in dropped
+    )
+    await channel.send(
+        embed=error_embed(
+            "Special log requests removed",
+            "Special logs are raffled now, so these queued requests "
+            f"were dropped:\n{lines}\n\nTell these members to answer "
+            "the poll in the raffle channel instead.",
+        )
+    )
+
+
 def cancellable(
     state: items_state.State, user_id: int, item_query: str
 ) -> tuple[items_state.PendingRequest | None, str | None]:
@@ -1002,21 +1191,45 @@ async def myrequests_cmd(ctx):
 @bot.command(name="itemhelp")
 async def itemhelp_cmd(ctx):
     """Explain the commands and the rules."""
-    await ctx.send(
-        embed=_embed(
-            "📦 Item Requests",
-            "**`!request <item name> <IGN>`** — ask for an item. "
-            "Example: `!request Asta's Heart Kobe`\n"
-            "**`!myrequests`** — see what you have pending\n"
-            "**`!cancelrequest [item name]`** — withdraw a request\n\n"
-            "**Rules**\n"
-            "• Special logs: one per player, ever.\n"
-            f"• Gear logs: {gear_cap()} per player per day, resetting at "
-            "midnight (Manila time).\n\n"
-            "Your IGN must match your row in the Logs Tracker sheet.",
-            0x3498DB,
-        )
+    embed = _embed(
+        "📦 Item Requests",
+        "**`!request <item name> <IGN>`** — ask for a **gear log**. "
+        "Example: `!request Asta's Belt Kobe`\n"
+        "**`!myrequests`** — see what you have pending\n"
+        "**`!cancelrequest [item name]`** — withdraw a request\n\n"
+        "**Rules**\n"
+        f"• Gear logs: {gear_cap()} per player per day, resetting at "
+        "midnight (Manila time).\n"
+        "• Special logs cannot be requested — they are raffled.\n\n"
+        "Your IGN must match your row in the Logs Tracker sheet.",
+        0x3498DB,
     )
+    embed.add_field(
+        name="🎲 Special log raffle",
+        value=(
+            "Special logs are drawn from a poll, not a queue. Answer **Yes** "
+            "on the poll in the raffle channel to enter. A log you already "
+            "have is skipped automatically.\n\n"
+            "_Raffle roles only:_\n"
+            "**`!poll <special log> [--hours N]`** — open a poll "
+            f"({items_raffle.DEFAULT_POLL_HOURS}h by default)\n"
+            "**`!list <special log>`** — after it closes, who is eligible\n"
+            "**`!winner <special log> <IGN>`** — record the draw"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚙️ Admins",
+        value=(
+            "**`!setofficerchannel`** — run first; the bot stores its queue "
+            "here\n"
+            "**`!setqueuechannel`** — pin a public queue board\n"
+            "**`!setraffleroles @role [@role ...]`** — who may run the raffle\n"
+            "**`!setrafflechannel`** — where polls are posted"
+        ),
+        inline=False,
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.event
@@ -1031,6 +1244,7 @@ async def on_ready():
                 try:
                     if await load_state(channel):
                         print(f"[items] restored state from #{channel.name}", flush=True)
+                        await announce_dropped_specials(channel)
                         return
                 except discord.HTTPException:
                     continue
@@ -1040,6 +1254,7 @@ async def on_ready():
     channel = bot.get_channel(_STATE.officer_channel_id)
     if channel is not None:
         await load_state(channel)
+        await announce_dropped_specials(channel)
 
 
 @bot.event
@@ -1070,5 +1285,564 @@ def main() -> None:
     bot.run(os.environ["ITEMS_DISCORD_TOKEN"])
 
 
+
+POLL_ANSWER = "Yes"
+
+
+def build_poll(item: str, hours: int) -> discord.Poll:
+    """A single-answer poll: voting is entering, so there is nothing to read."""
+    poll = discord.Poll(
+        question=item, duration=datetime.timedelta(hours=hours)
+    )
+    poll.add_answer(text=POLL_ANSWER)
+    return poll
+
+
+@bot.command(name="poll")
+async def poll_cmd(ctx, *, argument: str = ""):
+    """Open a raffle for one special log."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    try:
+        parsed = items_raffle.parse_poll_argument(argument)
+    except items_raffle.RaffleArgumentError as exc:
+        await ctx.send(embed=error_embed("Poll refused", str(exc)))
+        return
+
+    async with _SHEET_LOCK:
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        try:
+            item = items_rules.resolve_special(
+                parsed.item_query, snapshot.special_headers, snapshot.gear_headers
+            )
+        except items_rules.ItemLookupError as exc:
+            await ctx.send(embed=error_embed("Poll refused", str(exc)))
+            return
+
+        now = items_rules.now_pht()
+        now_text = items_rules.format_timestamp(now)
+        existing = items_state.find_raffle(_STATE, item)
+        if existing is not None and existing.ends_at > now_text and not existing.winner:
+            await ctx.send(
+                embed=error_embed(
+                    "Poll refused",
+                    f"A raffle for **{item}** is already open. It closes at "
+                    f"{existing.ends_at} PHT.",
+                )
+            )
+            return
+
+        # An earlier raffle for this item that ended without a winner is
+        # superseded, not kept. find_raffle only ever returns the newest
+        # raffle for a name, so leaving the old one behind would make it
+        # unreachable by !list and !winner AND unevictable (eviction takes
+        # only drawn raffles) -- a slot leaked until someone edited the
+        # pinned state by hand. A drawn raffle is real history and stays.
+        superseded = existing if existing is not None and not existing.winner else None
+        if superseded is not None:
+            _STATE.raffles.remove(superseded)
+
+        allowed, victim = items_state.raffle_to_evict(_STATE)
+        if not allowed:
+            if superseded is not None:
+                _STATE.raffles.append(superseded)
+            await ctx.send(
+                embed=error_embed(
+                    "Poll refused",
+                    f"All {items_state.MAX_RAFFLES} tracked raffles are still "
+                    "waiting for a winner. Run `!winner` on one of them "
+                    "first — the bot will not discard a raffle you have not "
+                    "drawn yet.",
+                )
+            )
+            return
+
+        try:
+            message = await ctx.channel.send(poll=build_poll(item, parsed.hours))
+        except Exception as exc:
+            # Nothing has been given up yet: the victim is still in state
+            # and the superseded raffle goes back, because no replacement
+            # poll exists to supersede it.
+            if superseded is not None:
+                _STATE.raffles.append(superseded)
+            await ctx.send(embed=error_embed("Could not post the poll", str(exc)))
+            return
+
+        # Paid for only now that Discord has accepted the poll.
+        if victim is not None:
+            _STATE.raffles.remove(victim)
+
+        # Recorded only once Discord has confirmed the message, so a
+        # failed post can never leave a raffle pointing at nothing.
+        raffle = items_state.Raffle(
+            item=item,
+            channel_id=ctx.channel.id,
+            message_id=message.id,
+            created_at=now_text,
+            ends_at=items_rules.format_timestamp(
+                now + datetime.timedelta(hours=parsed.hours)
+            ),
+        )
+        _STATE.raffles.append(raffle)
+
+        if not items_state.fits(_STATE):
+            # Put back everything the attempt spent. The victim was
+            # removed to pay for a raffle that is not being kept, and
+            # losing a drawn raffle's record is not an acceptable price
+            # for a poll that was never recorded.
+            _STATE.raffles.remove(raffle)
+            if victim is not None:
+                _STATE.raffles.append(victim)
+            if superseded is not None:
+                _STATE.raffles.append(superseded)
+            _STATE.raffles.sort(key=lambda r: r.created_at)
+            await ctx.send(
+                embed=error_embed(
+                    "Poll not recorded",
+                    "The bot's storage is full, so this raffle could not be "
+                    "saved. The poll above will not be tracked -- delete it, "
+                    "clear the request queue, and try again.",
+                )
+            )
+            return
+
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+
+    note = ""
+    if superseded is not None:
+        note = (
+            f"\n\n⚠️ This **replaces** the earlier raffle for **{item}** that "
+            "closed without a winner. Its entry list is gone."
+        )
+    await ctx.send(
+        embed=ok_embed(
+            "Raffle open",
+            f"**{item}** — answer **{POLL_ANSWER}** above to enter. Closes at "
+            f"{raffle.ends_at} PHT. Run `!list {item}` after that.{note}",
+        )
+    )
+
+
+def poll_is_open(poll) -> bool:
+    """Whether Discord itself still considers this poll open.
+
+    The stored ends_at is computed before the poll is posted, so it runs
+    a little ahead of the expiry Discord actually assigned. In that gap
+    !list would read a partial voter list and freeze it permanently.
+    Discord's own expiry settles it; when the object cannot answer (an
+    older poll payload), False defers to the stored timestamp, which the
+    caller has already checked.
+    """
+    if poll is None:
+        return False
+    expires_at = getattr(poll, "expires_at", None)
+    if expires_at is not None:
+        try:
+            return expires_at > discord.utils.utcnow()
+        except TypeError:
+            return False
+    is_finalised = getattr(poll, "is_finalised", None)
+    return not is_finalised() if callable(is_finalised) else False
+
+
+async def poll_voters(message) -> list[items_raffle.Voter]:
+    """Everyone who answered Yes, as (id, nickname) pairs.
+
+    The answer is found by its text rather than by index: an id is only
+    stable for a poll this bot created, and a raffle recorded before a
+    restart must still be readable.
+
+    A voter arrives as a Member when the members intent is on and the
+    guild is cached, and as a User otherwise. Only the Member carries the
+    server nickname, so a User is looked up once over HTTP before giving
+    up on the global name.
+    """
+    poll = getattr(message, "poll", None)
+    if poll is None or not poll.answers:
+        raise LookupError("that message no longer carries a poll")
+
+    answer = next(
+        (a for a in poll.answers if a.text.strip().casefold() == POLL_ANSWER.casefold()),
+        poll.answers[0],
+    )
+
+    guild = getattr(message, "guild", None)
+    voters: list[items_raffle.Voter] = []
+    async for voter in answer.voters():
+        display_name = getattr(voter, "display_name", "")
+        if guild is not None and not isinstance(voter, discord.Member):
+            try:
+                member = await guild.fetch_member(voter.id)
+            except Exception:
+                member = None
+            if member is not None:
+                display_name = member.display_name
+        voters.append(
+            items_raffle.Voter(user_id=voter.id, display_name=display_name)
+        )
+    return voters
+
+
+# Discord rejects an embed description longer than this, and !list saves
+# the frozen pool before it sends -- so an over-long render would lose the
+# officer's only view of a pool that has already been committed.
+EMBED_DESCRIPTION_LIMIT = 4096
+
+
+def _capped(names: list[str], budget: int, join: str) -> str:
+    """As many names as fit, then a count of what was left out."""
+    kept: list[str] = []
+    used = 0
+    for index, name in enumerate(names):
+        addition = len(name) + (len(join) if kept else 0)
+        remaining = len(names) - index
+        tail = f"{join}…and {remaining} more"
+        if used + addition + len(tail) > budget:
+            return join.join(kept) + tail if kept else tail.lstrip(join)
+        kept.append(name)
+        used += addition
+    return join.join(kept)
+
+
+def render_pool(item: str, split: items_raffle.VoterSplit, winner: str = "") -> str:
+    """The three groups an officer needs, in one description.
+
+    Bounded, because the eligible list is frozen and saved BEFORE this is
+    sent: a description Discord refuses would leave the pool committed
+    with nothing shown, and a retry replays the frozen list without the
+    excluded and unidentified groups that only exist on the first run.
+    The eligible list is the one that must survive truncation intact, so
+    it gets the budget first.
+    """
+    header = f"**Eligible for {item}** ({len(split.eligible)})"
+    footer = f"\n\n🏆 **Winner: {winner}**" if winner else ""
+    budget = EMBED_DESCRIPTION_LIMIT - len(header) - len(footer) - 200
+
+    numbered = [f"{n}. {ign}" for n, ign in enumerate(split.eligible, start=1)]
+    lines = [header, _capped(numbered, budget, "\n") or "_nobody_"]
+    budget -= len(lines[1])
+
+    if split.already_have:
+        block = "**Already has it** (excluded)"
+        lines += ["", block, _capped(split.already_have, max(budget, 0), ", ")]
+        budget -= len(lines[-1]) + len(block)
+    if split.unidentified:
+        block = "**Couldn't identify** — sort these out by hand"
+        mentions = [f"<@{voter.user_id}>" for voter in split.unidentified]
+        lines += ["", block, _capped(mentions, max(budget, 0), " ")]
+    if winner:
+        lines += ["", f"🏆 **Winner: {winner}**"]
+    return "\n".join(lines)
+
+
+@bot.command(name="list")
+async def list_cmd(ctx, *, argument: str = ""):
+    """Show who is eligible for a closed raffle."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    item_query = argument.strip()
+    raffle = items_state.find_raffle(_STATE, item_query) if item_query else None
+    if raffle is None:
+        await ctx.send(
+            embed=error_embed(
+                "Nothing to list",
+                f"No raffle for {item_query!r}. Usage: `!list <special log name>`",
+            )
+        )
+        return
+
+    if raffle.listed:
+        # Replayed verbatim, never recomputed: the pool a winner is drawn
+        # from must not be able to change between looking and drawing.
+        split = items_raffle.VoterSplit(eligible=list(raffle.eligible))
+        await ctx.send(
+            embed=ok_embed(
+                f"Raffle: {raffle.item}", render_pool(raffle.item, split, raffle.winner)
+            )
+        )
+        return
+
+    now = items_rules.format_timestamp(items_rules.now_pht())
+    if raffle.ends_at > now:
+        await ctx.send(
+            embed=error_embed(
+                "Poll still open",
+                f"**{raffle.item}** closes at {raffle.ends_at} PHT. "
+                "Drawing before then would leave out anyone who has not voted.",
+            )
+        )
+        return
+
+    try:
+        # The raffle's own channel, not wherever the command was typed.
+        # An admin who moves the raffle channel mid-poll must still be
+        # able to draw the poll that is sitting in the old one.
+        source = bot.get_channel(raffle.channel_id) or ctx.channel
+        message = await source.fetch_message(raffle.message_id)
+        if poll_is_open(getattr(message, "poll", None)):
+            await ctx.send(
+                embed=error_embed(
+                    "Poll still open",
+                    f"Discord still has voting open on **{raffle.item}**. "
+                    "Try again in a moment — freezing now would leave out "
+                    "anyone who has not voted yet.",
+                )
+            )
+            return
+        voters = await poll_voters(message)
+    except Exception as exc:
+        await ctx.send(
+            embed=error_embed(
+                "Cannot read the poll",
+                f"The poll message for **{raffle.item}** could not be read "
+                f"({exc}). Run `!poll {raffle.item}` again to hold a new one.",
+            )
+        )
+        return
+
+    async with _SHEET_LOCK:
+        # Re-resolved under the lock. The raffle above was found before
+        # the poll fetch awaited, so a second officer running !list at the
+        # same time reaches here holding a Raffle that has already been
+        # swapped out of state -- replace_raffle would raise on it.
+        raffle = items_state.find_raffle(_STATE, item_query)
+        if raffle is None or raffle.listed:
+            await ctx.send(
+                embed=(
+                    ok_embed(
+                        f"Raffle: {raffle.item}",
+                        render_pool(
+                            raffle.item,
+                            items_raffle.VoterSplit(eligible=list(raffle.eligible)),
+                            raffle.winner,
+                        ),
+                    )
+                    if raffle is not None
+                    else error_embed(
+                        "Nothing to list", f"No raffle for {item_query!r}."
+                    )
+                )
+            )
+            return
+
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        split = items_raffle.classify_voters(
+            voters,
+            snapshot.roster,
+            holds=lambda ign: items_sheet.holds_special(snapshot, ign, raffle.item),
+        )
+        updated = items_state.replace_raffle(
+            _STATE, raffle, eligible=tuple(split.eligible), listed=True
+        )
+        # A pool too big for one pinned message would make save_state give
+        # up -- not just now, but on every later save, silently halting
+        # queue persistence. Refuse the freeze instead, the same way
+        # !request and !poll refuse a state they could not store.
+        if not items_state.fits(_STATE):
+            items_state.replace_raffle(
+                _STATE, updated, eligible=raffle.eligible, listed=raffle.listed
+            )
+            await ctx.send(
+                embed=error_embed(
+                    "Entry list too large",
+                    f"**{raffle.item}** drew {len(split.eligible)} eligible "
+                    "players — too large for the bot to store safely, so "
+                    "nothing was frozen. Work the request queue down and try "
+                    "again; if it still refuses, the raffle needs to be split.",
+                )
+            )
+            return
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+
+    await ctx.send(
+        embed=ok_embed(
+            f"Raffle: {updated.item}", render_pool(updated.item, split, updated.winner)
+        )
+    )
+
+
+@bot.command(name="winner")
+async def winner_cmd(ctx, *, argument: str = ""):
+    """Record the winner of a closed raffle."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    async with _SHEET_LOCK:
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        try:
+            item, ign = items_raffle.split_item_and_ign(
+                argument, items_state.raffle_item_names(_STATE), snapshot.roster
+            )
+        except items_raffle.RaffleArgumentError as exc:
+            await ctx.send(embed=error_embed("Winner refused", str(exc)))
+            return
+
+        raffle = items_state.find_raffle(_STATE, item)
+        now = items_rules.format_timestamp(items_rules.now_pht())
+
+        if raffle.winner:
+            await ctx.send(
+                embed=error_embed(
+                    "Winner refused",
+                    f"**{raffle.item}** has already been drawn: "
+                    f"**{raffle.winner}** won it.",
+                )
+            )
+            return
+        if raffle.ends_at > now:
+            await ctx.send(
+                embed=error_embed(
+                    "Poll still open",
+                    f"**{raffle.item}** closes at {raffle.ends_at} PHT.",
+                )
+            )
+            return
+        if not raffle.listed:
+            await ctx.send(
+                embed=error_embed(
+                    "Winner refused",
+                    f"Run `!list {raffle.item}` first. The winner is checked "
+                    "against the eligible list that command freezes.",
+                )
+            )
+            return
+
+        wanted = items_rules.normalize(ign)
+        on_list = next(
+            (name for name in raffle.eligible if items_rules.normalize(name) == wanted),
+            None,
+        )
+        if on_list is None:
+            suggestions = get_close_matches(ign, list(raffle.eligible), n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            await ctx.send(
+                embed=error_embed(
+                    "Winner refused",
+                    f"**{ign}** is not on the eligible list for "
+                    f"**{raffle.item}**.{hint}",
+                )
+            )
+            return
+
+        try:
+            await asyncio.to_thread(
+                lambda: items_sheet.commit_approval(
+                    _SPREADSHEET,
+                    ign=on_list,
+                    item=raffle.item,
+                    item_type=items_rules.SPECIAL,
+                    timestamp=now,
+                    officer=getattr(ctx.author, "display_name", str(ctx.author)),
+                    user_id=ctx.author.id,
+                    request_id=items_state.new_request_id(),
+                )
+            )
+        except items_sheet.LedgerWriteError as exc:
+            # The checkbox IS ticked. Re-running could only fail against
+            # a ticked box, so the raffle closes and the officer is given
+            # the exact ledger row instead.
+            items_state.replace_raffle(_STATE, raffle, winner=on_list)
+            channel = (
+                bot.get_channel(_STATE.officer_channel_id)
+                if _STATE.officer_channel_id is not None
+                else None
+            )
+            if channel is not None:
+                await save_state(channel)
+            pasteable = " | ".join(exc.row)
+            await ctx.send(
+                embed=error_embed(
+                    "Winner recorded, ledger not",
+                    f"**{on_list}** won **{raffle.item}** and cell "
+                    f"{exc.address} is ticked, but the Distribution Log row "
+                    f"could not be written: {exc}\nDo NOT run this again — "
+                    f"add this row to `{items_sheet.LEDGER_TAB}` by hand:\n"
+                    f"```\n{pasteable}\n```",
+                )
+            )
+            return
+        except items_sheet.AlreadyHeld:
+            # The checkbox is already ticked. That happens when a previous
+            # !winner wrote the sheet but the state save then failed, so a
+            # restart restored a raffle that looks undrawn. Saying "nothing
+            # was recorded" here would be the opposite of the truth: the
+            # item HAS been given. Close the raffle to match the sheet.
+            items_state.replace_raffle(_STATE, raffle, winner=on_list)
+            channel = (
+                bot.get_channel(_STATE.officer_channel_id)
+                if _STATE.officer_channel_id is not None
+                else None
+            )
+            if channel is not None:
+                await save_state(channel)
+            await ctx.send(
+                embed=ok_embed(
+                    "Already recorded",
+                    f"**{on_list}** already has **{raffle.item}** ticked in "
+                    f"`{items_sheet.SPECIAL_TAB}` — nothing was written a "
+                    "second time. The raffle is now closed to match the sheet.",
+                )
+            )
+            return
+        except Exception as exc:
+            await ctx.send(
+                embed=error_embed(
+                    "Sheet write failed",
+                    f"Nothing was recorded, the raffle is still open: {exc}",
+                )
+            )
+            return
+
+        items_state.replace_raffle(_STATE, raffle, winner=on_list)
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+
+    await ctx.send(
+        embed=ok_embed(
+            "Winner recorded",
+            f"🏆 **{on_list}** wins **{raffle.item}**. Their checkbox in "
+            f"`{items_sheet.SPECIAL_TAB}` is ticked, so they will not be "
+            "eligible for this log again.",
+        )
+    )
+
+
+# Must stay the LAST statement in this file. bot.run() blocks, so any
+# @bot.command defined below this point would never be registered -- and
+# the tests would not notice, because importing the module skips main().
 if __name__ == "__main__":
     main()

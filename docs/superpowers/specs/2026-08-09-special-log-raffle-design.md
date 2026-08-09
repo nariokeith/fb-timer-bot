@@ -145,14 +145,21 @@ Pins written before this change lack all three keys and decode to `[]`,
 
 ### How many raffles are kept
 
-`MAX_RAFFLES = 5`. Creating a sixth drops the oldest raffle whose poll
-has already ended. If all five are still open, `!poll` refuses rather
-than discarding a live raffle.
+`MAX_RAFFLES = 25`, and state may occupy up to `MAX_SHARDS = 20` pinned
+messages (Discord allows 50 per channel). This sizing comes from a real
+requirement: raffling twenty items in one day. Twenty raffles, every one
+listed with a full 35-player pool, alongside a thirty-request gear
+queue, measures at thirteen shards.
 
-The ceiling exists because state lives in at most `MAX_SHARDS = 10`
-pinned messages. `items_state.fits` is checked before saving, as it
-already is for requests, and `!poll` refuses when the state would not
-fit.
+Creating a twenty-sixth raffle drops the oldest **drawn** raffle. A
+raffle that has merely ended is never discarded, because its frozen
+eligible pool is the only copy — the poll message may be gone, and
+Discord will not recompute it. When nothing has been drawn, `!poll`
+refuses and says so, and the officer clears the slot by running
+`!winner`, which is what they were going to do anyway.
+
+`items_state.fits` is checked before saving, as it already is for
+requests, and `!poll` refuses when the state would not fit.
 
 ## Commands
 

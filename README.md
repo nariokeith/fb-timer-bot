@@ -211,18 +211,19 @@ Two fail-closed behaviours are deliberate, not bugs — expect them:
 
 ## Item distribution
 
-Members request items from the separate item-distribution bot:
+Members request **gear logs** from the separate item-distribution bot:
 
 | Command | What it does |
 |---|---|
-| `!request <item name> <IGN>` | Request an item, for example `!request Asta's Heart Kobe`. |
+| `!request <item name> <IGN>` | Request a gear log, for example `!request Asta's Belt Kobe`. |
 | `!myrequests` | List your pending requests. |
 | `!cancelrequest [item name]` | Withdraw a pending request; name the item when you have more than one. |
 
-Two rules are enforced from the spreadsheet: a special log can be received
-once per player, ever; gear logs are limited to three per player per day,
-resetting at midnight in Manila time. An IGN must match the player's row in
-the Logs Tracker sheet.
+Gear logs are limited to three per player per day, resetting at midnight in
+Manila time. An IGN must match the player's row in the Logs Tracker sheet.
+
+**Special logs are not requested — they are raffled.** Asking for one with
+`!request` is refused with a pointer to the raffle channel.
 
 An administrator must first run `!setofficerchannel` in the private officer
 channel. That channel is where officers run `!distribute` and approve or deny
@@ -234,13 +235,46 @@ keeps a pinned queue board there — position, IGN and item for everyone waiting
 and refreshes it on every request, approval and denial, so members can see where
 they stand without asking.
 
-Create a third Discord application and enable **Message Content Intent** for
-its bot. Invite it with **View Channels**, **Send Messages**, **Embed Links**,
-**Read Message History**, and **Manage Messages** permissions. Share the Logs
-Tracker spreadsheet with the Google service account's `client_email` as an
-**Editor**. On Render, set `ITEMS_DISCORD_TOKEN`, `ITEMS_SHEET_ID`, and
-`GOOGLE_SERVICE_ACCOUNT_JSON`; `ITEMS_GEAR_DAILY_CAP` is optional and defaults
-to `3`.
+### Special log raffles
+
+Each special log is drawn from a poll instead of a queue. An admin runs
+`!setraffleroles @Officer` once to say who may run the raffle, and
+`!setrafflechannel` in the channel where polls should appear. Then, in that
+channel:
+
+| Command | What it does |
+|---|---|
+| `!poll <special log> [--hours N]` | Open a 24-hour poll for one special log. `--hours` overrides the duration (1–168). |
+| `!list <special log>` | After the poll closes, show who is eligible. Freezes that list. |
+| `!winner <special log> <IGN>` | Record the winner and tick their checkbox in the Special Logs tab. |
+
+Members enter by answering **Yes** on the poll. When it closes, `!list` turns
+the voters into IGNs and drops anyone whose checkbox for that log is already
+ticked — that checkbox is the record of who already owns what, so nobody can
+win the same special log twice. It reports three groups: eligible, already has
+it, and anyone it could not identify.
+
+Draw the winner yourself from the eligible list, then run `!winner`. The bot
+refuses a name that is not on the frozen list, refuses a second draw for the
+same raffle, and refuses to draw before `!list` has been run.
+
+**Nicknames must contain the IGN.** The bot reads each voter's server nickname
+and strips the guild tag, so `BK | Jjew`, `M2 - Jjew`, `BK Jjew` and a bare
+`Jjew` all resolve to the sheet row `Jjew`. A nickname that does not contain
+the IGN cannot be resolved and is listed for an officer to handle by hand.
+
+### Setup
+
+Create a third Discord application and enable both **Message Content Intent**
+and **Server Members Intent** for its bot. Invite it with **View Channels**,
+**Send Messages**, **Embed Links**, **Read Message History**, and **Manage
+Messages** permissions. Share the Logs Tracker spreadsheet with the Google
+service account's `client_email` as an **Editor**. On Render, set
+`ITEMS_DISCORD_TOKEN`, `ITEMS_SHEET_ID`, and `GOOGLE_SERVICE_ACCOUNT_JSON`;
+`ITEMS_GEAR_DAILY_CAP` is optional and defaults to `3`.
+
+Without **Server Members Intent** the bot cannot read nicknames, so every
+raffle voter comes back as unidentified and no winner can be drawn.
 
 ## Deploy 24/7 on Render (free tier)
 

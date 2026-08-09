@@ -8,6 +8,12 @@ The guild's two rules:
   * a special log may be received once, ever
   * gear logs are capped at three per player per PHT day, any mix
 
+The first rule is no longer enforced at request time, because special
+logs are no longer requested -- they are raffled (see items_raffle.py).
+It is still the rule, and still lives in the Special Logs checkbox: the
+raffle reads it to decide eligibility, and check_eligibility's SPECIAL
+branch is what answers that question.
+
 The second rule cannot be answered from the Gear Logs tab: its cells hold
 lifetime totals with no dates. It is answered from the Distribution Log
 ledger instead, which is why gear_used_today takes ledger rows.
@@ -134,16 +140,29 @@ def _exact(query: str, names: list[str]) -> str | None:
     return None
 
 
+RAFFLE_REDIRECT = (
+    "Special logs are raffled, not requested: watch the raffle channel for "
+    "a `!poll` and answer it there."
+)
+REQUEST_REDIRECT = "Gear logs are requested with `!request`, not raffled."
+
+
 def resolve_item(
     query: str, special_headers: list[str], gear_headers: list[str]
 ) -> ResolvedItem:
-    """Which item this is, and which tab it lives in.
+    """The gear item this query names, refusing anything else.
 
     Requires an exact (case- and spacing-insensitive) header match. Fuzzy
     matching is deliberately NOT used here: item names differ by one word
     ("Asta's Belt" vs "Asta's Heart"), so a near match would hand out the
     wrong item -- and unlike attendance, an approval is a permanent
     record. Close names are offered as suggestions instead.
+
+    A special log is refused rather than returned: those are raffled now.
+    The special headers are still read, and that is the point -- knowing
+    the name IS a special log is what turns a dead end into a redirect.
+    Dropping them would leave the member with "no item column named
+    that", which does not say where to go instead.
     """
     if not query.strip():
         raise ItemLookupError("No item name given.")
@@ -160,13 +179,41 @@ def resolve_item(
             "refusing to guess which one is meant. Remove the duplicate column."
         )
     if in_special:
-        return ResolvedItem(name=in_special, type=SPECIAL)
+        raise ItemLookupError(f"{in_special!r} is a special log. {RAFFLE_REDIRECT}")
     if in_gear:
         return ResolvedItem(name=in_gear, type=GEAR)
 
     suggestions = _suggest(query, specials + gears)
     hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
     raise ItemLookupError(f"No item column named {query!r}.{hint}")
+
+
+def resolve_special(
+    query: str, special_headers: list[str], gear_headers: list[str]
+) -> str:
+    """The Special Logs header this query names, exactly.
+
+    The raffle's counterpart to resolve_item, and exact for the same
+    reason: item names differ by one word, and the write this feeds
+    ticks a checkbox that can never be untidied by the bot.
+    """
+    if not query.strip():
+        raise ItemLookupError("No item name given.")
+
+    specials = item_names(special_headers)
+    gears = item_names(gear_headers)
+
+    found = _exact(query, specials)
+    if found:
+        return found
+
+    in_gear = _exact(query, gears)
+    if in_gear:
+        raise ItemLookupError(f"{in_gear!r} is a gear log. {REQUEST_REDIRECT}")
+
+    suggestions = _suggest(query, specials)
+    hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+    raise ItemLookupError(f"No special log column named {query!r}.{hint}")
 
 
 class RequestParseError(RuntimeError):
