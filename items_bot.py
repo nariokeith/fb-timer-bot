@@ -34,6 +34,11 @@ REQUIRED_ENV = ("ITEMS_DISCORD_TOKEN", "ITEMS_SHEET_ID", "GOOGLE_SERVICE_ACCOUNT
 # panel; expiry only means the officer re-runs the command.
 PANEL_TIMEOUT = 900  # 15 minutes
 
+# Reposting is presentation-only, so losing this cadence across a restart is
+# harmless and does not justify expanding the persisted queue-state schema.
+BOARD_REPOST_EVERY = 5
+_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
+
 # Serializes every read-then-write pair. Two officers approving at once
 # would otherwise both read "2 used today" and both write, yielding 4.
 _SHEET_LOCK = asyncio.Lock()
@@ -237,6 +242,7 @@ def is_officer_channel(channel_id: int) -> bool:
 
 async def refresh_board() -> None:
     """Redraw the member-facing queue board when one is configured."""
+    global _SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED
     if _STATE.queue_channel_id is None:
         return
     try:
@@ -250,7 +256,8 @@ async def refresh_board() -> None:
                 message = await channel.fetch_message(_STATE.board_message_id)
             except discord.NotFound:
                 pass
-        if message is not None:
+        repost = _SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED >= BOARD_REPOST_EVERY
+        if message is not None and not repost:
             try:
                 await message.edit(embed=embed)
                 # The board content matters even when pinning is temporarily
@@ -268,12 +275,27 @@ async def refresh_board() -> None:
             except discord.NotFound:
                 pass
 
+        if message is not None and repost:
+            try:
+                await message.delete()
+            except Exception as exc:
+                print(
+                    f"[items] could not remove old queue board: {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                # A replacement send may fail, so never retain an ID for a
+                # message we know Discord has already removed.
+                _STATE.board_message_id = None
+
         message = await channel.send(embed=embed)
         try:
             await message.pin()
         except Exception as exc:
             print(f"[items] could not pin queue board: {exc!r}", file=sys.stderr, flush=True)
         _STATE.board_message_id = message.id
+        _SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
         state_channel = (
             bot.get_channel(_STATE.officer_channel_id)
             if _STATE.officer_channel_id is not None
@@ -450,6 +472,7 @@ def evaluate_request(
 @bot.command(name="request")
 async def request_cmd(ctx, *, argument: str = ""):
     """Ask an officer for an item."""
+    global _SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED
     if _STATE.officer_channel_id is None:
         await ctx.send(
             embed=error_embed(
@@ -515,6 +538,7 @@ async def request_cmd(ctx, *, argument: str = ""):
             )
             return
         await save_state(channel)
+        _SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED += 1
         await refresh_board()
 
     await ctx.send(embed=ok_embed("Request queued", outcome.message))

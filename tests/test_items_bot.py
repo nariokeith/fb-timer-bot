@@ -78,12 +78,13 @@ def _not_found():
 
 
 class FakeChannel:
-    def __init__(self, channel_id=99, pins=None, history=None):
+    def __init__(self, channel_id=99, pins=None, history=None, *, raise_on_send=False):
         self.id = channel_id
         self.mention = f"#channel-{channel_id}"
         self._pins = list(pins or [])
         self._history = list(history or [])
         self.sent: list[FakeMessage] = []
+        self.raise_on_send = raise_on_send
 
     def pins(self, limit=50):
         """An async iterator, matching discord.py 2.7's real signature.
@@ -113,6 +114,8 @@ class FakeChannel:
         raise _not_found()
 
     async def send(self, content=None, **kwargs):
+        if self.raise_on_send:
+            raise _http_exception()
         message = FakeMessage(content=content or "", message_id=len(self.sent) + 1)
         message.embed = kwargs.get("embed")
         message.view = kwargs.get("view")
@@ -132,9 +135,13 @@ def reset_module_state():
     """
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
+    if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
+        items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
     yield
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
+    if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
+        items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
 
 
 def test_missing_credentials_lists_every_absent_name():
@@ -707,6 +714,150 @@ def test_refresh_board_reposts_and_pins_a_deleted_message_and_saves_its_id(monke
     assert board.pinned
     assert items_bot._STATE.board_message_id == board.id
     assert saved.board_message_id == board.id
+
+
+def _queue_board(monkeypatch, *, board=None, raise_on_send=False):
+    state_channel = FakeChannel(77)
+    board = board or FakeMessage("old board", message_id=7)
+    board.pinned = True
+    board_channel = FakeChannel(88, pins=[board], raise_on_send=raise_on_send)
+    items_bot._STATE.officer_channel_id = state_channel.id
+    items_bot._STATE.queue_channel_id = board_channel.id
+    items_bot._STATE.board_message_id = board.id
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {
+            state_channel.id: state_channel,
+            board_channel.id: board_channel,
+        }.get(channel_id),
+    )
+    return state_channel, board_channel, board
+
+
+def _queue_successes(monkeypatch, count):
+    requests = []
+
+    def accepted(_argument, user_id, _snapshot, _state, *, cap, today):
+        number = len(requests) + 1
+        request = items_state.PendingRequest(
+            id=f"queued-{number}",
+            user_id=user_id,
+            ign=f"Player {number}",
+            item="Asta's Belt",
+            type=items_rules.GEAR,
+            requested_at="2026-08-07 09:00:00",
+        )
+        requests.append(request)
+        return items_bot.RequestOutcome(True, "Queued", request)
+
+    monkeypatch.setattr(items_bot, "evaluate_request", accepted)
+    contexts = []
+    for number in range(count):
+        ctx = FakeCtx(FakeChannel(number + 1), user_id=number + 1)
+        asyncio.run(items_bot.request_cmd.callback(ctx, argument="anything"))
+        contexts.append(ctx)
+    return contexts
+
+
+def test_successful_requests_repost_the_board_on_every_fifth_request(monkeypatch):
+    state_channel, board_channel, first_board = _queue_board(monkeypatch)
+
+    _queue_successes(monkeypatch, 4)
+
+    assert first_board.edit_calls == 4
+    assert board_channel.sent == []
+
+    _queue_successes(monkeypatch, 1)
+
+    second_board = board_channel.sent[0]
+    saved = items_state.decode_state(state_channel.sent[0].content).state
+    assert first_board.deleted
+    assert second_board.pinned
+    assert items_bot._STATE.board_message_id == second_board.id
+    assert saved.board_message_id == second_board.id
+
+    _queue_successes(monkeypatch, 4)
+
+    assert second_board.edit_calls == 4
+    assert len(board_channel.sent) == 1
+
+    _queue_successes(monkeypatch, 1)
+
+    third_board = board_channel.sent[1]
+    saved = items_state.decode_state(state_channel.sent[0].content).state
+    assert second_board.deleted
+    assert third_board.pinned
+    assert saved.board_message_id == third_board.id
+
+
+def test_a_refused_request_does_not_advance_the_board_repost_cadence(monkeypatch):
+    _, board_channel, board = _queue_board(monkeypatch)
+    items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = items_bot.BOARD_REPOST_EVERY - 2
+    ctx = FakeCtx(FakeChannel(1))
+
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Heart Kobe"))
+
+    _queue_successes(monkeypatch, 1)
+
+    assert ctx.sent[-1]["embed"].title == "❌ Request refused"
+    assert not board.deleted
+    assert board.edit_calls == 1
+    assert board_channel.sent == []
+
+
+def test_approvals_denials_and_cancellations_do_not_repost_the_board(monkeypatch):
+    _, board_channel, board = _queue_board(monkeypatch)
+    items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = items_bot.BOARD_REPOST_EVERY - 1
+    items_bot._STATE.queue = [_queued("deny", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+
+    asyncio.run(items_bot.deny("deny"))
+
+    items_bot._STATE.queue = [_queued("approve", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda spreadsheet, **kwargs: "B3")
+    asyncio.run(items_bot.approve("approve", "Keith"))
+
+    items_bot._STATE.queue = [_queued("cancel", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    asyncio.run(items_bot.cancelrequest_cmd.callback(FakeCtx(FakeChannel(1))))
+
+    assert board.edit_calls == 3
+    assert not board.deleted
+    assert board_channel.sent == []
+    assert items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED == items_bot.BOARD_REPOST_EVERY - 1
+
+
+def test_a_repost_delete_failure_still_posts_a_new_board_and_keeps_the_request(monkeypatch):
+    board = FakeMessage("old board", message_id=7, raise_on_delete=True)
+    _, board_channel, old_board = _queue_board(monkeypatch, board=board)
+    items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = items_bot.BOARD_REPOST_EVERY - 1
+
+    ctx = _queue_successes(monkeypatch, 1)[0]
+
+    assert not old_board.deleted
+    assert len(board_channel.sent) == 1
+    assert board_channel.sent[0].pinned
+    assert items_bot._STATE.board_message_id == board_channel.sent[0].id
+    assert ctx.sent[-1]["embed"].title == "✅ Request queued"
+
+
+def test_a_failed_repost_send_leaves_the_board_ready_for_the_next_refresh(monkeypatch):
+    _, board_channel, old_board = _queue_board(monkeypatch, raise_on_send=True)
+    items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = items_bot.BOARD_REPOST_EVERY - 1
+
+    ctx = _queue_successes(monkeypatch, 1)[0]
+
+    assert old_board.deleted
+    assert items_bot._STATE.board_message_id is None
+    assert ctx.sent[-1]["embed"].title == "✅ Request queued"
+
+    board_channel.raise_on_send = False
+    asyncio.run(items_bot.refresh_board())
+
+    replacement = board_channel.sent[0]
+    assert replacement.pinned
+    assert items_bot._STATE.board_message_id == replacement.id
+    assert old_board.edit_calls == 0
 
 
 def test_setqueuechannel_deletes_the_previous_board_message(monkeypatch):

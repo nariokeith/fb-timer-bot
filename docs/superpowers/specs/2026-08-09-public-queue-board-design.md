@@ -110,3 +110,31 @@ been flagged.
 Restricting `!request` to the board channel, a "recently approved" tail,
 an item-type column, and a last-updated footer. All were considered and
 declined.
+
+## Addendum: reposting the board so it follows the chat
+
+Editing a Discord message never moves it, so the board kept its original
+position and scrolled out of view as the channel filled. Members had to
+open the pinned-messages list to find it, which defeats the point of a
+board you glance at.
+
+A true fixed banner is not something Discord offers a bot. Of the
+approximations -- a dedicated read-only channel, the channel topic, or
+reposting -- reposting was chosen: the guild already has too many
+channels, and the channel topic is capped at 1024 characters, collapses
+to one line, and is rate-limited far below the refresh rate.
+
+Every `BOARD_REPOST_EVERY = 5` successful requests, `refresh_board`
+deletes the board and posts a fresh one at the bottom of the channel
+instead of editing in place. Only successful requests count: a refused
+request does not change the board, and approvals, denials and
+cancellations keep editing in place so working the queue down does not
+spray new messages.
+
+The counter is in memory rather than in the saved state. A restart
+resetting it to zero costs at most one late repost, which is not worth
+another field in a state schema that has to stay backward compatible.
+
+If the delete succeeds but the send fails, `board_message_id` is cleared
+so the next refresh posts a fresh board rather than editing a message
+that no longer exists.
