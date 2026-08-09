@@ -302,6 +302,107 @@ def test_load_state_keeps_the_newest_duplicate_part_and_deletes_the_stale_one():
     assert items_bot._STATE_MESSAGES == winners
 
 
+def test_load_state_discards_obsolete_surplus_shards_after_a_shrink():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    assert len(channel.sent) == 3
+
+    first = items_bot._STATE_MESSAGES[0]
+    obsolete = items_bot._STATE_MESSAGES[1:]
+    for message in obsolete:
+        message.raise_on_delete = True
+    items_bot._STATE.queue = items_bot._STATE.queue[:1]
+    asyncio.run(items_bot.save_state(channel))
+    assert all(not message.deleted for message in obsolete)
+
+    for message in obsolete:
+        message.raise_on_delete = False
+    restored_channel = FakeChannel(channel.id, pins=[first, *obsolete])
+    items_bot._STATE = items_state.State()
+    items_bot._STATE_MESSAGES = []
+
+    assert asyncio.run(items_bot.load_state(restored_channel))
+    assert [request.id for request in items_bot._STATE.queue] == ["id000"]
+
+
+def test_load_state_deletes_obsolete_surplus_shards():
+    current = items_state.State(
+        officer_channel_id=99,
+        queue=[_queued("current", "Current", "Asta's Heart", items_rules.SPECIAL)],
+    )
+    obsolete_state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    current_message = FakeMessage(items_state.encode_state(current)[0], message_id=10)
+    obsolete = [
+        FakeMessage(content, message_id=20 + part)
+        for part, content in enumerate(items_state.encode_state(obsolete_state)[1:], start=1)
+    ]
+
+    assert asyncio.run(items_bot.load_state(FakeChannel(99, pins=[current_message, *obsolete])))
+
+    assert all(message.deleted for message in obsolete)
+
+
+def test_load_state_keeps_every_part_of_a_current_multi_shard_state():
+    state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    messages = [
+        FakeMessage(content, message_id=part)
+        for part, content in enumerate(items_state.encode_state(state))
+    ]
+
+    assert asyncio.run(items_bot.load_state(FakeChannel(99, pins=messages)))
+
+    assert [request.id for request in items_bot._STATE.queue] == [
+        request.id for request in state.queue
+    ]
+    assert not any(message.deleted for message in messages)
+
+
+def test_load_state_without_part_zero_uses_the_largest_total_and_warns():
+    two_part_state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"two-{n:03d}", f"Two {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(20)
+        ],
+    )
+    three_part_state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"three-{n:03d}", f"Three {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    part_one = FakeMessage(items_state.encode_state(two_part_state)[1], message_id=1)
+    part_two = FakeMessage(items_state.encode_state(three_part_state)[2], message_id=2)
+    channel = FakeChannel(99, pins=[part_one, part_two])
+
+    assert asyncio.run(items_bot.load_state(channel))
+
+    assert items_bot._STATE.missing_parts == (0,)
+    assert "1 state shard" in channel.sent[-1].embed.description.lower()
+    assert not part_one.deleted
+    assert not part_two.deleted
+
+
 def test_save_state_replaces_and_deletes_a_message_whose_edit_failed():
     channel = FakeChannel()
     failed_message = FakeMessage("old", raise_on_edit=True)

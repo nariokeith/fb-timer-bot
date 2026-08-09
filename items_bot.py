@@ -163,6 +163,27 @@ async def load_state(channel) -> bool:
         except discord.HTTPException:
             pass
     shard_messages = list(shard_by_part.values())
+    part_zero = shard_by_part.get(0)
+    if part_zero is not None:
+        # Message index 0 is edited on every save and is only deleted as
+        # surplus when the state has no shards, so its newest copy defines
+        # the current generation.
+        authoritative_total = part_zero[0].total
+        obsolete_messages = [
+            message
+            for decoded, message in shard_messages
+            if decoded.part >= authoritative_total
+        ]
+        for message in obsolete_messages:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+        shard_messages = [
+            (decoded, message)
+            for decoded, message in shard_messages
+            if decoded.part < authoritative_total
+        ]
     restored = items_state.decode_shards(
         [message.content for _, message in shard_messages]
     )
@@ -217,7 +238,8 @@ async def setofficerchannel_cmd(ctx):
         embed=ok_embed(
             "Officer channel set",
             f"`!distribute` now works in {ctx.channel.mention}, and the bot "
-            "keeps its request queue in a pinned message here. Don't delete it.",
+            "keeps its request queue in pinned messages here. A long queue "
+            "needs several of them. Don't delete any.",
         )
     )
 

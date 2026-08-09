@@ -131,7 +131,7 @@ Then, in Discord:
 
 | # | Do this | Expect |
 |---|---|---|
-| 1 | `!setofficerchannel` **in the private officer channel** (you need admin) | Confirmation, plus a pinned `ITEMS_STATE_V1` message. Don't delete it — it *is* the queue. |
+| 1 | `!setofficerchannel` **in the private officer channel** (you need admin) | Confirmation, plus a pinned `ITEMS_STATE_V1` message. Don't delete it — it *is* the queue. A busy queue adds more of them. |
 | 2 | `!request <special item> <IGN>` from any channel | "Request queued", echoing the item and IGN it understood |
 | 3 | The same request again | Refused as already pending |
 | 4 | `!request <item> Kobeee` (a wrong name) | Refused, suggesting the closest real names |
@@ -235,9 +235,16 @@ unaffected.
 **Officer permissions are channel permissions.** To add or remove an officer,
 change who can see the private channel. There is no role to configure.
 
-**Never delete the pinned `ITEMS_STATE_V1` message.** It holds the pending queue.
-If it is lost, pending requests are lost with it; approved history is safe in the
-sheet.
+**Never delete a pinned `ITEMS_STATE_V1` message.** They hold the pending queue.
+The bot writes as many as the queue needs — one is normal, a busy day may show
+several — and removes the extras itself as officers work the queue down. If one
+is lost the bot says so on restart and recovers the rest; the requests that were
+in the missing message are gone and must be re-requested. Approved history is
+always safe in the sheet.
+
+Requests are never silently discarded. If the queue ever grows past what the bot
+can store (around 100 pending), the next member is told the queue is full and
+asked to try again once officers have worked it down.
 
 **If the bot looks online but ignores commands**, it is almost always the
 Message Content Intent (step 1.3).
