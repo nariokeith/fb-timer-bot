@@ -28,6 +28,15 @@ def test_encode_decode_round_trip():
     assert restored.queue[0].id == "aaa"
 
 
+def test_queue_board_ids_round_trip():
+    state = items_state.State(queue_channel_id=77, board_message_id=88)
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert restored.queue_channel_id == 77
+    assert restored.board_message_id == 88
+
+
 def test_encoded_content_carries_the_marker():
     contents = items_state.encode_state(items_state.State())
     assert contents[0].startswith(items_state.STATE_MARKER)
@@ -132,6 +141,8 @@ def test_old_single_message_format_decodes_as_one_shard():
     assert shard.part == 0
     assert shard.total == 1
     assert shard.state.officer_channel_id == 99
+    assert shard.state.queue_channel_id is None
+    assert shard.state.board_message_id is None
     assert [request.id for request in shard.state.queue] == ["old1"]
 
 
@@ -146,6 +157,29 @@ def test_decode_shards_reassembles_out_of_order_queue_slices():
     restored = items_state.decode_shards(list(reversed(contents)))
 
     assert [request.id for request in restored.queue] == [request.id for request in state.queue]
+
+
+def test_queue_board_ids_survive_multi_shard_encode():
+    state = items_state.State(
+        queue_channel_id=77,
+        board_message_id=88,
+        queue=[_request(request_id=f"id{n:03d}") for n in range(50)],
+        igns={str(n): f"Member {n}" for n in range(50)},
+    )
+
+    contents = items_state.encode_state(state)
+    restored = items_state.decode_shards(contents)
+    shards = [items_state.decode_state(content) for content in contents]
+
+    assert len(contents) > 1
+    assert shards[0].state.queue_channel_id == 77
+    assert shards[0].state.board_message_id == 88
+    assert all(
+        shard.state.queue_channel_id is None and shard.state.board_message_id is None
+        for shard in shards[1:]
+    )
+    assert restored.queue_channel_id == 77
+    assert restored.board_message_id == 88
 
 
 def test_decode_shards_reports_missing_parts_while_restoring_available_requests():

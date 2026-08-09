@@ -66,6 +66,11 @@ def _http_exception():
     return discord.HTTPException(response, "Discord failed")
 
 
+def _not_found():
+    response = type("Response", (), {"status": 404, "reason": "Not Found"})()
+    return discord.NotFound(response, "Discord message not found")
+
+
 class FakeChannel:
     def __init__(self, channel_id=99, pins=None, history=None):
         self.id = channel_id
@@ -94,6 +99,12 @@ class FakeChannel:
                 yield message
 
         return _iterator()
+
+    async def fetch_message(self, message_id):
+        for message in self.sent + self._pins + self._history:
+            if message.id == message_id and not message.deleted:
+                return message
+        raise _not_found()
 
     async def send(self, content=None, **kwargs):
         message = FakeMessage(content=content or "", message_id=len(self.sent) + 1)
@@ -596,6 +607,83 @@ def test_is_officer_channel_is_false_before_setup():
     assert not items_bot.is_officer_channel(99)
 
 
+def test_refresh_board_is_a_noop_without_a_configured_queue_channel(monkeypatch):
+    channel = FakeChannel()
+    items_bot._STATE.queue_channel_id = None
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: channel)
+
+    asyncio.run(items_bot.refresh_board())
+
+    assert channel.sent == []
+
+
+def test_refresh_board_edits_the_existing_message_with_queue_order(monkeypatch):
+    board = FakeMessage("old board", message_id=7)
+    channel = FakeChannel(99, pins=[board])
+    items_bot._STATE.queue_channel_id = channel.id
+    items_bot._STATE.board_message_id = board.id
+    items_bot._STATE.queue = [
+        _queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL),
+        _queued("b", "Kobe", "Asta's Belt", items_rules.GEAR),
+    ]
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: channel)
+
+    asyncio.run(items_bot.refresh_board())
+
+    assert board.edit_calls == 1
+    assert board.embed.title == "📦 Queue Board"
+    assert "1   Dajz" in board.embed.description
+    assert "2   Kobe" in board.embed.description
+
+
+def test_refresh_board_reposts_and_pins_a_deleted_message_and_saves_its_id(monkeypatch):
+    state_channel = FakeChannel(77)
+    board_channel = FakeChannel(88)
+    items_bot._STATE.officer_channel_id = state_channel.id
+    items_bot._STATE.queue_channel_id = board_channel.id
+    items_bot._STATE.board_message_id = 7
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {state_channel.id: state_channel, board_channel.id: board_channel}.get(channel_id),
+    )
+
+    asyncio.run(items_bot.refresh_board())
+
+    board = board_channel.sent[0]
+    saved = items_state.decode_state(state_channel.sent[0].content).state
+    assert board.pinned
+    assert items_bot._STATE.board_message_id == board.id
+    assert saved.board_message_id == board.id
+
+
+def test_setqueuechannel_deletes_the_previous_board_message(monkeypatch):
+    old_board = FakeMessage("old board", message_id=7)
+    old_channel = FakeChannel(88, pins=[old_board])
+    new_channel = FakeChannel(99)
+    state_channel = FakeChannel(77)
+    items_bot._STATE.officer_channel_id = state_channel.id
+    items_bot._STATE.queue_channel_id = old_channel.id
+    items_bot._STATE.board_message_id = old_board.id
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {
+            old_channel.id: old_channel,
+            new_channel.id: new_channel,
+            state_channel.id: state_channel,
+        }.get(channel_id),
+    )
+    ctx = FakeCtx(new_channel)
+
+    asyncio.run(items_bot.setqueuechannel_cmd.callback(ctx))
+
+    assert old_board.deleted
+    assert items_bot._STATE.queue_channel_id == new_channel.id
+    assert new_channel.sent[0].pinned
+    assert ctx.sent[-1]["embed"].title == "✅ Queue channel set"
+
+
 class FakeCtx:
     def __init__(self, channel, user_id=1):
         self.channel = channel
@@ -682,6 +770,46 @@ def test_request_that_would_exceed_state_capacity_is_refused_without_changes(mon
     assert items_bot._STATE.queue == before_queue
     assert items_bot._STATE.igns == before_igns
     assert "queue is full" in ctx.sent[-1]["embed"].title.lower()
+
+
+def test_request_refreshes_the_queue_board(monkeypatch):
+    officer_channel = FakeChannel(99)
+    items_bot._STATE.officer_channel_id = officer_channel.id
+    ctx = FakeCtx(FakeChannel(1))
+    refreshes = []
+
+    async def refresh():
+        refreshes.append(True)
+
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: officer_channel)
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+    monkeypatch.setattr(items_bot, "refresh_board", refresh)
+
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Heart Dajz"))
+
+    assert refreshes == [True]
+
+
+def test_a_board_edit_failure_does_not_prevent_a_request_being_queued(monkeypatch):
+    state_channel = FakeChannel(99)
+    board = FakeMessage("old board", message_id=7, raise_on_edit=True)
+    board_channel = FakeChannel(88, pins=[board])
+    items_bot._STATE.officer_channel_id = state_channel.id
+    items_bot._STATE.queue_channel_id = board_channel.id
+    items_bot._STATE.board_message_id = board.id
+    ctx = FakeCtx(FakeChannel(1))
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {state_channel.id: state_channel, board_channel.id: board_channel}.get(channel_id),
+    )
+
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Heart Dajz"))
+
+    assert [request.ign for request in items_bot._STATE.queue] == ["Dajz"]
+    assert ctx.sent[-1]["embed"].title == "✅ Request queued"
 
 
 import items_rules
@@ -954,6 +1082,20 @@ def test_deny_removes_the_request_and_writes_nothing():
     assert "Dajz" in message
 
 
+def test_deny_refreshes_the_queue_board(monkeypatch):
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    refreshes = []
+
+    async def refresh():
+        refreshes.append(True)
+
+    monkeypatch.setattr(items_bot, "refresh_board", refresh)
+
+    asyncio.run(items_bot.deny("a"))
+
+    assert refreshes == [True]
+
+
 def test_denying_an_already_resolved_request_reports_it():
     items_bot._STATE.queue = []
     message = asyncio.run(items_bot.deny("gone"))
@@ -979,12 +1121,19 @@ def test_approve_removes_an_already_recorded_request_without_writing(monkeypatch
     monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: recorded)
     monkeypatch.setattr(items_bot, "save_state", _noop_save)
     calls = []
+    refreshes = []
+
+    async def refresh():
+        refreshes.append(True)
+
     monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: calls.append(k))
+    monkeypatch.setattr(items_bot, "refresh_board", refresh)
 
     message = asyncio.run(items_bot.approve("a", "Keith"))
 
     assert calls == []
     assert items_bot._STATE.queue == []
+    assert refreshes == [True]
     assert "already recorded" in message.lower()
 
 
@@ -1005,6 +1154,73 @@ def test_approve_commits_and_removes_the_request(monkeypatch):
     assert calls[0]["officer"] == "Keith"
     assert items_bot._STATE.queue == []
     assert "Dajz" in message
+
+
+def test_approve_refreshes_the_queue_board(monkeypatch):
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    refreshes = []
+
+    async def refresh():
+        refreshes.append(True)
+
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda spreadsheet, **kwargs: "B3")
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+    monkeypatch.setattr(items_bot, "refresh_board", refresh)
+
+    asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert refreshes == [True]
+
+
+def test_board_edit_failure_does_not_prevent_an_approval_completing(monkeypatch):
+    state_channel = FakeChannel(99)
+    board = FakeMessage("old board", message_id=7, raise_on_edit=True)
+    board_channel = FakeChannel(88, pins=[board])
+    items_bot._STATE.officer_channel_id = state_channel.id
+    items_bot._STATE.queue_channel_id = board_channel.id
+    items_bot._STATE.board_message_id = board.id
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    commits = []
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(
+        items_sheet,
+        "commit_approval",
+        lambda spreadsheet, **kwargs: commits.append(kwargs) or "B3",
+    )
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {state_channel.id: state_channel, board_channel.id: board_channel}.get(channel_id),
+    )
+
+    message = asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert len(commits) == 1
+    assert items_bot._STATE.queue == []
+    assert message == "Approved **Asta's Heart** for **Dajz**."
+
+
+def test_board_content_updates_after_an_approval(monkeypatch):
+    state_channel = FakeChannel(99)
+    board = FakeMessage("old board", message_id=7)
+    board_channel = FakeChannel(88, pins=[board])
+    items_bot._STATE.officer_channel_id = state_channel.id
+    items_bot._STATE.queue_channel_id = board_channel.id
+    items_bot._STATE.board_message_id = board.id
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda spreadsheet, **kwargs: "B3")
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {state_channel.id: state_channel, board_channel.id: board_channel}.get(channel_id),
+    )
+
+    asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert "Nothing pending" in board.embed.description
+    assert "Dajz" not in board.embed.description
 
 
 def test_approve_rechecks_the_cap_and_refuses_a_stale_request(monkeypatch):
@@ -1176,3 +1392,18 @@ def test_cancellable_reports_when_nothing_is_pending():
     found, error = items_bot.cancellable(items_bot._STATE, 1, "")
     assert found is None
     assert "no pending" in error.lower()
+
+
+def test_cancelrequest_refreshes_the_queue_board(monkeypatch):
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    ctx = FakeCtx(FakeChannel(1))
+    refreshes = []
+
+    async def refresh():
+        refreshes.append(True)
+
+    monkeypatch.setattr(items_bot, "refresh_board", refresh)
+
+    asyncio.run(items_bot.cancelrequest_cmd.callback(ctx))
+
+    assert refreshes == [True]

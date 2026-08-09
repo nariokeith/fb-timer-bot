@@ -229,6 +229,11 @@ channel. That channel is where officers run `!distribute` and approve or deny
 requests; the bot stores its pending queue in pinned messages there, adding
 more of them as the queue grows.
 
+An admin can also run `!setqueuechannel` in the members' channel. The bot then
+keeps a pinned queue board there — position, IGN and item for everyone waiting —
+and refreshes it on every request, approval and denial, so members can see where
+they stand without asking.
+
 Create a third Discord application and enable **Message Content Intent** for
 its bot. Invite it with **View Channels**, **Send Messages**, **Embed Links**,
 **Read Message History**, and **Manage Messages** permissions. Share the Logs

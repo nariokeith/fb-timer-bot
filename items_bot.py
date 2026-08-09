@@ -20,6 +20,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import items_rules
+import items_board
 import items_sheet
 import items_state
 
@@ -234,6 +235,50 @@ def is_officer_channel(channel_id: int) -> bool:
     )
 
 
+async def refresh_board() -> None:
+    """Redraw the member-facing queue board when one is configured."""
+    if _STATE.queue_channel_id is None:
+        return
+    try:
+        channel = bot.get_channel(_STATE.queue_channel_id)
+        if channel is None:
+            raise LookupError("configured queue channel is unreachable")
+        embed = _embed("📦 Queue Board", items_board.render_board(_STATE.queue), 0x3498DB)
+        message = None
+        if _STATE.board_message_id is not None:
+            try:
+                message = await channel.fetch_message(_STATE.board_message_id)
+            except discord.NotFound:
+                pass
+        if message is not None:
+            try:
+                await message.edit(embed=embed)
+                return
+            except discord.NotFound:
+                pass
+
+        message = await channel.send(embed=embed)
+        try:
+            await message.pin()
+        except Exception as exc:
+            print(f"[items] could not pin queue board: {exc!r}", file=sys.stderr, flush=True)
+        _STATE.board_message_id = message.id
+        state_channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if state_channel is None:
+            raise LookupError("configured officer channel is unreachable")
+        # Saving happens only after a replacement has a real ID. save_state()
+        # never refreshes the board, so this persistence cannot recurse.
+        await save_state(state_channel)
+    except Exception as exc:
+        # The board is cosmetic: it must never turn a completed queue change
+        # into a failed request or, worse, a seemingly failed sheet approval.
+        print(f"[items] could not refresh queue board: {exc!r}", file=sys.stderr, flush=True)
+
+
 @bot.command(name="setofficerchannel")
 @commands.has_permissions(administrator=True)
 async def setofficerchannel_cmd(ctx):
@@ -249,6 +294,46 @@ async def setofficerchannel_cmd(ctx):
             f"`!distribute` now works in {ctx.channel.mention}, and the bot "
             "keeps its request queue in pinned messages here. A long queue "
             "needs several of them. Don't delete any.",
+        )
+    )
+
+
+@bot.command(name="setqueuechannel")
+@commands.has_permissions(administrator=True)
+async def setqueuechannel_cmd(ctx):
+    """Record this channel as the member-facing queue board."""
+    previous_channel = (
+        bot.get_channel(_STATE.queue_channel_id)
+        if _STATE.queue_channel_id is not None
+        else None
+    )
+    if previous_channel is not None and _STATE.board_message_id is not None:
+        try:
+            message = await previous_channel.fetch_message(_STATE.board_message_id)
+            await message.delete()
+        except Exception as exc:
+            # Clearing the old board is tidiness, not correctness: moving the
+            # board must succeed even when the previous one cannot be removed.
+            print(f"[items] could not remove old queue board: {exc!r}", file=sys.stderr, flush=True)
+
+    _STATE.queue_channel_id = ctx.channel.id
+    _STATE.board_message_id = None
+    state_channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if state_channel is not None:
+        # Persist the destination before drawing: a board failure must not undo
+        # an admin's configuration. refresh_board saves once more only for a
+        # newly created message ID, and save_state never calls it back.
+        await save_state(state_channel)
+    await refresh_board()
+    await ctx.send(
+        embed=ok_embed(
+            "Queue channel set",
+            f"The member queue board is now in {ctx.channel.mention}. The bot "
+            "will keep it updated and pinned here.",
         )
     )
 
@@ -409,6 +494,7 @@ async def request_cmd(ctx, *, argument: str = ""):
             )
             return
         await save_state(channel)
+        await refresh_board()
 
     await ctx.send(embed=ok_embed("Request queued", outcome.message))
 
@@ -472,6 +558,7 @@ async def deny(request_id: str) -> str:
         channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
         if channel is not None:
             await save_state(channel)
+        await refresh_board()
     return f"Denied **{removed.item}** for **{removed.ign}**. Nothing was written to the sheet."
 
 
@@ -497,6 +584,7 @@ async def approve(request_id: str, officer_name: str) -> str:
             channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
             if channel is not None:
                 await save_state(channel)
+            await refresh_board()
             return (
                 f"**{request.item}** for **{request.ign}** was already recorded. "
                 "Nothing was written again."
@@ -539,6 +627,7 @@ async def approve(request_id: str, officer_name: str) -> str:
             channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
             if channel is not None:
                 await save_state(channel)
+            await refresh_board()
             pasteable = " | ".join(exc.row)
             return (
                 f"⚠️ **{request.item}** was given to **{request.ign}** "
@@ -554,6 +643,7 @@ async def approve(request_id: str, officer_name: str) -> str:
         channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
         if channel is not None:
             await save_state(channel)
+        await refresh_board()
 
     return f"Approved **{request.item}** for **{request.ign}**."
 
@@ -847,6 +937,7 @@ async def cancelrequest_cmd(ctx, *, item_query: str = ""):
         channel = bot.get_channel(_STATE.officer_channel_id) if _STATE.officer_channel_id else None
         if channel is not None:
             await save_state(channel)
+        await refresh_board()
     await ctx.send(
         embed=ok_embed("Request cancelled", f"Withdrew **{request.item}** for **{request.ign}**.")
     )
