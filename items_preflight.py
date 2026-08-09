@@ -17,6 +17,7 @@ is read-only and safe against any sheet.
 import argparse
 import os
 import sys
+import types
 
 from dotenv import load_dotenv
 
@@ -87,8 +88,8 @@ def check_tabs(spreadsheet) -> None:
     if items_sheet.GEAR_TAB not in titles:
         line(
             WARN,
-            f"{items_sheet.GEAR_TAB!r} is absent -- gear requests will be refused "
-            "until you create it. Special logs work fine meanwhile.",
+            f"{items_sheet.GEAR_TAB!r} is absent -- `!request` will be refused "
+            "until you create it. Special-log raffles work fine meanwhile.",
         )
     else:
         line(OK, f"{items_sheet.GEAR_TAB!r} present")
@@ -153,21 +154,58 @@ def check_item_clashes(specials: list[str], gears: list[str]) -> None:
 
 
 def check_parses(snapshot, specials, gears) -> None:
-    """Prove a real request string resolves, using this sheet's own data."""
+    """Prove real command arguments resolve, using this sheet's own data.
+
+    Two separate checks now, because the two item kinds go through
+    different commands: gear logs through `!request`, special logs
+    through the raffle's `!poll`. Feeding a special log to parse_request
+    is EXPECTED to fail, so it is asserted rather than reported as a
+    problem with the sheet.
+    """
     if not snapshot.roster or not (specials or gears):
-        line(WARN, "not enough data to test a sample request")
+        line(WARN, "not enough data to test a sample command")
         return
-    item = (specials or gears)[0]
     player = snapshot.roster[0]
-    sample = f"{item} {player}"
+
+    if gears:
+        sample = f"{gears[0]} {player}"
+        try:
+            parsed = items_rules.parse_request(
+                sample, snapshot.roster, snapshot.special_headers, snapshot.gear_headers
+            )
+        except Exception as exc:
+            line(FAIL, f"a request built from your own sheet failed to parse: {exc}")
+            raise PreflightFailure(str(exc)) from None
+        line(OK, f"`!request {sample}` -> {parsed.item.name!r} ({parsed.item.type}) for {parsed.ign!r}")
+    else:
+        line(WARN, "no gear-log columns yet, so `!request` could not be tested")
+
+    if not specials:
+        line(WARN, "no special-log columns, so the raffle could not be tested")
+        return
+
+    special = specials[0]
     try:
-        parsed = items_rules.parse_request(
-            sample, snapshot.roster, snapshot.special_headers, snapshot.gear_headers
+        resolved = items_rules.resolve_special(
+            special, snapshot.special_headers, snapshot.gear_headers
         )
     except Exception as exc:
-        line(FAIL, f"a request built from your own sheet failed to parse: {exc}")
+        line(FAIL, f"a raffle built from your own sheet failed to resolve: {exc}")
         raise PreflightFailure(str(exc)) from None
-    line(OK, f"`!request {sample}` -> {parsed.item.name!r} ({parsed.item.type}) for {parsed.ign!r}")
+    line(OK, f"`!poll {special}` -> {resolved!r}")
+
+    try:
+        items_rules.parse_request(
+            f"{special} {player}",
+            snapshot.roster,
+            snapshot.special_headers,
+            snapshot.gear_headers,
+        )
+    except items_rules.RequestParseError:
+        line(OK, f"`!request {special} ...` is correctly refused (special logs are raffled)")
+    else:
+        line(FAIL, f"{special!r} is a special log but `!request` accepted it")
+        raise PreflightFailure(f"{special!r} can still be requested")
 
 
 def check_write(spreadsheet, sheet_id: str, ign: str, item: str) -> None:
@@ -180,10 +218,28 @@ def check_write(spreadsheet, sheet_id: str, ign: str, item: str) -> None:
         )
 
     snapshot = items_sheet.read_snapshot(spreadsheet)
-    parsed = items_rules.parse_request(
-        f"{item} {ign}", snapshot.roster, snapshot.special_headers, snapshot.gear_headers
+    player = items_rules.resolve_ign(ign, snapshot.roster)
+    if player is None:
+        raise PreflightFailure(f"No player named {ign!r} in the sheet.")
+
+    # Special logs are resolved directly rather than through
+    # parse_request, which refuses them now that they are raffled. The
+    # checkbox write itself is unchanged -- it is what !winner performs.
+    try:
+        name = items_rules.resolve_special(
+            item, snapshot.special_headers, snapshot.gear_headers
+        )
+        item_type = items_rules.SPECIAL
+    except items_rules.ItemLookupError:
+        resolved = items_rules.resolve_item(
+            item, snapshot.special_headers, snapshot.gear_headers
+        )
+        name, item_type = resolved.name, resolved.type
+
+    parsed = types.SimpleNamespace(
+        ign=player, item=types.SimpleNamespace(name=name, type=item_type)
     )
-    if parsed.item.type == items_rules.SPECIAL:
+    if item_type == items_rules.SPECIAL:
         address = items_sheet.record_special(spreadsheet, parsed.ign, parsed.item.name)
     else:
         address = items_sheet.record_gear(spreadsheet, parsed.ign, parsed.item.name)
