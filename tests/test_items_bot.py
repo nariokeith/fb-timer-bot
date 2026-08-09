@@ -1111,6 +1111,7 @@ def test_a_board_edit_failure_does_not_prevent_a_request_being_queued(monkeypatc
 
 import items_rules
 import items_sheet
+import items_raffle
 
 SPECIAL_HEADER_ROW = ["Player Name", "Asta's Heart", "Amentis' Foot"]
 
@@ -1787,7 +1788,7 @@ class FakeMember:
 
 
 def _raffle_ctx(channel_id=42, roles=(10,), administrator=False):
-    channel = FakeChannel(channel_id)
+    channel = _register_channel(FakeChannel(channel_id))
     ctx = FakeCtx(channel)
     ctx.author = FakeMember(roles=[FakeRole(r) for r in roles], administrator=administrator)
     return ctx, channel
@@ -1903,12 +1904,27 @@ def _sheet(monkeypatch, special=("Player Name", "Asta's Heart"), gear=("Player N
     return snapshot
 
 
+# Channels the fake bot can resolve by id, the way discord.py does.
+# A get_channel that returns the same object for every id would hide
+# whether the code looks a channel up correctly at all.
+_CHANNELS: dict[int, FakeChannel] = {}
+
+
+def _register_channel(channel):
+    _CHANNELS[channel.id] = channel
+    return channel
+
+
 def _configured_raffle(monkeypatch, channel_id=42):
     state_channel = FakeChannel(1)
+    _CHANNELS.clear()
+    _register_channel(state_channel)
     items_bot._STATE.officer_channel_id = 1
     items_bot._STATE.raffle_channel_id = channel_id
     items_bot._STATE.raffle_role_ids = [10]
-    monkeypatch.setattr(items_bot.bot, "get_channel", lambda cid: state_channel)
+    monkeypatch.setattr(
+        items_bot.bot, "get_channel", lambda cid: _CHANNELS.get(cid, state_channel)
+    )
     return state_channel
 
 
@@ -2514,3 +2530,95 @@ def test_every_raffle_command_is_registered_on_the_bot():
     registered = {c.name for c in items_bot.bot.commands}
     for name in ("poll", "list", "winner", "setraffleroles", "setrafflechannel"):
         assert name in registered, f"!{name} is not registered"
+
+
+def test_list_reads_the_poll_from_the_raffles_own_channel(monkeypatch):
+    """An admin who moves the raffle channel mid-poll can still draw it."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    old_channel = _register_channel(FakeChannel(42))
+    _, message = _open_raffle(old_channel, ends="2026-08-09 10:00:00")
+    message.poll = FakePoll(answers=[FakePollAnswer("Yes", [FakeVoter(1, "BK | Jjew")])])
+
+    new_channel = _register_channel(FakeChannel(77))
+    items_bot._STATE.raffle_channel_id = 77
+    ctx = FakeCtx(new_channel)
+    ctx.author = FakeMember(roles=[FakeRole(10)])
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").eligible == ("Jjew",)
+
+
+def test_list_defers_to_discords_own_expiry_not_the_stored_one(monkeypatch):
+    """ends_at is computed before the poll is posted, so it runs early.
+
+    Freezing inside that gap would permanently exclude anyone who had
+    not voted yet.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _, message = _open_raffle(channel, ends="2026-08-09 10:00:00")
+    poll = FakePoll(answers=[FakePollAnswer("Yes", [FakeVoter(1, "BK | Jjew")])])
+    poll.expires_at = discord.utils.utcnow() + datetime.timedelta(minutes=5)
+    message.poll = poll
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert ctx.sent[-1]["embed"].title == "❌ Poll still open"
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").listed is False
+
+
+def test_a_poll_discord_has_already_closed_is_listed(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _, message = _open_raffle(channel, ends="2026-08-09 10:00:00")
+    poll = FakePoll(answers=[FakePollAnswer("Yes", [FakeVoter(1, "BK | Jjew")])])
+    poll.expires_at = discord.utils.utcnow() - datetime.timedelta(minutes=5)
+    message.poll = poll
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").eligible == ("Jjew",)
+
+
+def test_the_pool_embed_stays_within_discords_description_limit():
+    split = items_raffle.VoterSplit(
+        eligible=[f"AnExtremelyLongPlayerName{n:04d}" for n in range(400)],
+        already_have=[f"AnotherLongPlayerName{n:04d}" for n in range(200)],
+        unidentified=[items_raffle.Voter(10**18 + n, "x") for n in range(400)],
+    )
+
+    rendered = items_bot.render_pool("Asta's Heart", split, winner="Someone")
+
+    assert len(rendered) <= 4096, f"{len(rendered)} chars would be rejected by Discord"
+    assert "Someone" in rendered, "the winner must never be truncated away"
+
+
+def test_redrawing_a_winner_whose_box_is_already_ticked_says_so(monkeypatch):
+    """The state save can fail after the sheet write succeeded.
+
+    After a restart the raffle looks open but the checkbox is ticked, so
+    the officer retries !winner. record_special refuses, and a generic
+    'nothing was recorded' would be actively wrong -- the item HAS been
+    given. Close the raffle and say so instead.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
+
+    def already_ticked(spreadsheet, **kwargs):
+        raise items_sheet.SheetStructureError(
+            "Jjew already has \"Asta's Heart\" -- a special log is once only"
+        )
+
+    monkeypatch.setattr(items_sheet, "commit_approval", already_ticked)
+
+    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.winner == "Jjew", "the raffle must not stay open forever"
+    assert "already" in ctx.sent[-1]["embed"].description.casefold()

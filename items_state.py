@@ -230,7 +230,20 @@ def _encode_with_total(state: State, total: int) -> list[str]:
         if len(_render(current)) > MAX_CONTENT:
             raise ValueError("a raffle is too large for a state shard")
 
-    return [_render(payload) for payload in payloads]
+    contents = [_render(payload) for payload in payloads]
+    # The loops above bound the shards they fill item by item, but shard 0
+    # also carries whole-state fields -- the raffle role ids especially --
+    # that no loop measures. An oversized shard is not a shard Discord will
+    # accept, and save_state may already have deleted the message it was
+    # replacing, so this must be caught here where fits() can see it rather
+    # than mid-write.
+    for content in contents:
+        if len(content) > MAX_CONTENT:
+            raise ValueError(
+                "a state shard is too large to store; the configuration in "
+                "shard 0 does not fit in one Discord message"
+            )
+    return contents
 
 
 def encode_state(state: State) -> list[str]:

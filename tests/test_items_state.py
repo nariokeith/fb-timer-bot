@@ -469,3 +469,33 @@ def test_raffle_to_evict_refuses_when_nothing_has_been_drawn():
     state = _full_of(ends="2026-08-09 12:00:00")
 
     assert items_state.raffle_to_evict(state) == (False, None)
+
+
+def test_an_oversized_configuration_is_refused_rather_than_written():
+    """Shard 0 carries fields no per-item loop measures.
+
+    A huge raffle_role_ids list would otherwise render a shard past
+    Discord's content limit, which save_state can only discover mid-write
+    -- possibly after deleting the message it was replacing.
+    """
+    state = items_state.State(
+        officer_channel_id=1,
+        raffle_role_ids=[10**18 + n for n in range(200)],
+    )
+
+    assert not items_state.fits(state)
+    try:
+        items_state.encode_state(state)
+    except ValueError as error:
+        assert "too large" in str(error)
+    else:
+        raise AssertionError("an unstorable configuration must be reported")
+
+
+def test_a_reasonable_number_of_raffle_roles_still_fits():
+    state = items_state.State(
+        officer_channel_id=1, raffle_role_ids=[10**18 + n for n in range(20)]
+    )
+
+    assert items_state.fits(state)
+    assert items_state.decode_shards(items_state.encode_state(state)).raffle_role_ids == state.raffle_role_ids
