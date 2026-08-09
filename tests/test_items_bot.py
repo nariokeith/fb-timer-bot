@@ -1014,7 +1014,7 @@ def test_unreachable_officer_channel_does_not_keep_a_queued_request(monkeypatch)
     monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
     monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: None)
 
-    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Heart Dajz"))
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Belt Dajz"))
 
     assert items_bot._STATE.queue == []
     assert items_bot._STATE.igns == {"1": "Kobe"}
@@ -1033,7 +1033,7 @@ def test_request_that_would_exceed_state_capacity_is_refused_without_changes(mon
     ctx = FakeCtx(FakeChannel(1))
     monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
 
-    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Heart Dajz"))
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Belt Dajz"))
 
     assert items_bot._STATE.queue == before_queue
     assert items_bot._STATE.igns == before_igns
@@ -1054,7 +1054,7 @@ def test_request_refreshes_the_queue_board(monkeypatch):
     monkeypatch.setattr(items_bot, "save_state", _noop_save)
     monkeypatch.setattr(items_bot, "refresh_board", refresh)
 
-    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Heart Dajz"))
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Belt Dajz"))
 
     assert refreshes == [True]
 
@@ -1074,7 +1074,7 @@ def test_a_board_edit_failure_does_not_prevent_a_request_being_queued(monkeypatc
         lambda channel_id: {state_channel.id: state_channel, board_channel.id: board_channel}.get(channel_id),
     )
 
-    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Heart Dajz"))
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Belt Dajz"))
 
     assert [request.ign for request in items_bot._STATE.queue] == ["Dajz"]
     assert ctx.sent[-1]["embed"].title == "✅ Request queued"
@@ -1123,23 +1123,24 @@ def _evaluate(argument, state=None, user_id=1, snapshot=None):
     )
 
 
-def test_a_valid_special_request_is_accepted():
-    outcome = _evaluate("Asta's Heart Dajz")
+def test_a_valid_gear_request_is_accepted():
+    outcome = _evaluate("Asta's Belt Dajz")
     assert outcome.accepted
-    assert outcome.request.item == "Asta's Heart"
-    assert outcome.request.type == items_rules.SPECIAL
+    assert outcome.request.item == "Asta's Belt"
+    assert outcome.request.type == items_rules.GEAR
 
 
 def test_a_multi_word_ign_is_accepted():
-    outcome = _evaluate("Asta's Heart chinchong ni Mumu")
+    outcome = _evaluate("Asta's Belt chinchong ni Mumu")
     assert outcome.accepted
     assert outcome.request.ign == "chinchong ni Mumu"
 
 
-def test_a_special_the_player_already_holds_is_refused():
-    outcome = _evaluate("Asta's Heart Kobe")
+def test_a_special_log_is_refused_and_points_at_the_raffle():
+    """Special logs are raffled now. !request must say where to go."""
+    outcome = _evaluate("Asta's Heart Dajz")
     assert not outcome.accepted
-    assert "already" in outcome.message.lower()
+    assert "raffled" in outcome.message.lower()
 
 
 def test_a_gear_request_at_the_cap_is_refused_before_officers_see_it():
@@ -1571,12 +1572,12 @@ def test_a_duplicate_pending_request_is_refused():
     state = items_state.State(
         queue=[
             items_state.PendingRequest(
-                id="x", user_id=1, ign="Dajz", item="Asta's Heart",
-                type=items_rules.SPECIAL, requested_at="2026-08-07 10:30:00",
+                id="x", user_id=1, ign="Dajz", item="Asta's Belt",
+                type=items_rules.GEAR, requested_at="2026-08-07 10:30:00",
             )
         ]
     )
-    outcome = _evaluate("Asta's Heart Dajz", state=state)
+    outcome = _evaluate("Asta's Belt Dajz", state=state)
     assert not outcome.accepted
     assert "pending" in outcome.message.lower()
 
@@ -1590,14 +1591,14 @@ def test_an_unparseable_request_is_refused_with_the_reason():
 def test_an_ign_differing_from_last_time_is_noted_not_refused():
     """Requesting for an alt is legitimate; the officer judges it."""
     state = items_state.State(igns={"1": "Kobe"})
-    outcome = _evaluate("Asta's Heart Dajz", state=state, user_id=1)
+    outcome = _evaluate("Asta's Belt Dajz", state=state, user_id=1)
     assert outcome.accepted
     assert "Kobe" in outcome.request.note
 
 
 def test_the_same_ign_as_last_time_carries_no_note():
     state = items_state.State(igns={"1": "Dajz"})
-    outcome = _evaluate("Asta's Heart Dajz", state=state, user_id=1)
+    outcome = _evaluate("Asta's Belt Dajz", state=state, user_id=1)
     assert outcome.accepted
     assert outcome.request.note == ""
 
@@ -1607,8 +1608,8 @@ def test_a_duplicate_is_refused_even_from_a_different_account():
     state = items_state.State(
         queue=[
             items_state.PendingRequest(
-                id="x", user_id=999, ign="Dajz", item="Asta's Heart",
-                type=items_rules.SPECIAL, requested_at="2026-08-07 10:30:00",
+                id="x", user_id=999, ign="Dajz", item="Asta's Belt",
+                type=items_rules.GEAR, requested_at="2026-08-07 10:30:00",
             )
         ]
     )

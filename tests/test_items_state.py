@@ -259,3 +259,127 @@ def test_removing_an_already_removed_request_returns_none():
     state = items_state.State(queue=[_request("a")])
     items_state.remove_request(state, "a")
     assert items_state.remove_request(state, "a") is None
+
+
+def _raffle(item="Asta's Heart", created="2026-08-09 10:00:00", ends="2026-08-10 10:00:00", **kwargs):
+    return items_state.Raffle(
+        item=item,
+        channel_id=555,
+        message_id=777,
+        created_at=created,
+        ends_at=ends,
+        **kwargs,
+    )
+
+
+def test_a_raffle_survives_an_encode_decode_round_trip():
+    state = items_state.State(
+        officer_channel_id=1,
+        raffle_channel_id=2,
+        raffle_role_ids=[10, 11],
+        raffles=[_raffle(eligible=("Jjew", "Kobe"), listed=True, winner="Jjew")],
+    )
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert restored.raffle_channel_id == 2
+    assert restored.raffle_role_ids == [10, 11]
+    assert len(restored.raffles) == 1
+    assert restored.raffles[0].item == "Asta's Heart"
+    assert restored.raffles[0].eligible == ("Jjew", "Kobe")
+    assert restored.raffles[0].listed is True
+    assert restored.raffles[0].winner == "Jjew"
+
+
+def test_a_pin_written_before_raffles_existed_still_loads():
+    """Production pins have none of the three new keys."""
+    old = items_state.State(officer_channel_id=1)
+    contents = items_state.encode_state(old)
+
+    restored = items_state.decode_shards(contents)
+
+    assert restored.raffles == []
+    assert restored.raffle_role_ids == []
+    assert restored.raffle_channel_id is None
+
+
+def test_raffles_spill_into_further_shards_rather_than_being_dropped():
+    state = items_state.State(
+        officer_channel_id=1,
+        raffles=[
+            _raffle(item=f"Special Log {n}", eligible=tuple(f"Player {i:03d}" for i in range(40)))
+            for n in range(items_state.MAX_RAFFLES)
+        ],
+    )
+
+    contents = items_state.encode_state(state)
+    restored = items_state.decode_shards(contents)
+
+    assert len(contents) > 1
+    assert [r.item for r in restored.raffles] == [r.item for r in state.raffles]
+
+
+def test_find_raffle_matches_case_and_spacing_insensitively():
+    state = items_state.State(raffles=[_raffle()])
+
+    assert items_state.find_raffle(state, "  asta's   heart ").item == "Asta's Heart"
+    assert items_state.find_raffle(state, "Benji's Heart") is None
+
+
+def test_find_raffle_returns_the_most_recent_when_a_name_repeats():
+    state = items_state.State(
+        raffles=[
+            _raffle(created="2026-08-01 10:00:00", winner="Kobe"),
+            _raffle(created="2026-08-09 10:00:00"),
+        ]
+    )
+
+    assert items_state.find_raffle(state, "Asta's Heart").created_at == "2026-08-09 10:00:00"
+
+
+def test_replace_raffle_swaps_the_record_in_place():
+    original = _raffle()
+    state = items_state.State(raffles=[original])
+
+    updated = items_state.replace_raffle(state, original, winner="Jjew")
+
+    assert state.raffles == [updated]
+    assert updated.winner == "Jjew"
+    assert original.winner == ""
+
+
+def test_evicting_drops_the_oldest_ended_raffle_when_full():
+    state = items_state.State(
+        raffles=[
+            _raffle(item=f"Log {n}", created=f"2026-08-0{n + 1} 10:00:00", ends=f"2026-08-0{n + 1} 12:00:00")
+            for n in range(items_state.MAX_RAFFLES)
+        ]
+    )
+
+    assert items_state.evict_for_new_raffle(state, "2026-08-09 13:00:00")
+    assert [r.item for r in state.raffles] == [f"Log {n}" for n in range(1, items_state.MAX_RAFFLES)]
+
+
+def test_evicting_refuses_when_every_raffle_is_still_open():
+    state = items_state.State(
+        raffles=[
+            _raffle(item=f"Log {n}", ends="2026-12-31 23:59:59")
+            for n in range(items_state.MAX_RAFFLES)
+        ]
+    )
+
+    assert not items_state.evict_for_new_raffle(state, "2026-08-09 13:00:00")
+    assert len(state.raffles) == items_state.MAX_RAFFLES
+
+
+def test_evicting_does_nothing_below_the_ceiling():
+    state = items_state.State(raffles=[_raffle()])
+
+    assert items_state.evict_for_new_raffle(state, "2026-08-09 13:00:00")
+    assert len(state.raffles) == 1
+
+
+def test_raffle_item_names_lists_every_tracked_raffle():
+    state = items_state.State(raffles=[_raffle(item="A"), _raffle(item="B")])
+
+    assert items_state.raffle_item_names(state) == ["A", "B"]

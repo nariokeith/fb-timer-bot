@@ -11,6 +11,7 @@ Pure module: it produces and consumes strings. Reading and writing the
 Discord message is items_bot's job.
 """
 
+import dataclasses
 import json
 import secrets
 from dataclasses import dataclass, field
@@ -63,6 +64,57 @@ class PendingRequest:
         )
 
 
+# The pinned messages are capped at MAX_SHARDS, and a listed raffle
+# carries an eligible IGN for every voter. Five is enough history to
+# re-read recent draws without crowding the queue out of the pins.
+MAX_RAFFLES = 5
+
+
+@dataclass(frozen=True)
+class Raffle:
+    """One special log poll and everything decided from it.
+
+    `listed` cannot be inferred from `eligible`: a raffle where nobody
+    was eligible is a real outcome, and it must stay distinguishable
+    from one that has not been listed yet -- otherwise !winner would
+    tell an officer to run !list again forever.
+    """
+
+    item: str
+    channel_id: int
+    message_id: int
+    created_at: str
+    ends_at: str
+    eligible: tuple[str, ...] = ()
+    listed: bool = False
+    winner: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "item": self.item,
+            "channel_id": self.channel_id,
+            "message_id": self.message_id,
+            "created_at": self.created_at,
+            "ends_at": self.ends_at,
+            "eligible": list(self.eligible),
+            "listed": self.listed,
+            "winner": self.winner,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "Raffle":
+        return cls(
+            item=str(raw["item"]),
+            channel_id=int(raw["channel_id"]),
+            message_id=int(raw["message_id"]),
+            created_at=str(raw["created_at"]),
+            ends_at=str(raw["ends_at"]),
+            eligible=tuple(str(name) for name in raw.get("eligible", [])),
+            listed=bool(raw.get("listed", False)),
+            winner=str(raw.get("winner", "")),
+        )
+
+
 @dataclass
 class State:
     officer_channel_id: int | None = None
@@ -74,6 +126,13 @@ class State:
     # what lets a typo surface as "you used Kobe before" instead of
     # silently crediting a different row.
     igns: dict[str, str] = field(default_factory=dict)
+    # Roles permitted to run !poll / !list / !winner, and the one channel
+    # they work in. Unlike !distribute -- which is authorised by the
+    # officer channel itself -- the raffle happens in a member-visible
+    # channel, so the channel cannot also be the permission.
+    raffle_role_ids: list[int] = field(default_factory=list)
+    raffle_channel_id: int | None = None
+    raffles: list["Raffle"] = field(default_factory=list)
     # A partial pin read can still restore requests, but the bot needs to
     # warn officers that it could not recover the complete queue.
     missing_parts: tuple[int, ...] = ()
@@ -115,6 +174,11 @@ def _encode_with_total(state: State, total: int) -> list[str]:
         first_payload["queue_channel_id"] = state.queue_channel_id
     if state.board_message_id is not None:
         first_payload["board_message_id"] = state.board_message_id
+    if state.raffle_channel_id is not None:
+        first_payload["raffle_channel_id"] = state.raffle_channel_id
+    if state.raffle_role_ids:
+        first_payload["raffle_role_ids"] = list(state.raffle_role_ids)
+    first_payload["raffles"] = []
     payloads = [first_payload]
 
     for user_id, ign in state.igns.items():
@@ -144,6 +208,21 @@ def _encode_with_total(state: State, total: int) -> list[str]:
         current["queue"].append(request_payload)
         if len(_render(current)) > MAX_CONTENT:
             raise ValueError("a pending request is too large for a state shard")
+
+    for raffle in state.raffles:
+        raffle_payload = raffle.to_dict()
+        current = payloads[-1]
+        current.setdefault("raffles", []).append(raffle_payload)
+        if len(_render(current)) <= MAX_CONTENT:
+            continue
+
+        current["raffles"].pop()
+        current = {"part": len(payloads), "total": total, "raffles": []}
+        payloads.append(current)
+
+        current["raffles"].append(raffle_payload)
+        if len(_render(current)) > MAX_CONTENT:
+            raise ValueError("a raffle is too large for a state shard")
 
     return [_render(payload) for payload in payloads]
 
@@ -202,6 +281,12 @@ def decode_state(content: str) -> Shard | None:
         board_message_id = payload.get("board_message_id")
         board_message_id = int(board_message_id) if board_message_id is not None else None
         igns = {str(k): str(v) for k, v in dict(payload.get("igns", {})).items()}
+        raffles = [Raffle.from_dict(r) for r in payload.get("raffles", [])]
+        raffle_channel_id = payload.get("raffle_channel_id")
+        raffle_channel_id = (
+            int(raffle_channel_id) if raffle_channel_id is not None else None
+        )
+        raffle_role_ids = [int(r) for r in payload.get("raffle_role_ids", [])]
         part = int(payload.get("part", 0))
         total = int(payload.get("total", 1))
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
@@ -217,6 +302,9 @@ def decode_state(content: str) -> Shard | None:
             board_message_id=board_message_id,
             queue=queue,
             igns=igns,
+            raffle_role_ids=raffle_role_ids,
+            raffle_channel_id=raffle_channel_id,
+            raffles=raffles,
         ),
     )
 
@@ -257,17 +345,38 @@ def decode_shards(contents: list[str]) -> State | None:
         ),
         None,
     )
+    raffle_channel_id = next(
+        (
+            shard.state.raffle_channel_id
+            for shard in shards
+            if shard.state.raffle_channel_id is not None
+        ),
+        None,
+    )
+    raffle_role_ids = next(
+        (
+            shard.state.raffle_role_ids
+            for shard in shards
+            if shard.state.raffle_role_ids
+        ),
+        [],
+    )
     igns: dict[str, str] = {}
     queue: list[PendingRequest] = []
+    raffles: list[Raffle] = []
     for shard in shards:
         igns.update(shard.state.igns)
         queue.extend(shard.state.queue)
+        raffles.extend(shard.state.raffles)
     return State(
         officer_channel_id=officer_channel_id,
         queue_channel_id=queue_channel_id,
         board_message_id=board_message_id,
         queue=queue,
         igns=igns,
+        raffle_role_ids=raffle_role_ids,
+        raffle_channel_id=raffle_channel_id,
+        raffles=raffles,
         missing_parts=missing_parts,
     )
 
@@ -303,3 +412,44 @@ def remove_request(state: State, request_id: str) -> PendingRequest | None:
     if found is not None:
         state.queue.remove(found)
     return found
+
+
+def find_raffle(state: State, item: str) -> Raffle | None:
+    """The most recent raffle for this special log, or None.
+
+    Most recent rather than first, because a log raffled twice (a second
+    copy dropped later) leaves an older closed record in state; the
+    officer always means the live one.
+    """
+    wanted = items_rules.normalize(item)
+    matches = [r for r in state.raffles if items_rules.normalize(r.item) == wanted]
+    if not matches:
+        return None
+    return max(matches, key=lambda raffle: raffle.created_at)
+
+
+def replace_raffle(state: State, raffle: Raffle, **changes) -> Raffle:
+    """Swap a raffle for an updated copy, in place. Returns the new one."""
+    updated = dataclasses.replace(raffle, **changes)
+    state.raffles[state.raffles.index(raffle)] = updated
+    return updated
+
+
+def raffle_item_names(state: State) -> list[str]:
+    return [raffle.item for raffle in state.raffles]
+
+
+def evict_for_new_raffle(state: State, now: str) -> bool:
+    """Make room for one more raffle. False when there is none to make.
+
+    Only a raffle whose poll has already closed may be dropped. Evicting
+    a live one would orphan a poll members are still voting in, with no
+    way to draw from it.
+    """
+    if len(state.raffles) < MAX_RAFFLES:
+        return True
+    ended = [raffle for raffle in state.raffles if raffle.ends_at <= now]
+    if not ended:
+        return False
+    state.raffles.remove(min(ended, key=lambda raffle: raffle.created_at))
+    return True

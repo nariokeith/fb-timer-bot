@@ -60,9 +60,35 @@ SPECIAL_HEADERS = ["Player Name", "Asta's Heart", "Amentis' Foot", "Benji's Bloo
 GEAR_HEADERS = ["Player Name", "Asta's Belt", "Benji's Heart"]
 
 
-def test_resolves_an_item_to_the_tab_that_holds_it():
-    found = items_rules.resolve_item("Asta's Heart", SPECIAL_HEADERS, GEAR_HEADERS)
-    assert (found.name, found.type) == ("Asta's Heart", items_rules.SPECIAL)
+def test_requesting_a_special_log_is_refused_with_a_pointer_to_the_raffle():
+    """Special logs are raffled now, so !request must send them elsewhere."""
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_item("Asta's Heart", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "raffled" in str(exc.value)
+
+
+def test_resolve_special_returns_the_canonical_header():
+    assert (
+        items_rules.resolve_special("  asta's   HEART ", SPECIAL_HEADERS, GEAR_HEADERS)
+        == "Asta's Heart"
+    )
+
+
+def test_resolve_special_refuses_a_gear_log_with_a_pointer_to_request():
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_special("Asta's Belt", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "!request" in str(exc.value)
+
+
+def test_resolve_special_suggests_close_names():
+    with pytest.raises(items_rules.ItemLookupError) as exc:
+        items_rules.resolve_special("Asta", SPECIAL_HEADERS, GEAR_HEADERS)
+    assert "Asta's Heart" in str(exc.value)
+
+
+def test_resolve_special_refuses_an_empty_query():
+    with pytest.raises(items_rules.ItemLookupError, match="No item name"):
+        items_rules.resolve_special("   ", SPECIAL_HEADERS, GEAR_HEADERS)
 
 
 def test_resolves_a_gear_item():
@@ -123,13 +149,13 @@ def _parse(argument):
 
 
 def test_parses_a_single_word_ign():
-    parsed = _parse("Asta's Heart Kobe")
-    assert (parsed.item.name, parsed.ign) == ("Asta's Heart", "Kobe")
+    parsed = _parse("Benji's Heart Kobe")
+    assert (parsed.item.name, parsed.ign) == ("Benji's Heart", "Kobe")
 
 
 def test_parses_an_ign_containing_spaces():
-    parsed = _parse("Asta's Heart chinchong ni Mumu")
-    assert (parsed.item.name, parsed.ign) == ("Asta's Heart", "chinchong ni Mumu")
+    parsed = _parse("Benji's Heart chinchong ni Mumu")
+    assert (parsed.item.name, parsed.ign) == ("Benji's Heart", "chinchong ni Mumu")
 
 
 def test_parses_a_gear_item():
@@ -138,14 +164,20 @@ def test_parses_a_gear_item():
 
 
 def test_extra_whitespace_does_not_matter():
-    parsed = _parse("  Asta's   Heart    Kobe ")
+    parsed = _parse("  Benji's   Heart    Kobe ")
     assert parsed.ign == "Kobe"
 
 
 def test_an_unknown_ign_is_refused_and_named():
     with pytest.raises(items_rules.RequestParseError) as exc:
-        _parse("Asta's Heart Kobee")
+        _parse("Benji's Heart Kobee")
     assert "Kobee" in str(exc.value) or "Kobe" in str(exc.value)
+
+
+def test_parse_request_refuses_a_special_log_naming_the_raffle():
+    """The refusal has to survive the split loop, not just resolve_item."""
+    with pytest.raises(items_rules.RequestParseError, match="raffled"):
+        _parse("Asta's Heart Kobe")
 
 
 def test_an_unknown_item_is_refused():
@@ -170,7 +202,7 @@ def test_an_alias_resolves_to_the_sheet_row():
     no fuzzy threshold, however low, could ever match them.
     """
     parsed = items_rules.parse_request(
-        "Asta's Heart ツRyuuツ", ["Ryuu"], SPECIAL_HEADERS, GEAR_HEADERS
+        "Benji's Heart ツRyuuツ", ["Ryuu"], SPECIAL_HEADERS, GEAR_HEADERS
     )
     assert parsed.ign == "Ryuu"
 
@@ -178,7 +210,7 @@ def test_an_alias_resolves_to_the_sheet_row():
 def test_an_alias_whose_target_is_absent_does_not_resolve():
     with pytest.raises(items_rules.RequestParseError):
         items_rules.parse_request(
-            "Asta's Heart ツRyuuツ", ["Kobe"], SPECIAL_HEADERS, GEAR_HEADERS
+            "Benji's Heart ツRyuuツ", ["Kobe"], SPECIAL_HEADERS, GEAR_HEADERS
         )
 
 
