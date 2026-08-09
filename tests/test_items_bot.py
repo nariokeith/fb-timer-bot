@@ -2472,3 +2472,45 @@ def test_two_officers_drawing_the_same_raffle_tick_the_box_once(monkeypatch):
     assert writes == ["Jjew"], f"checkbox written {len(writes)} times"
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winner == "Jjew"
     assert "already been drawn" in ctx.sent[-1]["embed"].description
+
+
+def test_no_command_is_defined_after_the_main_guard():
+    """bot.run() blocks, so a command below the guard never registers.
+
+    Importing items_bot cannot catch this: __name__ is not "__main__",
+    so main() is skipped and every decorator runs. Only running the file
+    as a script exposes it -- which is exactly what production does and
+    the test suite does not. So the invariant is checked on the source.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(items_bot.__file__).read_text()
+    tree = ast.parse(source)
+
+    guards = [
+        node.lineno
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and ast.dump(node.test).find("__main__") != -1
+    ]
+    assert len(guards) == 1, f"expected exactly one __main__ guard, found {len(guards)}"
+
+    late = [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.lineno > guards[0]
+        and any(
+            isinstance(d, ast.Call)
+            and getattr(d.func, "attr", "") == "command"
+            for d in node.decorator_list
+        )
+    ]
+    assert late == [], f"these commands would never register in production: {late}"
+
+
+def test_every_raffle_command_is_registered_on_the_bot():
+    registered = {c.name for c in items_bot.bot.commands}
+    for name in ("poll", "list", "winner", "setraffleroles", "setrafflechannel"):
+        assert name in registered, f"!{name} is not registered"

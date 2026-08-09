@@ -1264,9 +1264,6 @@ def main() -> None:
     bot.run(os.environ["ITEMS_DISCORD_TOKEN"])
 
 
-if __name__ == "__main__":
-    main()
-
 
 POLL_ANSWER = "Yes"
 
@@ -1722,3 +1719,10 @@ async def winner_cmd(ctx, *, argument: str = ""):
             "eligible for this log again.",
         )
     )
+
+
+# Must stay the LAST statement in this file. bot.run() blocks, so any
+# @bot.command defined below this point would never be registered -- and
+# the tests would not notice, because importing the module skips main().
+if __name__ == "__main__":
+    main()
