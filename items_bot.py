@@ -253,6 +253,17 @@ async def refresh_board() -> None:
         if message is not None:
             try:
                 await message.edit(embed=embed)
+                # The board content matters even when pinning is temporarily
+                # unavailable, so retry the best-effort pin only after editing.
+                if not message.pinned:
+                    try:
+                        await message.pin()
+                    except Exception as exc:
+                        print(
+                            f"[items] could not pin queue board: {exc!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                 return
             except discord.NotFound:
                 pass

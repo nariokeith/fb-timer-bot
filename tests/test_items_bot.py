@@ -23,6 +23,7 @@ class FakeMessage:
         *,
         raise_on_edit=False,
         raise_on_delete=False,
+        raise_on_pin=False,
     ):
         self.content = content
         self.id = message_id
@@ -30,8 +31,10 @@ class FakeMessage:
         self.deleted = False
         self.edits: list[str] = []
         self.edit_calls = 0
+        self.pin_calls = 0
         self.raise_on_edit = raise_on_edit
         self.raise_on_delete = raise_on_delete
+        self.raise_on_pin = raise_on_pin
         self.embed = None
         self.view = None
 
@@ -53,6 +56,9 @@ class FakeMessage:
             self.view = kwargs["view"]
 
     async def pin(self):
+        self.pin_calls += 1
+        if self.raise_on_pin:
+            raise _http_exception()
         self.pinned = True
 
     async def delete(self):
@@ -634,6 +640,52 @@ def test_refresh_board_edits_the_existing_message_with_queue_order(monkeypatch):
     assert board.embed.title == "📦 Queue Board"
     assert "1   Dajz" in board.embed.description
     assert "2   Kobe" in board.embed.description
+
+
+def test_refresh_board_pins_an_existing_unpinned_message_after_updating_it(monkeypatch):
+    board = FakeMessage("old board", message_id=7)
+    channel = FakeChannel(99, pins=[board])
+    items_bot._STATE.queue_channel_id = channel.id
+    items_bot._STATE.board_message_id = board.id
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: channel)
+
+    asyncio.run(items_bot.refresh_board())
+
+    assert board.embed.title == "📦 Queue Board"
+    assert "1   Dajz" in board.embed.description
+    assert board.pinned
+    assert board.pin_calls == 1
+
+
+def test_refresh_board_does_not_repin_an_existing_pinned_message(monkeypatch):
+    board = FakeMessage("old board", message_id=7)
+    board.pinned = True
+    channel = FakeChannel(99, pins=[board])
+    items_bot._STATE.queue_channel_id = channel.id
+    items_bot._STATE.board_message_id = board.id
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: channel)
+
+    asyncio.run(items_bot.refresh_board())
+
+    assert board.embed.title == "📦 Queue Board"
+    assert board.pin_calls == 0
+
+
+def test_refresh_board_updates_an_existing_message_when_pin_retry_fails(monkeypatch):
+    board = FakeMessage("old board", message_id=7, raise_on_pin=True)
+    channel = FakeChannel(99, pins=[board])
+    items_bot._STATE.queue_channel_id = channel.id
+    items_bot._STATE.board_message_id = board.id
+    items_bot._STATE.queue = [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)]
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: channel)
+
+    asyncio.run(items_bot.refresh_board())
+
+    assert board.embed.title == "📦 Queue Board"
+    assert "1   Dajz" in board.embed.description
+    assert board.pin_calls == 1
+    assert not board.pinned
 
 
 def test_refresh_board_reposts_and_pins_a_deleted_message_and_saves_its_id(monkeypatch):
