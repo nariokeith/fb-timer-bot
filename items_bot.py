@@ -40,7 +40,7 @@ PANEL_TIMEOUT = 900  # 15 minutes
 
 # Reposting is presentation-only, so losing this cadence across a restart is
 # harmless and does not justify expanding the persisted queue-state schema.
-BOARD_REPOST_EVERY = 5
+BOARD_REPOST_EVERY = 3
 _SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
 
 # Serializes every read-then-write pair. Two officers approving at once
