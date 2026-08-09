@@ -85,9 +85,25 @@ def test_an_alias_resolves_through_the_roster():
     assert items_raffle.resolve_voter("BK | KobePH", ROSTER) == "Kobe"
 
 
+def test_a_tag_that_is_itself_a_roster_name_is_still_only_a_tag():
+    """Candidates are suffixes, so the leading 'Kobe' can never win.
+
+    The guild tag is always on the left. A member called Jjew whose tag
+    happens to be another player's name still resolves to Jjew.
+    """
+    assert items_raffle.resolve_voter("Kobe | Jjew", ROSTER) == "Jjew"
+
+
 def test_a_nickname_matching_two_different_rows_does_not_resolve():
-    """'Kobe | Jjew' could be read as either player. Refuse, don't pick."""
-    assert items_raffle.resolve_voter("Kobe | Jjew", ROSTER) is None
+    """Two roster rows where one is a suffix of the other. Refuse, don't pick.
+
+    'BK | chinchong ni Mumu' produces both 'chinchong ni Mumu' and
+    'ni Mumu' as candidates. If the sheet ever holds both, the bot has
+    no way to tell which player is meant.
+    """
+    roster = ROSTER + ["ni Mumu"]
+
+    assert items_raffle.resolve_voter("BK | chinchong ni Mumu", roster) is None
 
 
 def test_an_unknown_nickname_does_not_resolve():
