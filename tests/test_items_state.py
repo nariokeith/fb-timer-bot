@@ -198,7 +198,10 @@ def test_decode_shards_reports_missing_parts_while_restoring_available_requests(
 
 
 def test_fits_is_true_at_the_shard_limit_and_false_past_it():
-    requests = [_request(request_id=f"id{n:03d}") for n in range(200)]
+    # Enough to overflow MAX_SHARDS with room to spare; a range that only
+    # just reached the old ceiling would make this test fail as a
+    # StopIteration the day the ceiling is raised.
+    requests = [_request(request_id=f"id{n:03d}") for n in range(items_state.MAX_SHARDS * 20)]
     first_over_limit = next(
         count
         for count in range(len(requests) + 1)
@@ -348,28 +351,89 @@ def test_replace_raffle_swaps_the_record_in_place():
     assert original.winner == ""
 
 
-def test_evicting_drops_the_oldest_ended_raffle_when_full():
-    state = items_state.State(
+def _full_of(**kwargs):
+    """MAX_RAFFLES raffles, oldest first, all sharing the given fields."""
+    return items_state.State(
         raffles=[
-            _raffle(item=f"Log {n}", created=f"2026-08-0{n + 1} 10:00:00", ends=f"2026-08-0{n + 1} 12:00:00")
+            _raffle(
+                item=f"Log {n}",
+                created=f"2026-08-09 {n:02d}:00:00",
+                **kwargs,
+            )
             for n in range(items_state.MAX_RAFFLES)
         ]
     )
+
+
+def test_evicting_drops_the_oldest_DRAWN_raffle_when_full():
+    state = _full_of(ends="2026-08-09 12:00:00")
+    # Log 0 and Log 1 have been drawn; the rest are ended but undrawn.
+    for index in (0, 1):
+        items_state.replace_raffle(state, state.raffles[index], winner="Kobe")
 
     assert items_state.evict_for_new_raffle(state, "2026-08-09 13:00:00")
-    assert [r.item for r in state.raffles] == [f"Log {n}" for n in range(1, items_state.MAX_RAFFLES)]
+    assert "Log 0" not in [r.item for r in state.raffles]
+    assert "Log 1" in [r.item for r in state.raffles]
 
 
-def test_evicting_refuses_when_every_raffle_is_still_open():
-    state = items_state.State(
-        raffles=[
-            _raffle(item=f"Log {n}", ends="2026-12-31 23:59:59")
-            for n in range(items_state.MAX_RAFFLES)
-        ]
-    )
+def test_evicting_never_discards_an_ended_raffle_nobody_has_drawn():
+    """The whole point of a raffle is the draw.
+
+    An ended-but-undrawn raffle still holds the frozen pool !winner
+    checks against. Dropping it to make room would silently destroy the
+    only record of who was eligible, so a full state refuses instead.
+    """
+    state = _full_of(ends="2026-08-09 12:00:00", listed=True, eligible=("Jjew",))
 
     assert not items_state.evict_for_new_raffle(state, "2026-08-09 13:00:00")
     assert len(state.raffles) == items_state.MAX_RAFFLES
+
+
+def test_evicting_refuses_when_every_raffle_is_still_open():
+    state = _full_of(ends="2026-12-31 23:59:59")
+
+    assert not items_state.evict_for_new_raffle(state, "2026-08-09 13:00:00")
+    assert len(state.raffles) == items_state.MAX_RAFFLES
+
+
+def test_a_drawn_raffle_is_evictable_even_before_its_poll_closes():
+    """A winner is recorded; the poll's clock no longer matters."""
+    state = _full_of(ends="2026-12-31 23:59:59")
+    items_state.replace_raffle(state, state.raffles[0], winner="Kobe")
+
+    assert items_state.evict_for_new_raffle(state, "2026-08-09 13:00:00")
+    assert "Log 0" not in [r.item for r in state.raffles]
+
+
+def test_twenty_listed_raffles_and_a_full_queue_still_fit():
+    """The reason MAX_SHARDS was raised: 20 items raffled in one day."""
+    state = items_state.State(
+        officer_channel_id=1,
+        queue_channel_id=2,
+        raffle_channel_id=3,
+        raffle_role_ids=[10, 11],
+        raffles=[
+            _raffle(
+                item=f"Special Log Number {n}",
+                created=f"2026-08-09 {n:02d}:00:00",
+                listed=True,
+                eligible=tuple(f"PlayerName{i:02d}" for i in range(35)),
+            )
+            for n in range(20)
+        ],
+        queue=[
+            items_state.PendingRequest(
+                f"id{i:03d}", i, f"Player {i}", "Asta's Belt", "Gear",
+                "2026-08-09 09:00:00",
+            )
+            for i in range(30)
+        ],
+    )
+
+    assert items_state.fits(state)
+    restored = items_state.decode_shards(items_state.encode_state(state))
+    assert len(restored.raffles) == 20
+    assert restored.raffles[0].eligible == state.raffles[0].eligible
 
 
 def test_evicting_does_nothing_below_the_ceiling():

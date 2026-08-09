@@ -1049,10 +1049,13 @@ def test_unreachable_officer_channel_does_not_keep_a_queued_request(monkeypatch)
 
 def test_request_that_would_exceed_state_capacity_is_refused_without_changes(monkeypatch):
     items_bot._STATE.officer_channel_id = 99
+    # Sized off MAX_SHARDS rather than a literal, so raising the shard
+    # ceiling cannot silently turn this into a test of the happy path.
     items_bot._STATE.queue = [
-        _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
-        for n in range(140)
+        _queued(f"id{n:03d}", f"Player {n}", "Asta's Belt", items_rules.GEAR)
+        for n in range(items_state.MAX_SHARDS * 15)
     ]
+    assert not items_state.fits(items_bot._STATE), "queue must start over the limit"
     items_bot._STATE.igns = {"1": "Kobe"}
     before_queue = list(items_bot._STATE.queue)
     before_igns = dict(items_bot._STATE.igns)
@@ -1979,22 +1982,55 @@ def test_poll_refuses_a_second_open_raffle_for_the_same_log(monkeypatch):
     assert len(items_bot._STATE.raffles) == 1
 
 
-def test_poll_refuses_when_every_slot_holds_a_live_raffle(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", *[f"Log {n}" for n in range(5)]))
+def _fill_every_raffle_slot(monkeypatch, ends="2099-01-01 00:00:00", drawn=()):
+    logs = [f"Log {n}" for n in range(items_state.MAX_RAFFLES)]
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", *logs))
     items_bot._STATE.raffles = [
         items_state.Raffle(
-            item=f"Log {n}", channel_id=42, message_id=n,
-            created_at="2026-08-09 10:00:00", ends_at="2099-01-01 00:00:00",
+            item=name, channel_id=42, message_id=n,
+            created_at=f"2026-08-09 {n:02d}:00:00", ends_at=ends,
+            winner="Kobe" if name in drawn else "",
         )
-        for n in range(items_state.MAX_RAFFLES)
+        for n, name in enumerate(logs)
     ]
+
+
+def test_poll_refuses_when_every_slot_holds_a_live_raffle(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _fill_every_raffle_slot(monkeypatch)
     ctx, _ = _raffle_ctx()
 
     asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
 
-    assert "still open" in ctx.sent[-1]["embed"].description
+    assert "waiting for a winner" in ctx.sent[-1]["embed"].description
     assert len(items_bot._STATE.raffles) == items_state.MAX_RAFFLES
+
+
+def test_poll_refuses_rather_than_discard_an_ended_raffle_with_no_winner(monkeypatch):
+    """The frozen pool is the only copy. Never drop it to make room."""
+    _configured_raffle(monkeypatch)
+    _fill_every_raffle_slot(monkeypatch, ends="2020-01-01 00:00:00")
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert "waiting for a winner" in ctx.sent[-1]["embed"].description
+    assert len(items_bot._STATE.raffles) == items_state.MAX_RAFFLES
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart") is None
+
+
+def test_poll_reuses_the_slot_of_the_oldest_drawn_raffle(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _fill_every_raffle_slot(monkeypatch, drawn=("Log 0", "Log 3"))
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    items = [r.item for r in items_bot._STATE.raffles]
+    assert "Log 0" not in items
+    assert "Log 3" in items
+    assert "Asta's Heart" in items
+    assert len(items) == items_state.MAX_RAFFLES
 
 
 def test_poll_outside_the_raffle_channel_says_nothing(monkeypatch):

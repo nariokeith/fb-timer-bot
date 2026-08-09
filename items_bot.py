@@ -1325,7 +1325,9 @@ async def poll_cmd(ctx, *, argument: str = ""):
                 embed=error_embed(
                     "Poll refused",
                     f"All {items_state.MAX_RAFFLES} tracked raffles are still "
-                    "open. Draw a winner for one of them first.",
+                    "waiting for a winner. Run `!winner` on one of them "
+                    "first — the bot will not discard a raffle you have not "
+                    "drawn yet.",
                 )
             )
             return

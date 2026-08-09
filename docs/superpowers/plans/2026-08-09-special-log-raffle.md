@@ -17,6 +17,13 @@
 - Never fuzzy-match a name into a permanent sheet write. Exact normalized matching plus `attendance_roster.ALIASES` only. Fuzzy matching is allowed *only* to produce "did you mean" suggestions in refusals.
 - Refuse rather than guess: an ambiguous reading is an error message, never a choice.
 - `MAX_RAFFLES = 5`, `DEFAULT_POLL_HOURS = 24`, `MIN_POLL_HOURS = 1`, `MAX_POLL_HOURS = 168`.
+
+> **Amended after this plan was executed (2026-08-09):** the guild needs to
+> raffle twenty items in a single day, so `MAX_RAFFLES` became `25` and
+> `MAX_SHARDS` became `20`. Eviction also changed: only a **drawn** raffle may
+> be dropped, never one that merely ended, because its frozen eligible pool is
+> the only copy. See the design doc's "How many raffles are kept". Tasks below
+> are recorded as they were executed; the code and spec are the current truth.
 - Every commit message ends with:
   `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`
 - Work on a branch, not `main`.

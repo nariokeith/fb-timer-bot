@@ -23,7 +23,12 @@ STATE_MARKER = "ITEMS_STATE_V1"
 # Discord's hard limit is 2000 characters. The margin absorbs the
 # marker line and the fence, exactly as bot.py's encode_state does.
 MAX_CONTENT = 1990
-MAX_SHARDS = 10
+
+# Twenty pinned messages, against Discord's limit of 50 per channel. The
+# ceiling exists so a runaway queue cannot bury the channel, not because
+# the API is near its own -- and save_state rewrites only the shards
+# whose contents actually changed, so a high count is not a high cost.
+MAX_SHARDS = 20
 
 
 @dataclass(frozen=True)
@@ -64,10 +69,11 @@ class PendingRequest:
         )
 
 
-# The pinned messages are capped at MAX_SHARDS, and a listed raffle
-# carries an eligible IGN for every voter. Five is enough history to
-# re-read recent draws without crowding the queue out of the pins.
-MAX_RAFFLES = 5
+# A listed raffle carries an eligible IGN for every voter, so raffles are
+# the bulkiest thing in the state. Twenty-five covers a guild raffling
+# twenty items in one day with headroom, and measures at 15 shards even
+# when every one is listed with a full roster -- see the fits() test.
+MAX_RAFFLES = 25
 
 
 @dataclass(frozen=True)
@@ -442,14 +448,21 @@ def raffle_item_names(state: State) -> list[str]:
 def evict_for_new_raffle(state: State, now: str) -> bool:
     """Make room for one more raffle. False when there is none to make.
 
-    Only a raffle whose poll has already closed may be dropped. Evicting
-    a live one would orphan a poll members are still voting in, with no
-    way to draw from it.
+    Only a raffle that has been DRAWN may be dropped -- `now` is unused
+    and kept for callers, because a poll's clock is not what makes a
+    raffle finished. An ended-but-undrawn raffle still holds the frozen
+    eligible pool that !winner checks against, and it is the only copy:
+    the poll message may be gone, and Discord will not recompute it.
+    Dropping one to make room would destroy the record of who was
+    eligible without anyone being told.
+
+    So a full state refuses, and the officer clears it by drawing a
+    winner -- which is the thing they were going to do anyway.
     """
     if len(state.raffles) < MAX_RAFFLES:
         return True
-    ended = [raffle for raffle in state.raffles if raffle.ends_at <= now]
-    if not ended:
+    drawn = [raffle for raffle in state.raffles if raffle.winner]
+    if not drawn:
         return False
-    state.raffles.remove(min(ended, key=lambda raffle: raffle.created_at))
+    state.raffles.remove(min(drawn, key=lambda raffle: raffle.created_at))
     return True
