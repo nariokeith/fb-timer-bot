@@ -1676,3 +1676,183 @@ def test_cancelrequest_refreshes_the_queue_board(monkeypatch):
     asyncio.run(items_bot.cancelrequest_cmd.callback(ctx))
 
     assert refreshes == [True]
+
+
+def test_the_members_intent_is_enabled():
+    """Poll voters resolve to Members only when this intent is on.
+
+    Without it discord.py falls back to User objects, whose display_name
+    is the global name -- not the 'BK | Jjew' server nickname the roster
+    match depends on.
+    """
+    assert items_bot.intents.members is True
+
+
+def test_dropping_special_requests_removes_only_the_specials():
+    state = items_state.State(
+        queue=[
+            items_state.PendingRequest("a", 1, "Kobe", "Asta's Heart", "Special", "2026-08-09 09:00:00"),
+            items_state.PendingRequest("b", 2, "Jjew", "Sacred Ring", "Gear", "2026-08-09 09:01:00"),
+        ]
+    )
+
+    dropped = items_bot.drop_special_requests(state)
+
+    assert [r.id for r in dropped] == ["a"]
+    assert [r.id for r in state.queue] == ["b"]
+
+
+def test_dropping_nothing_leaves_the_queue_alone():
+    state = items_state.State(
+        queue=[items_state.PendingRequest("b", 2, "Jjew", "Sacred Ring", "Gear", "2026-08-09 09:01:00")]
+    )
+
+    assert items_bot.drop_special_requests(state) == []
+    assert [r.id for r in state.queue] == ["b"]
+
+
+def test_announcing_dropped_specials_saves_and_names_every_member():
+    channel = FakeChannel(99)
+    items_bot._STATE.officer_channel_id = channel.id
+    items_bot._STATE.queue = [
+        items_state.PendingRequest("a", 7, "Kobe", "Asta's Heart", "Special", "2026-08-09 09:00:00"),
+        items_state.PendingRequest("b", 8, "Jjew", "Asta's Belt", "Gear", "2026-08-09 09:01:00"),
+    ]
+
+    asyncio.run(items_bot.announce_dropped_specials(channel))
+
+    notice = channel.sent[-1].embed
+    assert "Asta's Heart" in notice.description
+    assert "<@7>" in notice.description
+    assert [r.id for r in items_bot._STATE.queue] == ["b"]
+    saved = items_state.decode_shards([m.content for m in channel.sent if m.content])
+    assert [r.id for r in saved.queue] == ["b"]
+
+
+def test_announcing_nothing_posts_nothing():
+    channel = FakeChannel(99)
+    items_bot._STATE.officer_channel_id = channel.id
+    items_bot._STATE.queue = [
+        items_state.PendingRequest("b", 8, "Jjew", "Asta's Belt", "Gear", "2026-08-09 09:01:00")
+    ]
+
+    asyncio.run(items_bot.announce_dropped_specials(channel))
+
+    assert channel.sent == []
+
+
+class FakeRole:
+    def __init__(self, role_id):
+        self.id = role_id
+        self.mention = f"@role-{role_id}"
+
+
+class FakeMember:
+    def __init__(self, user_id=1, roles=(), display_name="BK | Jjew", administrator=False):
+        self.id = user_id
+        self.display_name = display_name
+        self.roles = list(roles)
+        self.guild_permissions = type(
+            "Perms", (), {"administrator": administrator}
+        )()
+
+
+def _raffle_ctx(channel_id=42, roles=(10,), administrator=False):
+    channel = FakeChannel(channel_id)
+    ctx = FakeCtx(channel)
+    ctx.author = FakeMember(roles=[FakeRole(r) for r in roles], administrator=administrator)
+    return ctx, channel
+
+
+def test_holding_any_configured_role_is_enough():
+    author = FakeMember(roles=[FakeRole(99), FakeRole(11)])
+
+    assert items_bot.has_raffle_role(author, [10, 11])
+
+
+def test_holding_no_configured_role_is_refused():
+    author = FakeMember(roles=[FakeRole(99)])
+
+    assert not items_bot.has_raffle_role(author, [10, 11])
+
+
+def test_setraffleroles_stores_every_role_once():
+    items_bot._STATE.officer_channel_id = 1
+    channel = FakeChannel(1)
+    ctx = FakeCtx(channel)
+    roles = (FakeRole(10), FakeRole(11), FakeRole(10))
+
+    asyncio.run(items_bot.setraffleroles_cmd.callback(ctx, *roles))
+
+    assert items_bot._STATE.raffle_role_ids == [10, 11]
+    assert ctx.sent[-1]["embed"].title == "✅ Raffle roles set"
+
+
+def test_setraffleroles_without_a_role_shows_usage():
+    items_bot._STATE.officer_channel_id = 1
+    ctx = FakeCtx(FakeChannel(1))
+
+    asyncio.run(items_bot.setraffleroles_cmd.callback(ctx))
+
+    assert items_bot._STATE.raffle_role_ids == []
+    assert "!setraffleroles" in ctx.sent[-1]["embed"].description
+
+
+def test_setrafflechannel_requires_an_officer_channel_first():
+    ctx = FakeCtx(FakeChannel(42))
+
+    asyncio.run(items_bot.setrafflechannel_cmd.callback(ctx))
+
+    assert items_bot._STATE.raffle_channel_id is None
+    assert "!setofficerchannel" in ctx.sent[-1]["embed"].description
+
+
+def test_setrafflechannel_records_the_channel(monkeypatch):
+    state_channel = FakeChannel(1)
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: state_channel)
+    items_bot._STATE.officer_channel_id = 1
+    ctx = FakeCtx(FakeChannel(42))
+
+    asyncio.run(items_bot.setrafflechannel_cmd.callback(ctx))
+
+    assert items_bot._STATE.raffle_channel_id == 42
+    assert ctx.sent[-1]["embed"].title == "✅ Raffle channel set"
+
+
+def test_an_unconfigured_raffle_channel_hints_only_to_admins():
+    admin_ctx, _ = _raffle_ctx(administrator=True)
+    member_ctx, _ = _raffle_ctx(administrator=False)
+
+    assert "!setrafflechannel" in items_bot.raffle_access(admin_ctx)
+    assert items_bot.raffle_access(member_ctx) is items_bot.IGNORE
+
+
+def test_the_wrong_channel_is_silently_ignored():
+    items_bot._STATE.raffle_channel_id = 42
+    items_bot._STATE.raffle_role_ids = [10]
+    ctx, _ = _raffle_ctx(channel_id=999)
+
+    assert items_bot.raffle_access(ctx) is items_bot.IGNORE
+
+
+def test_no_configured_roles_is_a_refusal_not_an_open_door():
+    items_bot._STATE.raffle_channel_id = 42
+    ctx, _ = _raffle_ctx()
+
+    assert "!setraffleroles" in items_bot.raffle_access(ctx)
+
+
+def test_a_member_without_a_raffle_role_is_refused():
+    items_bot._STATE.raffle_channel_id = 42
+    items_bot._STATE.raffle_role_ids = [10]
+    ctx, _ = _raffle_ctx(roles=(99,))
+
+    assert "role" in items_bot.raffle_access(ctx).casefold()
+
+
+def test_a_role_holder_in_the_raffle_channel_is_permitted():
+    items_bot._STATE.raffle_channel_id = 42
+    items_bot._STATE.raffle_role_ids = [10]
+    ctx, _ = _raffle_ctx()
+
+    assert items_bot.raffle_access(ctx) is None

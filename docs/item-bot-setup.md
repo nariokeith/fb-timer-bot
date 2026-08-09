@@ -34,11 +34,15 @@ The supervisor is only for Render, where nothing else is running.
 2. **Bot** tab → **Reset Token** → copy it. This is `ITEMS_DISCORD_TOKEN`.
    Treat it like a password; anyone holding it controls the bot.
 3. Still on the Bot tab, scroll to **Privileged Gateway Intents** and turn on
-   **MESSAGE CONTENT INTENT**. Save.
+   **MESSAGE CONTENT INTENT** and **SERVER MEMBERS INTENT**. Save.
 
-   Without this the bot connects, looks online, and silently ignores every
-   `!request` — it cannot see message text at all. This is the single most
-   common reason a new bot "does nothing".
+   Without message content the bot connects, looks online, and silently
+   ignores every `!request` — it cannot see message text at all. This is the
+   single most common reason a new bot "does nothing".
+
+   Without server members the bot cannot read anyone's server nickname, so
+   every voter in a special log raffle comes back as "couldn't identify" and
+   `!list` produces an empty eligible list. Both are needed.
 
 4. **OAuth2 → URL Generator**:
    - Scopes: **`bot`**
@@ -214,17 +218,50 @@ the timer and attendance bots keep running normally either way.
 Local state does not carry over. Run it in the real officer channel, and confirm
 the pinned message appears.
 
-### 6. Tell your members
+### 6. Set up the special log raffle
+
+Special logs are not requested. Run these once, as an admin:
 
 ```
-!request <item name> <IGN>     e.g.  !request Asta's Heart Kobe
+!setraffleroles @Officer       who may run the raffle commands
+!setrafflechannel              run this IN the special logs channel
+```
+
+Order matters: `!setofficerchannel` first, because that is where the bot keeps
+its state. Then, in the raffle channel, whoever holds a raffle role runs:
+
+```
+!poll <special log>            opens a 24-hour poll; --hours N to change it
+!list <special log>            after it closes: who is eligible
+!winner <special log> <IGN>    records the draw, ticks their checkbox
+```
+
+`!list` reads everyone who answered **Yes**, converts their nickname to an IGN,
+and removes anyone already ticked for that log in the `Special Logs` tab. It
+prints eligible, already-has-it, and couldn't-identify. Draw the winner
+yourself, then run `!winner`.
+
+`!winner` refuses a name that is not on the list `!list` froze, refuses a
+second draw for the same raffle, and refuses to run before `!list`. On success
+it ticks the checkbox and adds a `Distribution Log` row — the same write an
+officer approval makes.
+
+Members' nicknames must contain their IGN. `BK | Jjew`, `M2 - Jjew`, `BK Jjew`
+and a bare `Jjew` all resolve to the sheet row `Jjew`. Anything that does not
+contain the IGN is reported for you to handle by hand.
+
+### 7. Tell your members
+
+```
+!request <item name> <IGN>     GEAR LOGS ONLY. e.g. !request Asta's Belt Kobe
 !myrequests                    what you have pending
 !cancelrequest                 withdraw a request
 !itemhelp                      the rules
 ```
 
-Rules: special logs once ever; gear logs 3 per day, resetting midnight Manila
-time. Their IGN must match their row in the sheet.
+Rules: gear logs 3 per day, resetting midnight Manila time. Their IGN must
+match their row in the sheet. For special logs they answer **Yes** on the poll
+in the raffle channel — `!request` will refuse them and say so.
 
 They also don't have to ask where they stand. Run `!setqueuechannel` once in
 their channel and the bot keeps a pinned board there showing the whole queue —

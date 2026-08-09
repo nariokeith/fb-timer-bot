@@ -5,10 +5,11 @@ Discord token and its own spreadsheet, so nothing it does can affect
 either of them. See supervisor.py for why all three share one Render
 service.
 
-Authorization is the private officer channel itself: !distribute is
-accepted only there, and a button attached to a message in that channel
-can only be pressed by someone Discord already lets see the channel.
-There is no role configuration to drift.
+Authorization has two shapes. !distribute is accepted only in the private
+officer channel, so a button there can only be pressed by someone Discord
+already lets see the channel. The raffle commands cannot work that way --
+the poll must be visible to members -- so they are gated on configured
+roles instead.
 """
 
 import asyncio
@@ -53,6 +54,12 @@ _SPREADSHEET = None
 
 intents = discord.Intents.default()
 intents.message_content = True
+# Poll voters arrive as Members only when this intent is on; otherwise
+# discord.py yields Users, whose display_name is the global name rather
+# than the 'BK | Jjew' server nickname the roster match reads. It is a
+# privileged intent and must also be enabled for this application in the
+# Discord Developer Portal.
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
@@ -377,6 +384,124 @@ async def setqueuechannel_cmd(ctx):
             "Queue channel set",
             f"The member queue board is now in {ctx.channel.mention}. The bot "
             "will keep it updated and pinned here.",
+        )
+    )
+
+
+# raffle_access returns this instead of a message when the command should
+# produce no reply at all. A distinct object rather than None, because
+# None already means "permitted".
+IGNORE = "\x00ignore"
+
+
+def has_raffle_role(author, role_ids: list[int]) -> bool:
+    """True if the author holds ANY configured raffle role."""
+    wanted = set(role_ids or ())
+    if not wanted:
+        return False
+    return any(role.id in wanted for role in getattr(author, "roles", []))
+
+
+def raffle_access(ctx) -> str | None:
+    """None if this raffle command may run, else a refusal or IGNORE.
+
+    Wrong-channel is silent: a raffle command typed elsewhere is far more
+    likely to be a typo than an attack, and a reply would only advertise
+    that the channel exists. The unconfigured case is the exception --
+    silence there is a dead end, so the one person who can fix it is told
+    and nobody else is.
+    """
+    if _STATE.raffle_channel_id is None:
+        permissions = getattr(ctx.author, "guild_permissions", None)
+        if getattr(permissions, "administrator", False):
+            return (
+                "No raffle channel is set. Run `!setrafflechannel` in the "
+                "channel where special log polls should be posted."
+            )
+        return IGNORE
+
+    if ctx.channel.id != _STATE.raffle_channel_id:
+        return IGNORE
+
+    if not _STATE.raffle_role_ids:
+        return (
+            "No raffle role is set. An admin must run "
+            "`!setraffleroles @role` before the raffle commands work."
+        )
+    if not has_raffle_role(ctx.author, _STATE.raffle_role_ids):
+        return "You need a raffle role to run this command."
+    return None
+
+
+async def _refuse_raffle(ctx, verdict: str) -> bool:
+    """Send the refusal if there is one. True when the caller must stop."""
+    if verdict is None:
+        return False
+    if verdict is not IGNORE:
+        await ctx.send(embed=error_embed("Not allowed", verdict))
+    return True
+
+
+@bot.command(name="setraffleroles")
+@commands.has_permissions(administrator=True)
+async def setraffleroles_cmd(ctx, *roles: discord.Role):
+    """Choose which roles may run the raffle commands."""
+    if not roles:
+        await ctx.send(
+            embed=error_embed(
+                "Which role?",
+                "Usage: `!setraffleroles @role [@role ...]`\n"
+                "Every role you list replaces the current set.",
+            )
+        )
+        return
+
+    # Deduplicated by id, order preserved, so mentioning a role twice
+    # does not store it twice. Keyed on the id rather than the object so
+    # this never depends on Role being hashable.
+    unique: dict[int, discord.Role] = {}
+    for role in roles:
+        unique.setdefault(role.id, role)
+    _STATE.raffle_role_ids = list(unique)
+
+    channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if channel is not None:
+        await save_state(channel)
+    mentions = ", ".join(role.mention for role in unique.values())
+    await ctx.send(
+        embed=ok_embed(
+            "Raffle roles set",
+            f"{mentions} can now run `!poll`, `!list` and `!winner`.",
+        )
+    )
+
+
+@bot.command(name="setrafflechannel")
+@commands.has_permissions(administrator=True)
+async def setrafflechannel_cmd(ctx):
+    """Record this channel as the special log raffle channel."""
+    if _STATE.officer_channel_id is None:
+        await ctx.send(
+            embed=error_embed(
+                "Not set up yet",
+                "An admin must run `!setofficerchannel` in the officers' "
+                "channel before a raffle channel can be set.",
+            )
+        )
+        return
+
+    _STATE.raffle_channel_id = ctx.channel.id
+    channel = bot.get_channel(_STATE.officer_channel_id)
+    if channel is not None:
+        await save_state(channel)
+    await ctx.send(
+        embed=ok_embed(
+            "Raffle channel set",
+            f"`!poll`, `!list` and `!winner` now work in {ctx.channel.mention}.",
         )
     )
 
@@ -945,6 +1070,46 @@ def requests_for_user(state: items_state.State, user_id: int) -> list[items_stat
     return [r for r in state.queue if r.user_id == user_id]
 
 
+def drop_special_requests(state: items_state.State) -> list[items_state.PendingRequest]:
+    """Remove every queued special log request, returning them.
+
+    Special logs are raffled now. A request queued under the old rules
+    can no longer be approved into a sensible outcome, and leaving it in
+    the queue would show members a board line that never resolves.
+    """
+    dropped = [r for r in state.queue if r.type == items_rules.SPECIAL]
+    for request in dropped:
+        state.queue.remove(request)
+    return dropped
+
+
+async def announce_dropped_specials(channel) -> None:
+    """Drop stranded special requests and tell the officers who was waiting.
+
+    Called from BOTH restore paths in on_ready. The pin-scanning path
+    recovers a queue just as completely as the configured-channel one, so
+    skipping it there would leave the stranded requests alive on exactly
+    the redeploy that has no officer channel configured yet.
+    """
+    dropped = drop_special_requests(_STATE)
+    if not dropped:
+        return
+
+    await save_state(channel)
+    await refresh_board()
+    lines = "\n".join(
+        f"• **{r.item}** for **{r.ign}** (<@{r.user_id}>)" for r in dropped
+    )
+    await channel.send(
+        embed=error_embed(
+            "Special log requests removed",
+            "Special logs are raffled now, so these queued requests "
+            f"were dropped:\n{lines}\n\nTell these members to answer "
+            "the poll in the raffle channel instead.",
+        )
+    )
+
+
 def cancellable(
     state: items_state.State, user_id: int, item_query: str
 ) -> tuple[items_state.PendingRequest | None, str | None]:
@@ -1031,6 +1196,7 @@ async def on_ready():
                 try:
                     if await load_state(channel):
                         print(f"[items] restored state from #{channel.name}", flush=True)
+                        await announce_dropped_specials(channel)
                         return
                 except discord.HTTPException:
                     continue
@@ -1040,6 +1206,7 @@ async def on_ready():
     channel = bot.get_channel(_STATE.officer_channel_id)
     if channel is not None:
         await load_state(channel)
+        await announce_dropped_specials(channel)
 
 
 @bot.event
