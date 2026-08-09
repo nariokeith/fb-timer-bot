@@ -39,9 +39,9 @@ _SHEET_LOCK = asyncio.Lock()
 
 _STATE = items_state.State()
 
-# The pinned message holding _STATE, cached so save_state edits it
-# instead of posting a new one on every change.
-_STATE_MESSAGE: discord.Message | None = None
+# The pinned messages holding _STATE, cached in shard order so save_state
+# edits them instead of posting a new copy on every change.
+_STATE_MESSAGES: list[discord.Message] = []
 
 _SPREADSHEET = None
 
@@ -71,36 +71,61 @@ def gear_cap() -> int:
         return items_rules.DEFAULT_GEAR_DAILY_CAP
 
 
-async def save_state(channel) -> list[items_state.PendingRequest]:
-    """Write _STATE into the pinned message. Returns anything dropped.
-
-    Anything the encoder had to drop to fit is removed from _STATE.queue
-    too. Without that, the dropped requests survive in memory, still
-    appear in panels, and force the encoder to drop them again on every
-    single save -- while a restart resurrects a state message that never
-    contained them. Memory and storage must agree.
-    """
-    global _STATE_MESSAGE
-    content, dropped = items_state.encode_state(_STATE)
-    if dropped:
-        gone = {r.id for r in dropped}
-        _STATE.queue = [r for r in _STATE.queue if r.id not in gone]
-
-    if _STATE_MESSAGE is not None:
-        try:
-            await _STATE_MESSAGE.edit(content=content)
-            return dropped
-        except discord.HTTPException:
-            _STATE_MESSAGE = None
-
-    _STATE_MESSAGE = await channel.send(content)
+async def save_state(channel) -> None:
+    """Write _STATE into its pinned message shards."""
+    global _STATE_MESSAGES
     try:
-        await _STATE_MESSAGE.pin()
-    except discord.HTTPException:
-        # Pinning needs Manage Messages. Without it the message still
-        # works -- load_state scans history too -- so this is not fatal.
-        pass
-    return dropped
+        contents = items_state.encode_state(_STATE)
+    except ValueError as exc:
+        print(f"[items] could not save state: {exc!r}", file=sys.stderr, flush=True)
+        await channel.send(
+            embed=error_embed(
+                "State could not be saved",
+                "The request queue is too large to store safely. An officer must "
+                "work the queue down before more requests can be accepted.",
+            )
+        )
+        return
+
+    messages: list[discord.Message] = []
+    for index, content in enumerate(contents):
+        if index < len(_STATE_MESSAGES):
+            message = _STATE_MESSAGES[index]
+            # A member request holds _SHEET_LOCK; rewriting every unchanged
+            # shard here amplifies Discord rate limits and makes that path wait.
+            if (
+                message.content
+                and message.content.startswith(items_state.STATE_MARKER)
+                and message.content == content
+            ):
+                messages.append(message)
+                continue
+            try:
+                await message.edit(content=content)
+                messages.append(message)
+                continue
+            except discord.HTTPException:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+
+        message = await channel.send(content)
+        try:
+            await message.pin()
+        except discord.HTTPException:
+            # Pinning needs Manage Messages. Without it the message still
+            # works -- load_state scans history too -- so this is not fatal.
+            pass
+        messages.append(message)
+
+    for message in _STATE_MESSAGES[len(contents) :]:
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+    _STATE_MESSAGES = messages
+    _STATE.missing_parts = ()
 
 
 async def load_state(channel) -> bool:
@@ -112,19 +137,82 @@ async def load_state(channel) -> bool:
     coroutine returning a list -- `await channel.pins()` raises
     TypeError. It must be consumed with `async for`.
     """
-    global _STATE_MESSAGE
-    candidates = [message async for message in channel.pins(limit=50)]
-    candidates += [message async for message in channel.history(limit=100)]
-    for message in candidates:
-        decoded = items_state.decode_state(message.content)
-        if decoded is None:
-            continue
-        _STATE.officer_channel_id = decoded.officer_channel_id or channel.id
-        _STATE.queue = decoded.queue
-        _STATE.igns = decoded.igns
-        _STATE_MESSAGE = message
-        return True
-    return False
+    global _STATE, _STATE_MESSAGES
+    candidates = [
+        message
+        async for message in channel.pins(limit=50)
+        if message.author.bot
+    ]
+    candidates += [
+        message
+        async for message in channel.history(limit=100)
+        if message.author.bot
+    ]
+    unique = {message.id: message for message in candidates}
+    shard_messages = [
+        (decoded, message)
+        for message in unique.values()
+        if (decoded := items_state.decode_state(message.content)) is not None
+    ]
+    shard_by_part: dict[int, tuple[items_state.Shard, discord.Message]] = {}
+    stale_messages: list[discord.Message] = []
+    for decoded, message in shard_messages:
+        previous = shard_by_part.get(decoded.part)
+        if previous is None or message.id > previous[1].id:
+            if previous is not None:
+                stale_messages.append(previous[1])
+            # A replacement has a newer Discord snowflake, so it is the
+            # authoritative shard when an old edit-failure orphan remains.
+            shard_by_part[decoded.part] = (decoded, message)
+        else:
+            stale_messages.append(message)
+    for message in stale_messages:
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+    shard_messages = list(shard_by_part.values())
+    part_zero = shard_by_part.get(0)
+    if part_zero is not None:
+        # Message index 0 is edited on every save and is only deleted as
+        # surplus when the state has no shards, so its newest copy defines
+        # the current generation.
+        authoritative_total = part_zero[0].total
+        obsolete_messages = [
+            message
+            for decoded, message in shard_messages
+            if decoded.part >= authoritative_total
+        ]
+        for message in obsolete_messages:
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+        shard_messages = [
+            (decoded, message)
+            for decoded, message in shard_messages
+            if decoded.part < authoritative_total
+        ]
+    restored = items_state.decode_shards(
+        [message.content for _, message in shard_messages]
+    )
+    if restored is None:
+        return False
+
+    _STATE = restored
+    _STATE.officer_channel_id = _STATE.officer_channel_id or channel.id
+    _STATE_MESSAGES = [
+        message for _, message in sorted(shard_messages, key=lambda pair: pair[0].part)
+    ]
+    if _STATE.missing_parts:
+        await channel.send(
+            embed=error_embed(
+                "State recovery incomplete",
+                f"Recovered what could be read, but {len(_STATE.missing_parts)} "
+                "state shard(s) are missing. Check this channel's pinned messages.",
+            )
+        )
+    return True
 
 
 def _embed(title: str, description: str, colour: int) -> discord.Embed:
@@ -150,16 +238,17 @@ def is_officer_channel(channel_id: int) -> bool:
 @commands.has_permissions(administrator=True)
 async def setofficerchannel_cmd(ctx):
     """Record this channel as the officers' channel."""
-    global _STATE_MESSAGE
+    global _STATE_MESSAGES
     if _STATE.officer_channel_id != ctx.channel.id:
-        _STATE_MESSAGE = None
+        _STATE_MESSAGES = []
     _STATE.officer_channel_id = ctx.channel.id
     await save_state(ctx.channel)
     await ctx.send(
         embed=ok_embed(
             "Officer channel set",
             f"`!distribute` now works in {ctx.channel.mention}, and the bot "
-            "keeps its request queue in a pinned message here. Don't delete it.",
+            "keeps its request queue in pinned messages here. A long queue "
+            "needs several of them. Don't delete any.",
         )
     )
 
@@ -289,6 +378,21 @@ async def request_cmd(ctx, *, argument: str = ""):
         _STATE.queue.append(outcome.request)
         _STATE.igns[str(ctx.author.id)] = outcome.request.ign
 
+        if not items_state.fits(_STATE):
+            _STATE.queue.remove(outcome.request)
+            if previous_ign is None:
+                _STATE.igns.pop(str(ctx.author.id), None)
+            else:
+                _STATE.igns[str(ctx.author.id)] = previous_ign
+            await ctx.send(
+                embed=error_embed(
+                    "Queue is full",
+                    "The officers need to work the queue down before your request "
+                    "can be recorded. Please try again shortly.",
+                )
+            )
+            return
+
         channel = bot.get_channel(_STATE.officer_channel_id)
         if channel is None:
             _STATE.queue.remove(outcome.request)
@@ -304,18 +408,9 @@ async def request_cmd(ctx, *, argument: str = ""):
                 )
             )
             return
-        dropped = await save_state(channel)
+        await save_state(channel)
 
     await ctx.send(embed=ok_embed("Request queued", outcome.message))
-    if dropped and channel:
-        names = ", ".join(f"{d.item} ({d.ign})" for d in dropped)
-        await channel.send(
-            embed=error_embed(
-                "Queue overflowed",
-                f"The queue no longer fits in one message. These oldest "
-                f"requests were dropped and must be re-requested: {names}",
-            )
-        )
 
 
 # Discord allows at most 25 options in a select menu.
@@ -463,6 +558,10 @@ async def approve(request_id: str, officer_name: str) -> str:
     return f"Approved **{request.item}** for **{request.ign}**."
 
 
+def page_count(requests: list[items_state.PendingRequest]) -> int:
+    return max(1, (len(requests) + MAX_PANEL_OPTIONS - 1) // MAX_PANEL_OPTIONS)
+
+
 class DistributePanel(discord.ui.View):
     """Select a request, then approve or deny it.
 
@@ -471,27 +570,108 @@ class DistributePanel(discord.ui.View):
     the panel at five requests. A select handles 25.
     """
 
-    def __init__(self, requests: list[items_state.PendingRequest], *, start: int = 1):
+    def __init__(
+        self,
+        requests: list[items_state.PendingRequest],
+        snapshot: items_sheet.Snapshot,
+        *,
+        cap: int,
+        today: str,
+        page: int = 0,
+    ):
         super().__init__(timeout=PANEL_TIMEOUT)
         # A panel is shared by several officers at once; one officer's
         # dropdown choice must never become another officer's approval.
         self.selected: dict[int, str] = {}
-        # The page this panel shows, so refresh_panel redraws THIS page.
-        self.start = start
+        self.requests = list(requests)
+        self.snapshot = snapshot
+        self.cap = cap
+        self.today = today
+        self.total_pages = page_count(self.requests)
+        self.page = min(max(page, 0), self.total_pages - 1)
+        self.start = self.page * MAX_PANEL_OPTIONS + 1
         # Set by the sender so on_timeout can edit the panel.
         self.message: discord.Message | None = None
 
+        page_requests = self.requests[
+            self.page * MAX_PANEL_OPTIONS : (self.page + 1) * MAX_PANEL_OPTIONS
+        ]
         options = [
             discord.SelectOption(
                 label=f"{n}. {r.ign} — {r.item}"[:100],
                 value=r.id,
                 description=f"{r.type} · requested {r.requested_at}"[:100],
             )
-            for n, r in enumerate(requests[:MAX_PANEL_OPTIONS], start=start)
+            for n, r in enumerate(page_requests, start=self.start)
         ]
-        self.picker = discord.ui.Select(placeholder="Choose a request…", options=options)
+        self.picker = discord.ui.Select(
+            placeholder="Choose a request…", options=options, row=0
+        )
         self.picker.callback = self._on_pick
         self.add_item(self.picker)
+        self._add_page_controls()
+
+    def build_embed(self) -> discord.Embed:
+        requests = self.requests[
+            self.page * MAX_PANEL_OPTIONS : (self.page + 1) * MAX_PANEL_OPTIONS
+        ]
+        embed = build_panel_embed(
+            requests, self.snapshot, self.cap, self.today, start=self.start
+        )
+        if self.total_pages > 1:
+            embed.set_footer(text=f"Page {self.page + 1} of {self.total_pages}")
+        return embed
+
+    def _add_page_controls(self) -> None:
+        if self.total_pages == 1:
+            return
+
+        if self.total_pages > 5:
+            self._add_page_button("◀", self.page - 1, disabled=self.page == 0)
+            if self.page == 0:
+                numbers = range(0, 3)
+            elif self.page == self.total_pages - 1:
+                numbers = range(self.total_pages - 3, self.total_pages)
+            else:
+                numbers = range(self.page - 1, self.page + 2)
+            for page in numbers:
+                self._add_page_button(str(page + 1), page, disabled=page == self.page)
+            self._add_page_button(
+                "▶", self.page + 1, disabled=self.page == self.total_pages - 1
+            )
+            return
+
+        for page in range(self.total_pages):
+            self._add_page_button(str(page + 1), page, disabled=page == self.page)
+
+    def _add_page_button(self, label: str, page: int, *, disabled: bool) -> None:
+        button = discord.ui.Button(
+            label=label,
+            style=(
+                discord.ButtonStyle.primary
+                if page == self.page and label not in {"◀", "▶"}
+                else discord.ButtonStyle.secondary
+            ),
+            disabled=disabled,
+            row=2,
+        )
+
+        async def change_page(interaction: discord.Interaction):
+            self.selected.clear()
+            next_panel = DistributePanel(
+                self.requests,
+                self.snapshot,
+                cap=self.cap,
+                today=self.today,
+                page=page,
+            )
+            next_panel.message = interaction.message
+            await interaction.response.edit_message(
+                embed=next_panel.build_embed(), view=next_panel
+            )
+
+        button.callback = change_page
+        self.add_item(button)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """The private channel is the authorization gate.
@@ -542,7 +722,9 @@ class DistributePanel(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, emoji="✅")
+    @discord.ui.button(
+        label="Approve", style=discord.ButtonStyle.success, emoji="✅", row=1
+    )
     async def approve_button(self, interaction: discord.Interaction, _button):
         if not await self._require_selection(interaction):
             return
@@ -550,9 +732,11 @@ class DistributePanel(discord.ui.View):
         result = await approve(self.selected[interaction.user.id], interaction.user.display_name)
         self.selected.pop(interaction.user.id, None)
         await interaction.followup.send(result)
-        await refresh_panel(interaction, self.start)
+        await refresh_panel(interaction, self.page)
 
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
+    @discord.ui.button(
+        label="Deny", style=discord.ButtonStyle.danger, emoji="❌", row=1
+    )
     async def deny_button(self, interaction: discord.Interaction, _button):
         if not await self._require_selection(interaction):
             return
@@ -560,44 +744,13 @@ class DistributePanel(discord.ui.View):
         result = await deny(self.selected[interaction.user.id])
         self.selected.pop(interaction.user.id, None)
         await interaction.followup.send(result)
-        await refresh_panel(interaction, self.start)
+        await refresh_panel(interaction, self.page)
 
 
-def pages(requests: list[items_state.PendingRequest]) -> list[list[items_state.PendingRequest]]:
-    """Split the queue into panel-sized chunks.
-
-    Discord allows at most 25 options in a select, so a queue longer
-    than that needs more than one panel. Chunking and posting one panel
-    per chunk is real pagination: every request is reachable. Showing
-    only the first 25 and asking officers to re-run the command would
-    not be -- re-running shows the same 25.
-    """
-    return [
-        requests[i : i + MAX_PANEL_OPTIONS]
-        for i in range(0, len(requests), MAX_PANEL_OPTIONS)
-    ] or [[]]
-
-
-async def send_panels(destination, snapshot, requests) -> None:
-    """Post one panel per page of the queue."""
-    cap = gear_cap()
-    today = today_pht()
-    chunks = pages(requests)
-    for index, chunk in enumerate(chunks):
-        start = index * MAX_PANEL_OPTIONS + 1
-        embed = build_panel_embed(chunk, snapshot, cap, today, start=start)
-        if len(chunks) > 1:
-            embed.set_footer(text=f"Page {index + 1} of {len(chunks)}")
-        view = DistributePanel(chunk, start=start) if chunk else None
-        message = await destination.send(embed=embed, view=view)
-        if view is not None:
-            view.message = message
-
-
-async def refresh_panel(interaction: discord.Interaction, start: int) -> None:
+async def refresh_panel(interaction: discord.Interaction, page: int) -> None:
     """Redraw one page of the queue in place after a request resolves.
 
-    `start` is the page this panel is showing, so page 2 stays page 2
+    `page` is the page this panel is showing, so page 2 stays page 2
     rather than being replaced by page 1's contents. Other pages go
     stale, which is harmless: approve() and deny() both re-check the
     queue, so a click on a stale entry reports that it was already
@@ -607,10 +760,19 @@ async def refresh_panel(interaction: discord.Interaction, start: int) -> None:
         snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
     except Exception:
         return
-    offset = start - 1
-    requests = list(_STATE.queue)[offset : offset + MAX_PANEL_OPTIONS]
-    embed = build_panel_embed(requests, snapshot, gear_cap(), today_pht(), start=start)
-    view = DistributePanel(requests, start=start) if requests else None
+    requests = list(_STATE.queue)
+    page = min(page, page_count(requests) - 1)
+    view = (
+        DistributePanel(
+            requests, snapshot, cap=gear_cap(), today=today_pht(), page=page
+        )
+        if requests
+        else None
+    )
+    if view is None:
+        embed = build_panel_embed([], snapshot, gear_cap(), today_pht())
+    else:
+        embed = view.build_embed()
     await interaction.message.edit(embed=embed, view=view)
     if view is not None:
         view.message = interaction.message
@@ -628,7 +790,20 @@ async def distribute_cmd(ctx):
         await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
         return
 
-    await send_panels(ctx, snapshot, list(_STATE.queue))
+    requests = list(_STATE.queue)
+    view = (
+        DistributePanel(requests, snapshot, cap=gear_cap(), today=today_pht())
+        if requests
+        else None
+    )
+    embed = (
+        view.build_embed()
+        if view is not None
+        else build_panel_embed([], snapshot, gear_cap(), today_pht())
+    )
+    message = await ctx.send(embed=embed, view=view)
+    if view is not None:
+        view.message = message
 
 
 def requests_for_user(state: items_state.State, user_id: int) -> list[items_state.PendingRequest]:

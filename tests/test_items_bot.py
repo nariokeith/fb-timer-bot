@@ -7,6 +7,7 @@ following the local-fakes style of test_attendance_bot.py.
 
 import asyncio
 
+import discord
 import pytest
 
 import items_bot
@@ -14,11 +15,25 @@ import items_state
 
 
 class FakeMessage:
-    def __init__(self, content="", author_is_bot=True, message_id=1):
+    def __init__(
+        self,
+        content="",
+        author_is_bot=True,
+        message_id=1,
+        *,
+        raise_on_edit=False,
+        raise_on_delete=False,
+    ):
         self.content = content
         self.id = message_id
         self.pinned = False
+        self.deleted = False
         self.edits: list[str] = []
+        self.edit_calls = 0
+        self.raise_on_edit = raise_on_edit
+        self.raise_on_delete = raise_on_delete
+        self.embed = None
+        self.view = None
 
         class _Author:
             bot = author_is_bot
@@ -26,12 +41,29 @@ class FakeMessage:
         self.author = _Author()
 
     async def edit(self, content=None, **kwargs):
+        self.edit_calls += 1
+        if self.raise_on_edit:
+            raise _http_exception()
         if content is not None:
             self.content = content
             self.edits.append(content)
+        if "embed" in kwargs:
+            self.embed = kwargs["embed"]
+        if "view" in kwargs:
+            self.view = kwargs["view"]
 
     async def pin(self):
         self.pinned = True
+
+    async def delete(self):
+        if self.raise_on_delete:
+            raise _http_exception()
+        self.deleted = True
+
+
+def _http_exception():
+    response = type("Response", (), {"status": 500, "reason": "Server Error"})()
+    return discord.HTTPException(response, "Discord failed")
 
 
 class FakeChannel:
@@ -40,7 +72,7 @@ class FakeChannel:
         self.mention = f"#channel-{channel_id}"
         self._pins = list(pins or [])
         self._history = list(history or [])
-        self.sent: list[str] = []
+        self.sent: list[FakeMessage] = []
 
     def pins(self, limit=50):
         """An async iterator, matching discord.py 2.7's real signature.
@@ -51,39 +83,41 @@ class FakeChannel:
         """
 
         async def _iterator():
-            for message in list(self._pins)[:limit]:
+            for message in [m for m in self._pins if not m.deleted][:limit]:
                 yield message
 
         return _iterator()
 
     def history(self, limit=100):
         async def _iterator():
-            for message in list(self._history)[:limit]:
+            for message in [m for m in self._history if not m.deleted][:limit]:
                 yield message
 
         return _iterator()
 
     async def send(self, content=None, **kwargs):
-        self.sent.append(content)
-        message = FakeMessage(content=content or "", message_id=len(self.sent))
+        message = FakeMessage(content=content or "", message_id=len(self.sent) + 1)
+        message.embed = kwargs.get("embed")
+        message.view = kwargs.get("view")
+        self.sent.append(message)
         self._pins.append(message)
         return message
 
 
 @pytest.fixture(autouse=True)
 def reset_module_state():
-    """items_bot keeps _STATE and _STATE_MESSAGE at module level.
+    """items_bot keeps _STATE and _STATE_MESSAGES at module level.
 
-    Without this, a test that saves state leaves _STATE_MESSAGE pointing
-    at a previous test's fake message, and the next save_state edits
+    Without this, a test that saves state leaves _STATE_MESSAGES pointing
+    at previous tests' fake messages, and the next save_state edits
     that instead of posting to its own channel -- so tests pass or fail
     depending on the order they run in.
     """
     items_bot._STATE = items_state.State()
-    items_bot._STATE_MESSAGE = None
+    items_bot._STATE_MESSAGES = []
     yield
     items_bot._STATE = items_state.State()
-    items_bot._STATE_MESSAGE = None
+    items_bot._STATE_MESSAGES = []
 
 
 def test_missing_credentials_lists_every_absent_name():
@@ -147,33 +181,34 @@ def test_load_state_recovers_an_unpinned_state_message_from_history():
     state = items_state.State(officer_channel_id=99, queue=[
         items_state.PendingRequest("aaa", 1, "Kobe", "Asta's Heart", "Special", "2026-08-07 09:00:00")
     ])
-    content, _ = items_state.encode_state(state)
+    content = items_state.encode_state(state)[0]
     message = FakeMessage(content, message_id=3)
     channel = FakeChannel(history=[message])
 
     assert asyncio.run(items_bot.load_state(channel))
     assert [r.id for r in items_bot._STATE.queue] == ["aaa"]
-    assert items_bot._STATE_MESSAGE is message
+    assert items_bot._STATE_MESSAGES == [message]
 
 
-def test_dropped_requests_are_removed_from_memory_too():
-    """Storage and memory must not disagree about what is queued."""
+def test_saving_three_shards_then_one_deletes_the_surplus_messages():
     channel = FakeChannel()
     items_bot._STATE.officer_channel_id = channel.id
     items_bot._STATE.queue = [
         items_state.PendingRequest(
-            id=f"id{n:03d}", user_id=1, ign="Kobe",
-            item="A Very Long Item Name Indeed",
-            type="Gear", requested_at="2026-08-07 09:00:00",
+            id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+            item="Asta's Heart", type="Special", requested_at="2026-08-07 09:00:00",
         )
-        for n in range(300)
+        for n in range(30)
     ]
 
-    dropped = asyncio.run(items_bot.save_state(channel))
+    asyncio.run(items_bot.save_state(channel))
+    assert len(channel.sent) == 3
+    surplus = list(items_bot._STATE_MESSAGES[1:])
+    items_bot._STATE.queue = items_bot._STATE.queue[:1]
+    asyncio.run(items_bot.save_state(channel))
 
-    assert dropped
-    surviving = {r.id for r in items_bot._STATE.queue}
-    assert not any(d.id in surviving for d in dropped)
+    assert len(items_bot._STATE_MESSAGES) == 1
+    assert all(message.deleted for message in surplus)
 
 
 def test_saving_twice_edits_the_same_message_rather_than_posting_again():
@@ -185,6 +220,369 @@ def test_saving_twice_edits_the_same_message_rather_than_posting_again():
     asyncio.run(items_bot.save_state(channel))
 
     assert len(channel.sent) == 1
+
+
+def test_appending_to_a_three_shard_queue_edits_only_the_last_shard():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+
+    items_bot._STATE.queue.append(
+        items_state.PendingRequest(
+            id="appended", user_id=30, ign="Appended", item="Asta's Heart",
+            type="Special", requested_at="2026-08-07 09:00:00",
+        )
+    )
+    asyncio.run(items_bot.save_state(channel))
+
+    assert len(messages) >= 3
+    assert [message.edit_calls for message in messages] == [0, 0, 1]
+    assert items_bot._STATE_MESSAGES == messages
+
+
+def test_appending_that_creates_a_shard_rewrites_existing_shards_and_sends_one():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(28)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+
+    items_bot._STATE.queue.append(
+        items_state.PendingRequest(
+            id="new-shard", user_id=28, ign="New Shard", item="Asta's Heart",
+            type="Special", requested_at="2026-08-07 09:00:00",
+        )
+    )
+    asyncio.run(items_bot.save_state(channel))
+
+    assert [message.edit_calls for message in messages] == [1, 1]
+    assert len(channel.sent) == 3
+    assert len(items_bot._STATE_MESSAGES) == 3
+
+
+def test_removing_a_middle_request_rewrites_its_shard_and_every_shard_after_it():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(35)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+
+    del items_bot._STATE.queue[15]
+    asyncio.run(items_bot.save_state(channel))
+
+    assert len(messages) == 3
+    assert [message.edit_calls for message in messages] == [0, 1, 1]
+
+
+def test_unchanged_multi_shard_state_issues_no_edits_or_sends():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+    sent_before = len(channel.sent)
+
+    asyncio.run(items_bot.save_state(channel))
+
+    assert [message.edit_calls for message in messages] == [0, 0, 0]
+    assert len(channel.sent) == sent_before
+
+
+def test_save_state_edits_an_empty_cached_message_even_when_the_state_is_unchanged():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+    messages[1].content = ""
+
+    asyncio.run(items_bot.save_state(channel))
+
+    assert [message.edit_calls for message in messages] == [0, 1, 0]
+    assert len(channel.sent) == 3
+
+
+def test_save_load_round_trip_keeps_shards_in_part_order_for_the_next_save():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(50)
+        ],
+    )
+
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(reversed(items_bot._STATE_MESSAGES))
+    channel = FakeChannel(channel.id, pins=messages)
+    items_bot._STATE = items_state.State()
+    items_bot._STATE_MESSAGES = []
+
+    assert asyncio.run(items_bot.load_state(channel))
+    assert [items_state.decode_state(message.content).part for message in items_bot._STATE_MESSAGES] == list(
+        range(len(messages))
+    )
+    asyncio.run(items_bot.save_state(channel))
+
+    assert channel.sent == []
+    assert all(message.edit_calls == 0 for message in items_bot._STATE_MESSAGES)
+
+
+def test_load_state_with_a_missing_shard_restores_the_rest_and_warns():
+    state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    contents = items_state.encode_state(state)
+    channel = FakeChannel(99, pins=[
+        FakeMessage(content, message_id=part)
+        for part, content in enumerate(contents)
+        if part != 1
+    ])
+
+    assert asyncio.run(items_bot.load_state(channel))
+    assert items_bot._STATE.missing_parts == (1,)
+    assert len(items_bot._STATE.queue) < len(state.queue)
+    assert "1 state shard" in channel.sent[-1].embed.description.lower()
+
+
+def test_load_state_keeps_the_newest_duplicate_part_and_deletes_the_stale_one():
+    fresh = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    fresh_contents = items_state.encode_state(fresh)
+    stale = FakeMessage(
+        items_state.encode_state(
+            items_state.State(
+                officer_channel_id=99,
+                queue=[_queued("resolved", "Resolved", "Asta's Heart", items_rules.SPECIAL)],
+            )
+        )[0],
+        message_id=100,
+    )
+    winners = [
+        FakeMessage(content, message_id=200 + part)
+        for part, content in enumerate(fresh_contents)
+    ]
+    channel = FakeChannel(99, pins=[stale, *reversed(winners)])
+
+    assert asyncio.run(items_bot.load_state(channel))
+
+    assert [request.id for request in items_bot._STATE.queue] == [
+        request.id for request in fresh.queue
+    ]
+    assert stale.deleted
+    assert items_bot._STATE_MESSAGES == winners
+
+
+def test_load_state_discards_obsolete_surplus_shards_after_a_shrink():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    assert len(channel.sent) == 3
+
+    first = items_bot._STATE_MESSAGES[0]
+    obsolete = items_bot._STATE_MESSAGES[1:]
+    for message in obsolete:
+        message.raise_on_delete = True
+    items_bot._STATE.queue = items_bot._STATE.queue[:1]
+    asyncio.run(items_bot.save_state(channel))
+    assert all(not message.deleted for message in obsolete)
+
+    for message in obsolete:
+        message.raise_on_delete = False
+    restored_channel = FakeChannel(channel.id, pins=[first, *obsolete])
+    items_bot._STATE = items_state.State()
+    items_bot._STATE_MESSAGES = []
+
+    assert asyncio.run(items_bot.load_state(restored_channel))
+    assert [request.id for request in items_bot._STATE.queue] == ["id000"]
+
+
+def test_load_state_deletes_obsolete_surplus_shards():
+    current = items_state.State(
+        officer_channel_id=99,
+        queue=[_queued("current", "Current", "Asta's Heart", items_rules.SPECIAL)],
+    )
+    obsolete_state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    current_message = FakeMessage(items_state.encode_state(current)[0], message_id=10)
+    obsolete = [
+        FakeMessage(content, message_id=20 + part)
+        for part, content in enumerate(items_state.encode_state(obsolete_state)[1:], start=1)
+    ]
+
+    assert asyncio.run(items_bot.load_state(FakeChannel(99, pins=[current_message, *obsolete])))
+
+    assert all(message.deleted for message in obsolete)
+
+
+def test_load_state_keeps_every_part_of_a_current_multi_shard_state():
+    state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    messages = [
+        FakeMessage(content, message_id=part)
+        for part, content in enumerate(items_state.encode_state(state))
+    ]
+
+    assert asyncio.run(items_bot.load_state(FakeChannel(99, pins=messages)))
+
+    assert [request.id for request in items_bot._STATE.queue] == [
+        request.id for request in state.queue
+    ]
+    assert not any(message.deleted for message in messages)
+
+
+def test_load_state_without_part_zero_uses_the_largest_total_and_warns():
+    two_part_state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"two-{n:03d}", f"Two {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(20)
+        ],
+    )
+    three_part_state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"three-{n:03d}", f"Three {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    part_one = FakeMessage(items_state.encode_state(two_part_state)[1], message_id=1)
+    part_two = FakeMessage(items_state.encode_state(three_part_state)[2], message_id=2)
+    channel = FakeChannel(99, pins=[part_one, part_two])
+
+    assert asyncio.run(items_bot.load_state(channel))
+
+    assert items_bot._STATE.missing_parts == (0,)
+    assert "1 state shard" in channel.sent[-1].embed.description.lower()
+    assert not part_one.deleted
+    assert not part_two.deleted
+
+
+def test_save_state_replaces_and_deletes_a_message_whose_edit_failed():
+    channel = FakeChannel()
+    failed_message = FakeMessage("old", raise_on_edit=True)
+    items_bot._STATE.officer_channel_id = channel.id
+    items_bot._STATE_MESSAGES = [failed_message]
+
+    asyncio.run(items_bot.save_state(channel))
+
+    assert len(channel.sent) == 1
+    assert failed_message.deleted
+    assert items_bot._STATE_MESSAGES == channel.sent
+
+
+def test_save_state_ignores_a_surplus_shard_delete_failure():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    first = items_bot._STATE_MESSAGES[0]
+    surplus = items_bot._STATE_MESSAGES[1:]
+    surplus[0].raise_on_delete = True
+    items_bot._STATE.queue = items_bot._STATE.queue[:1]
+
+    asyncio.run(items_bot.save_state(channel))
+
+    assert items_bot._STATE_MESSAGES == [first]
+    assert not surplus[0].deleted
+
+
+def test_save_state_clears_recovery_missing_parts_after_a_complete_rewrite():
+    state = items_state.State(
+        officer_channel_id=99,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    channel = FakeChannel(99, pins=[
+        FakeMessage(content, message_id=part)
+        for part, content in enumerate(items_state.encode_state(state))
+        if part != 1
+    ])
+
+    assert asyncio.run(items_bot.load_state(channel))
+    assert items_bot._STATE.missing_parts == (1,)
+    asyncio.run(items_bot.save_state(channel))
+
+    assert items_bot._STATE.missing_parts == ()
 
 
 def test_is_officer_channel_only_matches_the_recorded_channel():
@@ -206,19 +604,50 @@ class FakeCtx:
 
     async def send(self, **kwargs):
         self.sent.append(kwargs)
+        return await self.channel.send(**kwargs)
 
 
-def test_moving_officer_channel_discards_the_old_state_message(monkeypatch):
-    old_message = FakeMessage("old")
+class FakeInteraction:
+    def __init__(self, message, user_id=1):
+        self.message = message
+        self.channel_id = 99
+        self.user = type("User", (), {"id": user_id, "display_name": "Keith"})()
+        self.followups = []
+        self.response = self.Response(self)
+        self.followup = self.Followup(self)
+
+    class Response:
+        def __init__(self, interaction):
+            self.interaction = interaction
+
+        async def defer(self):
+            pass
+
+        async def send_message(self, *args, **kwargs):
+            pass
+
+        async def edit_message(self, **kwargs):
+            await self.interaction.message.edit(**kwargs)
+
+    class Followup:
+        def __init__(self, interaction):
+            self.interaction = interaction
+
+        async def send(self, message):
+            self.interaction.followups.append(message)
+
+
+def test_moving_officer_channel_discards_the_old_state_messages(monkeypatch):
+    old_messages = [FakeMessage("old"), FakeMessage("old")]
     items_bot._STATE.officer_channel_id = 10
-    items_bot._STATE_MESSAGE = old_message
+    items_bot._STATE_MESSAGES = old_messages
     channel = FakeChannel(99)
     ctx = FakeCtx(channel)
     monkeypatch.setattr(items_bot, "save_state", _noop_save)
 
     asyncio.run(items_bot.setofficerchannel_cmd.callback(ctx))
 
-    assert items_bot._STATE_MESSAGE is None
+    assert items_bot._STATE_MESSAGES == []
     assert items_bot._STATE.officer_channel_id == 99
 
 
@@ -234,6 +663,25 @@ def test_unreachable_officer_channel_does_not_keep_a_queued_request(monkeypatch)
     assert items_bot._STATE.queue == []
     assert items_bot._STATE.igns == {"1": "Kobe"}
     assert "unreachable" in ctx.sent[-1]["embed"].title.lower()
+
+
+def test_request_that_would_exceed_state_capacity_is_refused_without_changes(monkeypatch):
+    items_bot._STATE.officer_channel_id = 99
+    items_bot._STATE.queue = [
+        _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+        for n in range(140)
+    ]
+    items_bot._STATE.igns = {"1": "Kobe"}
+    before_queue = list(items_bot._STATE.queue)
+    before_igns = dict(items_bot._STATE.igns)
+    ctx = FakeCtx(FakeChannel(1))
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Asta's Heart Dajz"))
+
+    assert items_bot._STATE.queue == before_queue
+    assert items_bot._STATE.igns == before_igns
+    assert "queue is full" in ctx.sent[-1]["embed"].title.lower()
 
 
 import items_rules
@@ -390,33 +838,108 @@ def test_panel_lines_number_from_the_page_start():
     assert lines[0].startswith("**26.")
 
 
-def test_pages_chunks_the_queue_so_every_request_is_reachable():
-    queue = [_queued(f"id{n}", "Dajz", "Asta's Heart", items_rules.SPECIAL) for n in range(60)]
-    chunks = items_bot.pages(queue)
-    assert [len(c) for c in chunks] == [25, 25, 10]
-    assert sum(len(c) for c in chunks) == 60
+def test_distribute_posts_one_message_for_a_sixty_request_queue(monkeypatch):
+    items_bot._STATE.officer_channel_id = 99
+    items_bot._STATE.queue = [
+        _queued(f"id{n}", "Dajz", "Asta's Heart", items_rules.SPECIAL)
+        for n in range(60)
+    ]
+    ctx = FakeCtx(FakeChannel(99))
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+
+    asyncio.run(items_bot.distribute_cmd.callback(ctx))
+
+    assert len(ctx.sent) == 1
 
 
-def test_pages_of_an_empty_queue_is_one_empty_page():
-    assert items_bot.pages([]) == [[]]
+def test_page_two_lists_requests_twenty_six_through_fifty():
+    queue = [
+        _queued(f"id{n}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+        for n in range(60)
+    ]
+    panel = items_bot.DistributePanel(queue, SNAPSHOT, cap=3, today="2026-08-07", page=1)
+
+    assert [option.value for option in panel.picker.options] == [
+        f"id{n}" for n in range(25, 50)
+    ]
+    embed = panel.build_embed()
+    assert "**26. Player 25**" in embed.description
+    assert "**50. Player 49**" in embed.description
 
 
-def test_a_panel_remembers_which_page_it_shows():
-    """Page 2 must redraw as page 2, not be replaced by page 1."""
-    queue = [_queued(f"id{n}", "Dajz", "Asta's Heart", items_rules.SPECIAL) for n in range(30)]
-    panel = items_bot.DistributePanel(items_bot.pages(queue)[1], start=26)
-    assert panel.start == 26
+def test_single_page_panel_has_no_page_buttons():
+    panel = items_bot.DistributePanel(
+        [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)],
+        SNAPSHOT,
+        cap=3,
+        today="2026-08-07",
+    )
+
+    assert [child.label for child in panel.children if child.row == 2] == []
 
 
 def test_a_panel_keeps_each_officers_selection_separate():
-    panel = items_bot.DistributePanel([
-        _queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL),
-        _queued("b", "Kobe", "Asta's Belt", items_rules.GEAR),
-    ])
+    panel = items_bot.DistributePanel(
+        [
+            _queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL),
+            _queued("b", "Kobe", "Asta's Belt", items_rules.GEAR),
+        ],
+        SNAPSHOT,
+        cap=3,
+        today="2026-08-07",
+    )
     panel.selected[101] = "a"
     panel.selected[202] = "b"
     assert panel.selected[101] == "a"
     assert panel.selected[202] == "b"
+
+
+def test_page_button_edits_the_existing_message_and_clears_selections():
+    queue = [
+        _queued(f"id{n}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+        for n in range(60)
+    ]
+    panel = items_bot.DistributePanel(queue, SNAPSHOT, cap=3, today="2026-08-07")
+    channel = FakeChannel(99)
+    message = asyncio.run(channel.send(embed=panel.build_embed(), view=panel))
+    panel.message = message
+    panel.selected[101] = "id0"
+    interaction = FakeInteraction(message)
+    page_two = next(child for child in panel.children if getattr(child, "label", None) == "2")
+
+    asyncio.run(page_two.callback(interaction))
+
+    assert len(channel.sent) == 1
+    assert message.edit_calls == 1
+    assert message.view.page == 1
+    assert message.view.selected == {}
+
+
+def test_resolving_the_only_request_on_the_last_page_returns_to_a_nonempty_page(monkeypatch):
+    items_bot._STATE.officer_channel_id = 99
+    items_bot._STATE.queue = [
+        _queued(f"id{n}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+        for n in range(26)
+    ]
+    panel = items_bot.DistributePanel(
+        list(items_bot._STATE.queue), SNAPSHOT, cap=3, today="2026-08-07", page=1
+    )
+    channel = FakeChannel(99)
+    message = asyncio.run(channel.send(embed=panel.build_embed(), view=panel))
+    panel.message = message
+    panel.selected[1] = "id25"
+    interaction = FakeInteraction(message)
+
+    async def resolve(request_id, officer_name):
+        items_state.remove_request(items_bot._STATE, request_id)
+        return "Approved"
+
+    monkeypatch.setattr(items_bot, "approve", resolve)
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    asyncio.run(panel.approve_button.callback(interaction))
+
+    assert message.view.page == 0
+    assert "**1. Player 0**" in message.embed.description
 
 
 def test_an_empty_queue_says_so():
@@ -503,6 +1026,10 @@ def test_approve_rechecks_the_cap_and_refuses_a_stale_request(monkeypatch):
     calls = []
     monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: calls.append(k))
     monkeypatch.setattr(items_bot, "save_state", _noop_save)
+    # approve() reads the real clock, but the ledger rows above are dated.
+    # Without pinning "today" the cap resets and this test passes vacuously
+    # from 2026-08-08 onward.
+    monkeypatch.setattr(items_bot, "today_pht", lambda: "2026-08-07")
 
     message = asyncio.run(items_bot.approve("a", "Keith"))
 

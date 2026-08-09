@@ -226,7 +226,8 @@ the Logs Tracker sheet.
 
 An administrator must first run `!setofficerchannel` in the private officer
 channel. That channel is where officers run `!distribute` and approve or deny
-requests; the bot stores its pending queue in a pinned message there.
+requests; the bot stores its pending queue in pinned messages there, adding
+more of them as the queue grows.
 
 Create a third Discord application and enable **Message Content Intent** for
 its bot. Invite it with **View Channels**, **Send Messages**, **Embed Links**,
