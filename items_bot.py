@@ -1790,20 +1790,12 @@ async def winner_cmd(ctx, *, argument: str = ""):
                 )
             )
             return
-        except items_sheet.SheetStructureError as exc:
+        except items_sheet.AlreadyHeld:
             # The checkbox is already ticked. That happens when a previous
             # !winner wrote the sheet but the state save then failed, so a
             # restart restored a raffle that looks undrawn. Saying "nothing
             # was recorded" here would be the opposite of the truth: the
             # item HAS been given. Close the raffle to match the sheet.
-            if "once only" not in str(exc):
-                await ctx.send(
-                    embed=error_embed(
-                        "Sheet write failed",
-                        f"Nothing was recorded, the raffle is still open: {exc}",
-                    )
-                )
-                return
             items_state.replace_raffle(_STATE, raffle, winner=on_list)
             channel = (
                 bot.get_channel(_STATE.officer_channel_id)

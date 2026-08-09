@@ -169,6 +169,18 @@ def holds_special(snapshot: Snapshot, ign: str, item: str) -> bool:
     return False
 
 
+class AlreadyHeld(SheetStructureError):
+    """This player's checkbox for this special log is already ticked.
+
+    Its own type because callers act on it differently from every other
+    structural problem: nothing was written and nothing needs writing,
+    the record is simply already correct. Recognising that by matching
+    words in an error message would be wrong -- record_special quotes
+    the offending cell's contents into its other messages, so a cell
+    holding the wrong text could imitate any phrase chosen here.
+    """
+
+
 class LedgerWriteError(RuntimeError):
     """The item cell was written but the ledger row was not.
 
@@ -222,7 +234,7 @@ def record_special(spreadsheet, ign: str, item: str) -> str:
             "state; refusing to overwrite a value this bot does not understand"
         )
     if state in CHECKED_VALUES:
-        raise SheetStructureError(
+        raise AlreadyHeld(
             f"{ign} already has {item!r} -- a special log is once only"
         )
 

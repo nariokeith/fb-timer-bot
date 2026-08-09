@@ -2611,7 +2611,7 @@ def test_redrawing_a_winner_whose_box_is_already_ticked_says_so(monkeypatch):
     _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
 
     def already_ticked(spreadsheet, **kwargs):
-        raise items_sheet.SheetStructureError(
+        raise items_sheet.AlreadyHeld(
             "Jjew already has \"Asta's Heart\" -- a special log is once only"
         )
 
@@ -2681,3 +2681,29 @@ def test_a_refused_poll_keeps_the_superseded_raffle_listable(monkeypatch):
     assert "Jjew" in ctx.sent[-1]["embed"].description
     asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winner == "Jjew"
+
+
+def test_a_corrupt_cell_is_not_mistaken_for_an_already_ticked_box(monkeypatch):
+    """record_special quotes the offending cell into its message.
+
+    A cell holding the words this handler once matched on would have
+    closed the raffle and reported success while nothing was written.
+    Only the dedicated AlreadyHeld type means "already ticked".
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
+
+    def corrupt_cell(spreadsheet, **kwargs):
+        raise items_sheet.SheetStructureError(
+            "Cell for Jjew / \"Asta's Heart\" holds 'a special log is once "
+            "only', which is not a checkbox state; refusing to overwrite it"
+        )
+
+    monkeypatch.setattr(items_sheet, "commit_approval", corrupt_cell)
+
+    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
+
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winner == ""
+    assert ctx.sent[-1]["embed"].title == "❌ Sheet write failed"
