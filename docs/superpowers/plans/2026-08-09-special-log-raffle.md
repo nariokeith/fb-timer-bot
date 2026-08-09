@@ -1592,6 +1592,17 @@ def _configured_raffle(monkeypatch, channel_id=42):
     return state_channel
 
 
+def _posted_poll(channel):
+    """The poll message, not the confirmation embed sent after it.
+
+    poll_cmd sends two messages: the poll itself, then an ok_embed
+    telling the officer when it closes. channel.sent[-1] is the latter.
+    """
+    polls = [message for message in channel.sent if message.poll is not None]
+    assert len(polls) == 1, f"expected one poll message, got {len(polls)}"
+    return polls[0]
+
+
 def test_poll_posts_a_poll_and_records_the_raffle(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch)
@@ -1599,8 +1610,7 @@ def test_poll_posts_a_poll_and_records_the_raffle(monkeypatch):
 
     asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
 
-    posted = channel.sent[-1]
-    assert posted.poll is not None
+    posted = _posted_poll(channel)
     assert posted.poll.question == "Asta's Heart"
     assert [a.text for a in posted.poll.answers] == ["Yes"]
     raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
@@ -1616,7 +1626,7 @@ def test_poll_defaults_to_twenty_four_hours(monkeypatch):
 
     asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
 
-    assert channel.sent[-1].poll.duration == datetime.timedelta(hours=24)
+    assert _posted_poll(channel).poll.duration == datetime.timedelta(hours=24)
 
 
 def test_poll_honours_the_hours_flag(monkeypatch):
@@ -1626,7 +1636,7 @@ def test_poll_honours_the_hours_flag(monkeypatch):
 
     asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart --hours 48"))
 
-    assert channel.sent[-1].poll.duration == datetime.timedelta(hours=48)
+    assert _posted_poll(channel).poll.duration == datetime.timedelta(hours=48)
 
 
 def test_poll_refuses_a_gear_log(monkeypatch):

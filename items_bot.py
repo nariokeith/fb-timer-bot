@@ -13,6 +13,7 @@ roles instead.
 """
 
 import asyncio
+import datetime
 import os
 import sys
 
@@ -21,6 +22,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import items_rules
+import items_raffle
 import items_board
 import items_sheet
 import items_state
@@ -1239,3 +1241,113 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+POLL_ANSWER = "Yes"
+
+
+def build_poll(item: str, hours: int) -> discord.Poll:
+    """A single-answer poll: voting is entering, so there is nothing to read."""
+    poll = discord.Poll(
+        question=item, duration=datetime.timedelta(hours=hours)
+    )
+    poll.add_answer(text=POLL_ANSWER)
+    return poll
+
+
+@bot.command(name="poll")
+async def poll_cmd(ctx, *, argument: str = ""):
+    """Open a raffle for one special log."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    try:
+        parsed = items_raffle.parse_poll_argument(argument)
+    except items_raffle.RaffleArgumentError as exc:
+        await ctx.send(embed=error_embed("Poll refused", str(exc)))
+        return
+
+    async with _SHEET_LOCK:
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        try:
+            item = items_rules.resolve_special(
+                parsed.item_query, snapshot.special_headers, snapshot.gear_headers
+            )
+        except items_rules.ItemLookupError as exc:
+            await ctx.send(embed=error_embed("Poll refused", str(exc)))
+            return
+
+        now = items_rules.now_pht()
+        now_text = items_rules.format_timestamp(now)
+        existing = items_state.find_raffle(_STATE, item)
+        if existing is not None and existing.ends_at > now_text and not existing.winner:
+            await ctx.send(
+                embed=error_embed(
+                    "Poll refused",
+                    f"A raffle for **{item}** is already open. It closes at "
+                    f"{existing.ends_at} PHT.",
+                )
+            )
+            return
+
+        if not items_state.evict_for_new_raffle(_STATE, now_text):
+            await ctx.send(
+                embed=error_embed(
+                    "Poll refused",
+                    f"All {items_state.MAX_RAFFLES} tracked raffles are still "
+                    "open. Draw a winner for one of them first.",
+                )
+            )
+            return
+
+        try:
+            message = await ctx.channel.send(poll=build_poll(item, parsed.hours))
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Could not post the poll", str(exc)))
+            return
+
+        # Recorded only once Discord has confirmed the message, so a
+        # failed post can never leave a raffle pointing at nothing.
+        raffle = items_state.Raffle(
+            item=item,
+            channel_id=ctx.channel.id,
+            message_id=message.id,
+            created_at=now_text,
+            ends_at=items_rules.format_timestamp(
+                now + datetime.timedelta(hours=parsed.hours)
+            ),
+        )
+        _STATE.raffles.append(raffle)
+
+        if not items_state.fits(_STATE):
+            _STATE.raffles.remove(raffle)
+            await ctx.send(
+                embed=error_embed(
+                    "Poll not recorded",
+                    "The bot's storage is full, so this raffle could not be "
+                    "saved. The poll above will not be tracked -- delete it, "
+                    "clear the request queue, and try again.",
+                )
+            )
+            return
+
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+
+    await ctx.send(
+        embed=ok_embed(
+            "Raffle open",
+            f"**{item}** — answer **{POLL_ANSWER}** above to enter. Closes at "
+            f"{raffle.ends_at} PHT. Run `!list {item}` after that.",
+        )
+    )

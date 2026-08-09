@@ -6,6 +6,7 @@ following the local-fakes style of test_attendance_bot.py.
 """
 
 import asyncio
+import datetime
 
 import discord
 import pytest
@@ -37,6 +38,7 @@ class FakeMessage:
         self.raise_on_pin = raise_on_pin
         self.embed = None
         self.view = None
+        self.poll = None
 
         class _Author:
             bot = author_is_bot
@@ -119,9 +121,33 @@ class FakeChannel:
         message = FakeMessage(content=content or "", message_id=len(self.sent) + 1)
         message.embed = kwargs.get("embed")
         message.view = kwargs.get("view")
+        message.poll = kwargs.get("poll")
         self.sent.append(message)
         self._pins.append(message)
         return message
+
+
+class FakePollAnswer:
+    def __init__(self, text, voters=()):
+        self.text = text
+        self._voters = list(voters)
+
+    def voters(self, **kwargs):
+        async def _iterator():
+            for voter in self._voters:
+                yield voter
+
+        return _iterator()
+
+
+class FakePoll:
+    def __init__(self, question="Asta's Heart", answers=None, finalised=True):
+        self.question = question
+        self.answers = answers if answers is not None else [FakePollAnswer("Yes")]
+        self._finalised = finalised
+
+    def is_finalised(self):
+        return self._finalised
 
 
 @pytest.fixture(autouse=True)
@@ -1856,3 +1882,126 @@ def test_a_role_holder_in_the_raffle_channel_is_permitted():
     ctx, _ = _raffle_ctx()
 
     assert items_bot.raffle_access(ctx) is None
+
+
+def _sheet(monkeypatch, special=("Player Name", "Asta's Heart"), gear=("Player Name", "Sacred Ring"), roster=("Jjew", "Kobe"), holds=()):
+    snapshot = items_sheet.Snapshot(
+        roster=list(roster),
+        special_headers=list(special),
+        gear_headers=list(gear),
+        ledger_rows=[],
+        special_grid=[],
+    )
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: snapshot)
+    monkeypatch.setattr(
+        items_sheet, "holds_special",
+        lambda snap, ign, item: ign in holds,
+    )
+    return snapshot
+
+
+def _configured_raffle(monkeypatch, channel_id=42):
+    state_channel = FakeChannel(1)
+    items_bot._STATE.officer_channel_id = 1
+    items_bot._STATE.raffle_channel_id = channel_id
+    items_bot._STATE.raffle_role_ids = [10]
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda cid: state_channel)
+    return state_channel
+
+
+def _posted_poll(channel):
+    """The poll message, not the confirmation embed sent after it.
+
+    poll_cmd sends two messages: the poll itself, then an ok_embed
+    telling the officer when it closes. channel.sent[-1] is the latter.
+    """
+    polls = [message for message in channel.sent if message.poll is not None]
+    assert len(polls) == 1, f"expected one poll message, got {len(polls)}"
+    return polls[0]
+
+
+def test_poll_posts_a_poll_and_records_the_raffle(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    posted = _posted_poll(channel)
+    assert posted.poll.question == "Asta's Heart"
+    assert [a.text for a in posted.poll.answers] == ["Yes"]
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.message_id == posted.id
+    assert raffle.channel_id == channel.id
+    assert raffle.listed is False
+
+
+def test_poll_defaults_to_twenty_four_hours(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert _posted_poll(channel).poll.duration == datetime.timedelta(hours=24)
+
+
+def test_poll_honours_the_hours_flag(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart --hours 48"))
+
+    assert _posted_poll(channel).poll.duration == datetime.timedelta(hours=48)
+
+
+def test_poll_refuses_a_gear_log(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Sacred Ring"))
+
+    assert "!request" in ctx.sent[-1]["embed"].description
+    assert items_bot._STATE.raffles == []
+
+
+def test_poll_refuses_a_second_open_raffle_for_the_same_log(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert "already open" in ctx.sent[-1]["embed"].description
+    assert len(items_bot._STATE.raffles) == 1
+
+
+def test_poll_refuses_when_every_slot_holds_a_live_raffle(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", *[f"Log {n}" for n in range(5)]))
+    items_bot._STATE.raffles = [
+        items_state.Raffle(
+            item=f"Log {n}", channel_id=42, message_id=n,
+            created_at="2026-08-09 10:00:00", ends_at="2099-01-01 00:00:00",
+        )
+        for n in range(items_state.MAX_RAFFLES)
+    ]
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert "still open" in ctx.sent[-1]["embed"].description
+    assert len(items_bot._STATE.raffles) == items_state.MAX_RAFFLES
+
+
+def test_poll_outside_the_raffle_channel_says_nothing(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, _ = _raffle_ctx(channel_id=999)
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert ctx.sent == []
