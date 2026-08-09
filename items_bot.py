@@ -1320,7 +1320,20 @@ async def poll_cmd(ctx, *, argument: str = ""):
             )
             return
 
-        if not items_state.evict_for_new_raffle(_STATE, now_text):
+        # An earlier raffle for this item that ended without a winner is
+        # superseded, not kept. find_raffle only ever returns the newest
+        # raffle for a name, so leaving the old one behind would make it
+        # unreachable by !list and !winner AND unevictable (eviction takes
+        # only drawn raffles) -- a slot leaked until someone edited the
+        # pinned state by hand. A drawn raffle is real history and stays.
+        superseded = existing if existing is not None and not existing.winner else None
+        if superseded is not None:
+            _STATE.raffles.remove(superseded)
+
+        allowed, victim = items_state.raffle_to_evict(_STATE)
+        if not allowed:
+            if superseded is not None:
+                _STATE.raffles.append(superseded)
             await ctx.send(
                 embed=error_embed(
                     "Poll refused",
@@ -1335,8 +1348,17 @@ async def poll_cmd(ctx, *, argument: str = ""):
         try:
             message = await ctx.channel.send(poll=build_poll(item, parsed.hours))
         except Exception as exc:
+            # Nothing has been given up yet: the victim is still in state
+            # and the superseded raffle goes back, because no replacement
+            # poll exists to supersede it.
+            if superseded is not None:
+                _STATE.raffles.append(superseded)
             await ctx.send(embed=error_embed("Could not post the poll", str(exc)))
             return
+
+        # Paid for only now that Discord has accepted the poll.
+        if victim is not None:
+            _STATE.raffles.remove(victim)
 
         # Recorded only once Discord has confirmed the message, so a
         # failed post can never leave a raffle pointing at nothing.
@@ -1371,11 +1393,17 @@ async def poll_cmd(ctx, *, argument: str = ""):
         if channel is not None:
             await save_state(channel)
 
+    note = ""
+    if superseded is not None:
+        note = (
+            f"\n\n⚠️ This **replaces** the earlier raffle for **{item}** that "
+            "closed without a winner. Its entry list is gone."
+        )
     await ctx.send(
         embed=ok_embed(
             "Raffle open",
             f"**{item}** — answer **{POLL_ANSWER}** above to enter. Closes at "
-            f"{raffle.ends_at} PHT. Run `!list {item}` after that.",
+            f"{raffle.ends_at} PHT. Run `!list {item}` after that.{note}",
         )
     )
 
@@ -1506,6 +1534,24 @@ async def list_cmd(ctx, *, argument: str = ""):
         updated = items_state.replace_raffle(
             _STATE, raffle, eligible=tuple(split.eligible), listed=True
         )
+        # A pool too big for one pinned message would make save_state give
+        # up -- not just now, but on every later save, silently halting
+        # queue persistence. Refuse the freeze instead, the same way
+        # !request and !poll refuse a state they could not store.
+        if not items_state.fits(_STATE):
+            items_state.replace_raffle(
+                _STATE, updated, eligible=raffle.eligible, listed=raffle.listed
+            )
+            await ctx.send(
+                embed=error_embed(
+                    "Entry list too large",
+                    f"**{raffle.item}** drew {len(split.eligible)} eligible "
+                    "players — too large for the bot to store safely, so "
+                    "nothing was frozen. Work the request queue down and try "
+                    "again; if it still refuses, the raffle needs to be split.",
+                )
+            )
+            return
         channel = (
             bot.get_channel(_STATE.officer_channel_id)
             if _STATE.officer_channel_id is not None

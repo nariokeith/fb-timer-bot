@@ -447,3 +447,25 @@ def test_raffle_item_names_lists_every_tracked_raffle():
     state = items_state.State(raffles=[_raffle(item="A"), _raffle(item="B")])
 
     assert items_state.raffle_item_names(state) == ["A", "B"]
+
+
+def test_raffle_to_evict_names_the_victim_without_removing_it():
+    """poll_cmd must know the cost BEFORE it posts a poll it cannot untake."""
+    state = _full_of(ends="2026-08-09 12:00:00")
+    items_state.replace_raffle(state, state.raffles[2], winner="Kobe")
+
+    allowed, victim = items_state.raffle_to_evict(state)
+
+    assert allowed
+    assert victim.item == "Log 2"
+    assert len(state.raffles) == items_state.MAX_RAFFLES
+
+
+def test_raffle_to_evict_has_no_victim_below_the_ceiling():
+    assert items_state.raffle_to_evict(items_state.State(raffles=[_raffle()])) == (True, None)
+
+
+def test_raffle_to_evict_refuses_when_nothing_has_been_drawn():
+    state = _full_of(ends="2026-08-09 12:00:00")
+
+    assert items_state.raffle_to_evict(state) == (False, None)

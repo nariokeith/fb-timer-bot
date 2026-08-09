@@ -2301,3 +2301,95 @@ def test_help_no_longer_offers_special_logs_through_request():
     text = str(ctx.sent[-1]["embed"].to_dict())
     assert "raffle" in text.casefold()
     assert "one per player, ever" not in text
+
+
+def test_repolling_an_ended_undrawn_raffle_replaces_it(monkeypatch):
+    """Otherwise the old one is unreachable AND unevictable: a leaked slot.
+
+    find_raffle only ever returns the newest raffle for a name, so an
+    older undrawn one can never be listed, drawn or evicted again -- it
+    would occupy a slot until someone edited the pinned state by hand.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+    first = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    items_state.replace_raffle(items_bot._STATE, first, ends_at="2020-01-01 00:00:00")
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert len(items_bot._STATE.raffles) == 1
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").ends_at != "2020-01-01 00:00:00"
+    assert "replaces" in ctx.sent[-1]["embed"].description.casefold()
+
+
+def test_repolling_never_replaces_a_raffle_that_was_already_drawn(monkeypatch):
+    """A drawn raffle is history worth keeping; a new poll sits beside it."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+    first = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    items_state.replace_raffle(
+        items_bot._STATE, first, ends_at="2020-01-01 00:00:00", winner="Kobe"
+    )
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert len(items_bot._STATE.raffles) == 2
+
+
+class PollRejectingChannel(FakeChannel):
+    """Rejects the poll but still delivers the error reply.
+
+    A blanket raise_on_send would make the refusal embed fail too, which
+    tells us nothing about whether the slot was consumed.
+    """
+
+    async def send(self, content=None, **kwargs):
+        if kwargs.get("poll") is not None:
+            raise _http_exception()
+        return await super().send(content, **kwargs)
+
+
+def test_a_failed_poll_post_does_not_consume_the_evicted_slot(monkeypatch):
+    """Eviction must not be spent on a poll Discord never accepted."""
+    _configured_raffle(monkeypatch)
+    _fill_every_raffle_slot(monkeypatch, drawn=("Log 0",))
+    before = [r.item for r in items_bot._STATE.raffles]
+    channel = PollRejectingChannel(42)
+    ctx = FakeCtx(channel)
+    ctx.author = FakeMember(roles=[FakeRole(10)])
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert [r.item for r in items_bot._STATE.raffles] == before
+    assert ctx.sent[-1]["embed"].title == "❌ Could not post the poll"
+
+
+def test_list_refuses_to_freeze_a_pool_it_could_never_save(monkeypatch):
+    """An unsaveable freeze poisons every later save, not just this one.
+
+    save_state gives up when encode_state raises, so an in-memory pool
+    too big for a shard would stop the queue persisting at all -- the
+    same guard !poll and !request already apply, applied here.
+    """
+    _configured_raffle(monkeypatch)
+    roster = [f"AVeryLongPlayerName{n:03d}" for n in range(150)]
+    _sheet(monkeypatch, roster=roster)
+    ctx, channel = _raffle_ctx()
+    raffle, message = _open_raffle(channel, ends="2026-08-09 10:00:00")
+    message.poll = FakePoll(answers=[FakePollAnswer(
+        "Yes", [FakeVoter(n, name) for n, name in enumerate(roster)]
+    )])
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    unchanged = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert unchanged.listed is False
+    assert unchanged.eligible == ()
+    assert items_state.fits(items_bot._STATE)
+    assert "too large" in ctx.sent[-1]["embed"].description.casefold()

@@ -459,10 +459,22 @@ def evict_for_new_raffle(state: State, now: str) -> bool:
     So a full state refuses, and the officer clears it by drawing a
     winner -- which is the thing they were going to do anyway.
     """
+    allowed, victim = raffle_to_evict(state)
+    if victim is not None:
+        state.raffles.remove(victim)
+    return allowed
+
+
+def raffle_to_evict(state: State) -> tuple[bool, Raffle | None]:
+    """(is there room, which raffle pays for it) -- without removing it.
+
+    Separate from evict_for_new_raffle because the caller must know the
+    price before posting a poll: a poll that Discord rejects must not
+    have cost a slot, and once posted it cannot be untaken.
+    """
     if len(state.raffles) < MAX_RAFFLES:
-        return True
+        return True, None
     drawn = [raffle for raffle in state.raffles if raffle.winner]
     if not drawn:
-        return False
-    state.raffles.remove(min(drawn, key=lambda raffle: raffle.created_at))
-    return True
+        return False, None
+    return True, min(drawn, key=lambda raffle: raffle.created_at)
