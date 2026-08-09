@@ -1520,6 +1520,30 @@ async def list_cmd(ctx, *, argument: str = ""):
         return
 
     async with _SHEET_LOCK:
+        # Re-resolved under the lock. The raffle above was found before
+        # the poll fetch awaited, so a second officer running !list at the
+        # same time reaches here holding a Raffle that has already been
+        # swapped out of state -- replace_raffle would raise on it.
+        raffle = items_state.find_raffle(_STATE, item_query)
+        if raffle is None or raffle.listed:
+            await ctx.send(
+                embed=(
+                    ok_embed(
+                        f"Raffle: {raffle.item}",
+                        render_pool(
+                            raffle.item,
+                            items_raffle.VoterSplit(eligible=list(raffle.eligible)),
+                            raffle.winner,
+                        ),
+                    )
+                    if raffle is not None
+                    else error_embed(
+                        "Nothing to list", f"No raffle for {item_query!r}."
+                    )
+                )
+            )
+            return
+
         try:
             snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
         except Exception as exc:

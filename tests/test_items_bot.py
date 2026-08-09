@@ -2393,3 +2393,82 @@ def test_list_refuses_to_freeze_a_pool_it_could_never_save(monkeypatch):
     assert unchanged.eligible == ()
     assert items_state.fits(items_bot._STATE)
     assert "too large" in ctx.sent[-1]["embed"].description.casefold()
+
+
+def test_two_officers_listing_the_same_raffle_at_once(monkeypatch):
+    """list_cmd resolves the raffle BEFORE taking the sheet lock.
+
+    The second caller therefore holds a stale Raffle object that has
+    already been swapped out of state. Re-finding it under the lock is
+    what keeps replace_raffle from raising 'x not in list'.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _, message = _open_raffle(channel, ends="2026-08-09 10:00:00")
+    message.poll = FakePoll(answers=[FakePollAnswer("Yes", [FakeVoter(1, "BK | Jjew")])])
+
+    # The fakes never suspend, so without a real yield point the two
+    # calls would simply run one after the other and prove nothing.
+    original_fetch = channel.fetch_message
+
+    async def slow_fetch(message_id):
+        await asyncio.sleep(0)
+        return await original_fetch(message_id)
+
+    channel.fetch_message = slow_fetch
+
+    async def both():
+        await asyncio.gather(
+            items_bot.list_cmd.callback(ctx, argument="Asta's Heart"),
+            items_bot.list_cmd.callback(ctx, argument="Asta's Heart"),
+        )
+
+    asyncio.run(both())
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is True
+    assert raffle.eligible == ("Jjew",)
+    assert len(items_bot._STATE.raffles) == 1
+
+
+def test_two_officers_drawing_the_same_raffle_tick_the_box_once(monkeypatch):
+    """The unrecoverable case: a checkbox must never be ticked twice.
+
+    winner_cmd resolves the raffle INSIDE _SHEET_LOCK, so the second
+    officer sees the winner already recorded and is refused.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
+
+    writes = []
+
+    def commit(spreadsheet, **kwargs):
+        writes.append(kwargs["ign"])
+        return "B2"
+
+    monkeypatch.setattr(items_sheet, "commit_approval", commit)
+
+    # A real suspension point inside the sheet write, so the two calls
+    # genuinely interleave rather than running back to back.
+    real_to_thread = asyncio.to_thread
+
+    async def slow_to_thread(func, *args, **kwargs):
+        await asyncio.sleep(0)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(items_bot.asyncio, "to_thread", slow_to_thread)
+
+    async def both():
+        await asyncio.gather(
+            items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"),
+            items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"),
+        )
+
+    asyncio.run(both())
+
+    assert writes == ["Jjew"], f"checkbox written {len(writes)} times"
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winner == "Jjew"
+    assert "already been drawn" in ctx.sent[-1]["embed"].description
