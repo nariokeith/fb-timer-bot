@@ -503,6 +503,10 @@ def test_approve_rechecks_the_cap_and_refuses_a_stale_request(monkeypatch):
     calls = []
     monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: calls.append(k))
     monkeypatch.setattr(items_bot, "save_state", _noop_save)
+    # approve() reads the real clock, but the ledger rows above are dated.
+    # Without pinning "today" the cap resets and this test passes vacuously
+    # from 2026-08-08 onward.
+    monkeypatch.setattr(items_bot, "today_pht", lambda: "2026-08-07")
 
     message = asyncio.run(items_bot.approve("a", "Keith"))
 
