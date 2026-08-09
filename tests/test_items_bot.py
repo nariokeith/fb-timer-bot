@@ -222,6 +222,133 @@ def test_saving_twice_edits_the_same_message_rather_than_posting_again():
     assert len(channel.sent) == 1
 
 
+def test_appending_to_a_three_shard_queue_edits_only_the_last_shard():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+
+    items_bot._STATE.queue.append(
+        items_state.PendingRequest(
+            id="appended", user_id=30, ign="Appended", item="Asta's Heart",
+            type="Special", requested_at="2026-08-07 09:00:00",
+        )
+    )
+    asyncio.run(items_bot.save_state(channel))
+
+    assert len(messages) >= 3
+    assert [message.edit_calls for message in messages] == [0, 0, 1]
+    assert items_bot._STATE_MESSAGES == messages
+
+
+def test_appending_that_creates_a_shard_rewrites_existing_shards_and_sends_one():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(28)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+
+    items_bot._STATE.queue.append(
+        items_state.PendingRequest(
+            id="new-shard", user_id=28, ign="New Shard", item="Asta's Heart",
+            type="Special", requested_at="2026-08-07 09:00:00",
+        )
+    )
+    asyncio.run(items_bot.save_state(channel))
+
+    assert [message.edit_calls for message in messages] == [1, 1]
+    assert len(channel.sent) == 3
+    assert len(items_bot._STATE_MESSAGES) == 3
+
+
+def test_removing_a_middle_request_rewrites_its_shard_and_every_shard_after_it():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(35)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+
+    del items_bot._STATE.queue[15]
+    asyncio.run(items_bot.save_state(channel))
+
+    assert len(messages) == 3
+    assert [message.edit_calls for message in messages] == [0, 1, 1]
+
+
+def test_unchanged_multi_shard_state_issues_no_edits_or_sends():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+    sent_before = len(channel.sent)
+
+    asyncio.run(items_bot.save_state(channel))
+
+    assert [message.edit_calls for message in messages] == [0, 0, 0]
+    assert len(channel.sent) == sent_before
+
+
+def test_save_state_edits_an_empty_cached_message_even_when_the_state_is_unchanged():
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            items_state.PendingRequest(
+                id=f"id{n:03d}", user_id=n, ign=f"Player {n}",
+                item="Asta's Heart", type="Special",
+                requested_at="2026-08-07 09:00:00",
+            )
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    messages = list(items_bot._STATE_MESSAGES)
+    messages[1].content = ""
+
+    asyncio.run(items_bot.save_state(channel))
+
+    assert [message.edit_calls for message in messages] == [0, 1, 0]
+    assert len(channel.sent) == 3
+
+
 def test_save_load_round_trip_keeps_shards_in_part_order_for_the_next_save():
     channel = FakeChannel()
     items_bot._STATE = items_state.State(
@@ -245,7 +372,7 @@ def test_save_load_round_trip_keeps_shards_in_part_order_for_the_next_save():
     asyncio.run(items_bot.save_state(channel))
 
     assert channel.sent == []
-    assert all(message.edits for message in items_bot._STATE_MESSAGES)
+    assert all(message.edit_calls == 0 for message in items_bot._STATE_MESSAGES)
 
 
 def test_load_state_with_a_missing_shard_restores_the_rest_and_warns():

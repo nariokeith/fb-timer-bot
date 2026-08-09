@@ -91,6 +91,15 @@ async def save_state(channel) -> None:
     for index, content in enumerate(contents):
         if index < len(_STATE_MESSAGES):
             message = _STATE_MESSAGES[index]
+            # A member request holds _SHEET_LOCK; rewriting every unchanged
+            # shard here amplifies Discord rate limits and makes that path wait.
+            if (
+                message.content
+                and message.content.startswith(items_state.STATE_MARKER)
+                and message.content == content
+            ):
+                messages.append(message)
+                continue
             try:
                 await message.edit(content=content)
                 messages.append(message)
