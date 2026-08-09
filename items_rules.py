@@ -8,6 +8,12 @@ The guild's two rules:
   * a special log may be received once, ever
   * gear logs are capped at three per player per PHT day, any mix
 
+The first rule is no longer enforced at request time, because special
+logs are no longer requested -- they are raffled (see items_raffle.py).
+It is still the rule, and still lives in the Special Logs checkbox: the
+raffle reads it to decide eligibility, and check_eligibility's SPECIAL
+branch is what answers that question.
+
 The second rule cannot be answered from the Gear Logs tab: its cells hold
 lifetime totals with no dates. It is answered from the Distribution Log
 ledger instead, which is why gear_used_today takes ledger rows.
