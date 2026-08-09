@@ -1170,21 +1170,45 @@ async def myrequests_cmd(ctx):
 @bot.command(name="itemhelp")
 async def itemhelp_cmd(ctx):
     """Explain the commands and the rules."""
-    await ctx.send(
-        embed=_embed(
-            "📦 Item Requests",
-            "**`!request <item name> <IGN>`** — ask for an item. "
-            "Example: `!request Asta's Heart Kobe`\n"
-            "**`!myrequests`** — see what you have pending\n"
-            "**`!cancelrequest [item name]`** — withdraw a request\n\n"
-            "**Rules**\n"
-            "• Special logs: one per player, ever.\n"
-            f"• Gear logs: {gear_cap()} per player per day, resetting at "
-            "midnight (Manila time).\n\n"
-            "Your IGN must match your row in the Logs Tracker sheet.",
-            0x3498DB,
-        )
+    embed = _embed(
+        "📦 Item Requests",
+        "**`!request <item name> <IGN>`** — ask for a **gear log**. "
+        "Example: `!request Asta's Belt Kobe`\n"
+        "**`!myrequests`** — see what you have pending\n"
+        "**`!cancelrequest [item name]`** — withdraw a request\n\n"
+        "**Rules**\n"
+        f"• Gear logs: {gear_cap()} per player per day, resetting at "
+        "midnight (Manila time).\n"
+        "• Special logs cannot be requested — they are raffled.\n\n"
+        "Your IGN must match your row in the Logs Tracker sheet.",
+        0x3498DB,
     )
+    embed.add_field(
+        name="🎲 Special log raffle",
+        value=(
+            "Special logs are drawn from a poll, not a queue. Answer **Yes** "
+            "on the poll in the raffle channel to enter. A log you already "
+            "have is skipped automatically.\n\n"
+            "_Raffle roles only:_\n"
+            "**`!poll <special log> [--hours N]`** — open a poll "
+            f"({items_raffle.DEFAULT_POLL_HOURS}h by default)\n"
+            "**`!list <special log>`** — after it closes, who is eligible\n"
+            "**`!winner <special log> <IGN>`** — record the draw"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚙️ Admins",
+        value=(
+            "**`!setofficerchannel`** — run first; the bot stores its queue "
+            "here\n"
+            "**`!setqueuechannel`** — pin a public queue board\n"
+            "**`!setraffleroles @role [@role ...]`** — who may run the raffle\n"
+            "**`!setrafflechannel`** — where polls are posted"
+        ),
+        inline=False,
+    )
+    await ctx.send(embed=embed)
 
 
 @bot.event

@@ -2243,3 +2243,25 @@ def test_a_ledger_failure_closes_the_raffle_and_hands_over_the_row(monkeypatch):
     assert "C4" in description
     assert "Jjew" in description
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winner == "Jjew"
+
+
+def test_help_says_request_is_gear_only_and_lists_the_raffle_commands():
+    ctx = FakeCtx(FakeChannel(1))
+
+    asyncio.run(items_bot.itemhelp_cmd.callback(ctx))
+
+    text = str(ctx.sent[-1]["embed"].to_dict())
+    assert "gear" in text.casefold()
+    for command in ("!poll", "!list", "!winner", "!setraffleroles", "!setrafflechannel"):
+        assert command in text
+
+
+def test_help_no_longer_offers_special_logs_through_request():
+    """The old 'one per player, ever' line described a !request rule."""
+    ctx = FakeCtx(FakeChannel(1))
+
+    asyncio.run(items_bot.itemhelp_cmd.callback(ctx))
+
+    text = str(ctx.sent[-1]["embed"].to_dict())
+    assert "raffle" in text.casefold()
+    assert "one per player, ever" not in text
