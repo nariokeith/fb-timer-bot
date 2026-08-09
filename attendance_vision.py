@@ -9,33 +9,47 @@ would need parsing.
 import base64
 import json
 import os
+from dataclasses import dataclass
 
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "names": {"type": "array", "items": {"type": "string"}},
+        "players": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "status": {"type": "string", "enum": ["active", "dimmed"]},
+                },
+                "required": ["name", "status"],
+            },
+        },
     },
-    "required": ["names"],
+    "required": ["players"],
 }
 
-# Validated against a real Manage Rally screenshot from this guild on
-# 2026-08-06: 4/4 runs correctly excluded the one dimmed player, and 3/3
-# runs on a crop containing no dimmed players kept all ten -- so it does
-# not over-exclude. The earlier, looser wording included the dimmed
-# player 4/4 times.
+# The classify-every-name wording and foreground-panel-only rule have not
+# yet been validated against a live screenshot. The preview's Skipped field
+# makes a misclassification visible to an officer before points are written.
 PROMPT = (
     "This image is a roster panel from the mobile game Lordnine: Infinite "
     "Class. It may be a party list, a guild member list, or a rally / "
     "squad management screen.\n\n"
-    "List the player character names that are shown as ACTIVE, and only "
-    "those. Copy each name exactly as written, preserving capitalisation, "
-    "spacing, punctuation and any non-Latin characters.\n\n"
-    "Exclude a name if it is rendered dimmed, greyed out, faded, or at "
-    "lower contrast than the other names around it. In this game's "
-    "interface a dimmed entry means that player is not confirmed present, "
-    "so it must not be listed. Compare the names against each other: the "
-    "active ones share the same bright text colour, and a dimmed one is "
-    "visibly darker or washed out.\n\n"
+    "List EVERY visible player character name exactly once. For each one, "
+    "set status to exactly active or dimmed. Never omit a player name "
+    "because it is dimmed; classify it as dimmed instead. Copy each name "
+    "exactly as written, preserving capitalisation, spacing, punctuation "
+    "and any non-Latin characters.\n\n"
+    "If a dialog or modal panel is open in the foreground, for example "
+    "Manage Rally, list ONLY the player names inside that foreground panel. "
+    "Ignore everything behind or outside it entirely, including side party "
+    "lists, floating nameplates over the game world, and chat lines. When "
+    "no dialog is open, read the whole roster panel.\n\n"
+    "A dimmed entry is darker, greyed out, faded, washed out, or lower "
+    "contrast than the names around it. In this game's interface it means "
+    "that player is not confirmed present. Compare the names against each "
+    "other: active names share the same bright text colour.\n\n"
     "Also ignore: character levels, class names and icons, guild ranks "
     "and tags, HP and MP bars, damage numbers, timers, currency amounts, "
     "buttons, tab labels, chat text, the boss or monster name, and every "
@@ -44,14 +58,22 @@ PROMPT = (
     "side panel and a main grid), list them only once."
 )
 
-# Free tier: 15 requests/minute, 1,000/day -- far above expected volume.
-# If accuracy proves insufficient, set GEMINI_MODEL=gemini-3.5-flash
-# (10/min, 250/day), also free.
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+# Free tier: 10 requests/minute, 250/day. This stronger vision tier is
+# deliberate because deciding whether low-contrast text is dimmed needs
+# more reliable visual judgement than the lighter model provides.
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 
 class VisionError(RuntimeError):
     """The screenshot could not be turned into a list of names."""
+
+
+@dataclass(frozen=True)
+class RosterRead:
+    """The active and dimmed player names the model reported, in reply order."""
+
+    active: list[str]
+    dimmed: list[str]
 
 
 def _new_client():
@@ -60,8 +82,8 @@ def _new_client():
     return genai.Client()
 
 
-def extract_names(image_bytes: bytes, mime_type: str, *, client=None) -> list[str]:
-    """Return the player names visible in a roster screenshot.
+def read_roster(image_bytes: bytes, mime_type: str, *, client=None) -> RosterRead:
+    """Return the active and dimmed names visible in a roster screenshot.
 
     `client` is injectable so tests never touch the network. Raises
     VisionError for anything that is not a usable list of names.
@@ -94,11 +116,48 @@ def extract_names(image_bytes: bytes, mime_type: str, *, client=None) -> list[st
     except (TypeError, ValueError) as exc:
         raise VisionError(f"Gemini reply was not valid JSON: {raw!r}") from exc
 
-    names = payload.get("names") if isinstance(payload, dict) else None
-    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+    players = payload.get("players") if isinstance(payload, dict) else None
+    if not isinstance(players, list) or not all(
+        isinstance(player, dict) for player in players
+    ):
         raise VisionError(f"Gemini reply had an unexpected shape: {payload!r}")
 
-    cleaned = [n.strip() for n in names if n.strip()]
-    if not cleaned:
+    active: list[str] = []
+    dimmed: list[str] = []
+    for player in players:
+        name, status = player.get("name"), player.get("status")
+        # Casing and surrounding whitespace are normalised, but an
+        # unrecognised word still refuses. The distinction matters: a
+        # status nobody can interpret must never be guessed at, because
+        # guessing "active" is what silently pays a player who was not
+        # there. "Active" is not ambiguous, though -- and since an
+        # unrecognised status aborts the whole command, treating a
+        # capital letter as unreadable would take attendance logging
+        # down entirely over a reply whose meaning is plain. The
+        # schema's enum should make this moot; it is defence against
+        # structured output being enforced less strictly by whatever
+        # model GEMINI_MODEL happens to name.
+        if isinstance(status, str):
+            status = status.strip().casefold()
+        if (
+            not isinstance(name, str)
+            or not isinstance(status, str)
+            or status not in {"active", "dimmed"}
+        ):
+            raise VisionError(f"Gemini reply had an unexpected shape: {payload!r}")
+        name = name.strip()
+        if not name:
+            continue
+        if status == "active":
+            active.append(name)
+        else:
+            dimmed.append(name)
+
+    if not active:
+        if dimmed:
+            raise VisionError(
+                "Gemini found no active names; every name in that image "
+                "was dimmed"
+            )
         raise VisionError("Gemini found no names in that image")
-    return cleaned
+    return RosterRead(active=active, dimmed=dimmed)

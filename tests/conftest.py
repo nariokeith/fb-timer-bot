@@ -23,7 +23,7 @@ class _FakeInteractions:
 
 @dataclass
 class FakeGeminiClient:
-    """Stands in for google.genai.Client in tests."""
+    """Stands in for google.genai.Client and its structured roster reply."""
 
     output_text: str = ""
     error: Exception | None = None
