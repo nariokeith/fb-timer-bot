@@ -18,10 +18,10 @@ def test_encode_decode_round_trip():
     state = items_state.State(
         officer_channel_id=99, queue=[_request()], igns={"42": "Kobe"}
     )
-    content, dropped = items_state.encode_state(state)
-    assert dropped == []
+    contents = items_state.encode_state(state)
+    assert len(contents) == 1
 
-    restored = items_state.decode_state(content)
+    restored = items_state.decode_shards(contents)
     assert restored.officer_channel_id == 99
     assert restored.igns == {"42": "Kobe"}
     assert restored.queue[0].ign == "Kobe"
@@ -29,8 +29,8 @@ def test_encode_decode_round_trip():
 
 
 def test_encoded_content_carries_the_marker():
-    content, _ = items_state.encode_state(items_state.State())
-    assert content.startswith(items_state.STATE_MARKER)
+    contents = items_state.encode_state(items_state.State())
+    assert contents[0].startswith(items_state.STATE_MARKER)
 
 
 def test_decoding_an_unrelated_message_returns_none():
@@ -50,27 +50,139 @@ def test_a_fresh_state_has_no_officer_channel():
     assert items_state.State().officer_channel_id is None
 
 
-def test_oversize_state_drops_the_oldest_requests_and_reports_them():
-    many = [_request(request_id=f"id{n:03d}", item="A Very Long Item Name Indeed") for n in range(300)]
-    state = items_state.State(officer_channel_id=99, queue=many)
-
-    content, dropped = items_state.encode_state(state)
-
-    assert len(content) <= items_state.MAX_CONTENT
-    assert dropped, "oversize state must report what it dropped"
-    assert dropped[0].id == "id000", "the OLDEST request is dropped first"
-    assert items_state.decode_state(content).officer_channel_id == 99
+def _remembered_igns(count):
+    return {str(10**17 + n): "PlayerName%02d" % n for n in range(count)}
 
 
-def test_oversize_ign_memory_is_trimmed_after_the_queue_is_preserved():
-    state = items_state.State(igns={str(n): "A very long remembered IGN value" for n in range(300)})
-    content, dropped = items_state.encode_state(state)
-    restored = items_state.decode_state(content)
-    assert len(content) <= items_state.MAX_CONTENT
-    assert dropped == []
-    assert "0" not in state.igns
-    assert "0" not in restored.igns
-    assert "299" in restored.igns
+def test_200_remembered_igns_and_queue_round_trip_across_shards():
+    state = items_state.State(
+        officer_channel_id=10**17,
+        igns=_remembered_igns(200),
+        queue=[_request(request_id=f"id{n:03d}", ign=f"Member {n}") for n in range(5)],
+    )
+
+    contents = items_state.encode_state(state)
+    restored = items_state.decode_shards(contents)
+
+    assert restored.igns == state.igns
+    assert restored.queue == state.queue
+    assert all(len(content) <= items_state.MAX_CONTENT for content in contents)
+
+
+def test_fits_when_igns_span_multiple_shards_within_the_limit():
+    state = items_state.State(igns=_remembered_igns(200))
+
+    assert len(items_state.encode_state(state)) > 1
+    assert len(items_state.encode_state(state)) <= items_state.MAX_SHARDS
+    assert items_state.fits(state)
+
+
+def test_empty_queue_with_a_huge_ign_map_still_fits():
+    state = items_state.State(igns=_remembered_igns(500))
+
+    contents = items_state.encode_state(state)
+
+    assert items_state.fits(state)
+    assert all(len(content) <= items_state.MAX_CONTENT for content in contents)
+
+
+def test_a_single_request_too_large_for_one_shard_still_raises_value_error():
+    state = items_state.State(queue=[_request(item="X" * items_state.MAX_CONTENT)])
+
+    try:
+        items_state.encode_state(state)
+    except ValueError as error:
+        assert "pending request" in str(error)
+    else:
+        raise AssertionError("an unencodable request must be reported")
+
+
+def test_large_queue_and_ign_map_round_trip_without_reordering_requests():
+    state = items_state.State(
+        officer_channel_id=99,
+        queue=[_request(request_id=f"id{n:03d}", ign=f"Member {n}") for n in range(50)],
+        igns={str(n): f"Member {n}" for n in range(50)},
+    )
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert restored.officer_channel_id == 99
+    assert restored.igns == state.igns
+    assert [request.id for request in restored.queue] == [request.id for request in state.queue]
+
+
+def test_each_encoded_shard_respects_discords_content_limit():
+    state = items_state.State(
+        officer_channel_id=99,
+        queue=[_request(request_id=f"id{n:03d}", item="A Very Long Item Name Indeed") for n in range(50)],
+        igns={str(n): f"Member {n}" for n in range(50)},
+    )
+
+    assert all(len(content) <= items_state.MAX_CONTENT for content in items_state.encode_state(state))
+
+
+def test_old_single_message_format_decodes_as_one_shard():
+    content = """ITEMS_STATE_V1 -- bot storage, please don't delete this message.
+```json
+{"officer_channel_id":99,"queue":[{"id":"old1","user_id":42,"ign":"Kobe","item":"Asta's Heart","type":"Special","requested_at":"2026-08-07 09:00:00","note":""}],"igns":{"42":"Kobe"}}
+```"""
+
+    shard = items_state.decode_state(content)
+
+    assert shard.part == 0
+    assert shard.total == 1
+    assert shard.state.officer_channel_id == 99
+    assert [request.id for request in shard.state.queue] == ["old1"]
+
+
+def test_decode_shards_reassembles_out_of_order_queue_slices():
+    state = items_state.State(
+        queue=[_request(request_id=f"id{n:03d}") for n in range(50)],
+        igns={str(n): f"Member {n}" for n in range(50)},
+    )
+    contents = items_state.encode_state(state)
+    assert len(contents) > 1
+
+    restored = items_state.decode_shards(list(reversed(contents)))
+
+    assert [request.id for request in restored.queue] == [request.id for request in state.queue]
+
+
+def test_decode_shards_reports_missing_parts_while_restoring_available_requests():
+    state = items_state.State(
+        queue=[_request(request_id=f"id{n:03d}") for n in range(50)],
+        igns={str(n): f"Member {n}" for n in range(50)},
+    )
+    contents = items_state.encode_state(state)
+    assert len(contents) > 2
+
+    restored = items_state.decode_shards(contents[:1] + contents[2:])
+
+    assert restored is not None
+    assert restored.missing_parts == (1,)
+    assert [request.id for request in restored.queue] != [request.id for request in state.queue]
+
+
+def test_fits_is_true_at_the_shard_limit_and_false_past_it():
+    requests = [_request(request_id=f"id{n:03d}") for n in range(200)]
+    first_over_limit = next(
+        count
+        for count in range(len(requests) + 1)
+        if len(items_state.encode_state(items_state.State(queue=requests[:count])))
+        > items_state.MAX_SHARDS
+    )
+    at_limit = items_state.State(queue=requests[: first_over_limit - 1])
+    past_limit = items_state.State(queue=requests[:first_over_limit])
+
+    assert len(items_state.encode_state(at_limit)) == items_state.MAX_SHARDS
+    assert items_state.fits(at_limit)
+    assert not items_state.fits(past_limit)
+
+
+def test_small_queue_uses_exactly_one_shard():
+    contents = items_state.encode_state(items_state.State(queue=[_request()]))
+
+    assert len(contents) == 1
 
 
 def test_new_request_ids_are_unique():

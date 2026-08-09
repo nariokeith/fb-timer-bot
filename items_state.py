@@ -22,6 +22,7 @@ STATE_MARKER = "ITEMS_STATE_V1"
 # Discord's hard limit is 2000 characters. The margin absorbs the
 # marker line and the fence, exactly as bot.py's encode_state does.
 MAX_CONTENT = 1990
+MAX_SHARDS = 10
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,16 @@ class State:
     # what lets a typo surface as "you used Kobe before" instead of
     # silently crediting a different row.
     igns: dict[str, str] = field(default_factory=dict)
+    # A partial pin read can still restore requests, but the bot needs to
+    # warn officers that it could not recover the complete queue.
+    missing_parts: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class Shard:
+    part: int
+    total: int
+    state: State
 
 
 def new_request_id() -> str:
@@ -90,39 +101,75 @@ def _render(payload: dict) -> str:
     )
 
 
-def encode_state(state: State) -> tuple[str, list[PendingRequest]]:
-    """Render the state, dropping the oldest requests if it will not fit.
+def _encode_with_total(state: State, total: int) -> list[str]:
+    payloads = [
+        {
+            "part": 0,
+            "total": total,
+            "officer_channel_id": state.officer_channel_id,
+            "igns": {},
+            "queue": [],
+        }
+    ]
 
-    Returns (content, dropped). The caller MUST tell the officers about
-    anything dropped -- silently losing a member's request is the one
-    failure mode this whole module exists to prevent, so it is surfaced
-    loudly rather than swallowed.
+    for user_id, ign in state.igns.items():
+        current = payloads[-1]
+        current.setdefault("igns", {})[user_id] = ign
+        if len(_render(current)) <= MAX_CONTENT:
+            continue
+
+        current["igns"].pop(user_id)
+        current = {"part": len(payloads), "total": total, "igns": {}, "queue": []}
+        payloads.append(current)
+        current["igns"][user_id] = ign
+        if len(_render(current)) > MAX_CONTENT:
+            raise ValueError("a remembered IGN is too large for a state shard")
+
+    for request in state.queue:
+        request_payload = request.to_dict()
+        current = payloads[-1]
+        current["queue"].append(request_payload)
+        if len(_render(current)) <= MAX_CONTENT:
+            continue
+
+        current["queue"].pop()
+        current = {"part": len(payloads), "total": total, "queue": []}
+        payloads.append(current)
+
+        current["queue"].append(request_payload)
+        if len(_render(current)) > MAX_CONTENT:
+            raise ValueError("a pending request is too large for a state shard")
+
+    return [_render(payload) for payload in payloads]
+
+
+def encode_state(state: State) -> list[str]:
+    """Render the state into self-contained Discord message shards.
+
+    Nothing is ever dropped: a queue too big for one message spills into
+    another shard rather than losing the member who has waited longest.
+    Callers ask `fits` first and refuse the new request when it says no.
     """
-    queue = list(state.queue)
-    dropped: list[PendingRequest] = []
-
-    igns = state.igns
-    while True:
-        content = _render(
-            {
-                "officer_channel_id": state.officer_channel_id,
-                "queue": [r.to_dict() for r in queue],
-                "igns": igns,
-            }
-        )
-        if len(content) <= MAX_CONTENT:
-            return content, dropped
-        if queue:
-            dropped.append(queue.pop(0))
-        elif igns:
-            # Queue entries are members' pending requests.  IGN memory is
-            # advisory, so discard its oldest entries first once necessary.
-            igns.pop(next(iter(igns)))
-        else:
-            return content, dropped
+    total = 1
+    # Only the decimal width of ``total`` can change packing. A fixed
+    # ceiling turns an unexpected non-converging packer into a clear error.
+    for _ in range(100):
+        contents = _encode_with_total(state, total)
+        if len(contents) == total:
+            return contents
+        total = len(contents)
+    raise ValueError("state shard count did not stabilize")
 
 
-def decode_state(content: str) -> State | None:
+def fits(state: State) -> bool:
+    """Whether this state can be saved without exceeding the shard limit."""
+    try:
+        return len(encode_state(state)) <= MAX_SHARDS
+    except ValueError:
+        return False
+
+
+def decode_state(content: str) -> Shard | None:
     """Parse a state message, or None if this isn't one / is corrupt.
 
     Returning None rather than raising lets the caller scan a channel's
@@ -138,16 +185,59 @@ def decode_state(content: str) -> State | None:
     body = content[start + len("```json") : end].strip()
     try:
         payload = json.loads(body)
+        if not isinstance(payload, dict):
+            return None
         queue = [PendingRequest.from_dict(r) for r in payload.get("queue", [])]
         channel_id = payload.get("officer_channel_id")
         channel_id = int(channel_id) if channel_id is not None else None
         igns = {str(k): str(v) for k, v in dict(payload.get("igns", {})).items()}
+        part = int(payload.get("part", 0))
+        total = int(payload.get("total", 1))
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
+    if part < 0 or total < 1 or part >= total:
+        return None
+    return Shard(
+        part=part,
+        total=total,
+        state=State(
+            officer_channel_id=channel_id,
+            queue=queue,
+            igns=igns,
+        ),
+    )
+
+
+def decode_shards(contents: list[str]) -> State | None:
+    """Restore every readable state shard, retaining any partial recovery."""
+    shards = [shard for content in contents if (shard := decode_state(content))]
+    if not shards:
+        return None
+
+    shards.sort(key=lambda shard: shard.part)
+    missing_parts = tuple(
+        part
+        for part in range(max(shard.total for shard in shards))
+        if part not in {shard.part for shard in shards}
+    )
+    officer_channel_id = next(
+        (
+            shard.state.officer_channel_id
+            for shard in shards
+            if shard.state.officer_channel_id is not None
+        ),
+        None,
+    )
+    igns: dict[str, str] = {}
+    queue: list[PendingRequest] = []
+    for shard in shards:
+        igns.update(shard.state.igns)
+        queue.extend(shard.state.queue)
     return State(
-        officer_channel_id=channel_id,
+        officer_channel_id=officer_channel_id,
         queue=queue,
         igns=igns,
+        missing_parts=missing_parts,
     )
 
 
