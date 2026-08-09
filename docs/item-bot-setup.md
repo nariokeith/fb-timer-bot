@@ -143,6 +143,9 @@ Then, in Discord:
 | 10 | Four gear requests for one player, approve three | The 4th is refused at the daily cap |
 | 11 | Click **❌** on something | Cleared from the queue, **nothing** written to the sheet |
 | 12 | `!cancelrequest` as the requester | Withdraws your own pending request |
+| 13 | `!setqueuechannel` **in the members' channel** (you need admin) | Confirmation, plus a pinned queue board showing position, IGN and item |
+| 14 | `!request` something else | The pinned board updates itself within a second |
+| 15 | Approve it from the officer panel | The board updates again and the row disappears |
 | 13 | `Ctrl-C`, restart the bot, `!distribute` | The pending queue is still there |
 
 Test 13 is the one people skip. It's what proves a Render redeploy won't quietly
@@ -222,6 +225,16 @@ the pinned message appears.
 
 Rules: special logs once ever; gear logs 3 per day, resetting midnight Manila
 time. Their IGN must match their row in the sheet.
+
+They also don't have to ask where they stand. Run `!setqueuechannel` once in
+their channel and the bot keeps a pinned board there showing the whole queue —
+position, IGN, item — refreshed on every request, approval and denial. The first
+30 are listed and the rest are counted as `+N more waiting`.
+
+The number is a **position, not a ticket**: it says how many are ahead of you, so
+it shifts as the queue moves. Officers can approve out of order, so a member may
+occasionally see their position jump. The board deliberately shows nothing about
+eligibility, daily caps or officer notes — that stays in the officer channel.
 
 ---
 

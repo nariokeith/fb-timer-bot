@@ -66,6 +66,8 @@ class PendingRequest:
 @dataclass
 class State:
     officer_channel_id: int | None = None
+    queue_channel_id: int | None = None
+    board_message_id: int | None = None
     queue: list[PendingRequest] = field(default_factory=list)
     # Discord user id (as a string, because JSON object keys are strings)
     # -> the IGN they last used. Members type their own IGN, so this is
@@ -102,15 +104,18 @@ def _render(payload: dict) -> str:
 
 
 def _encode_with_total(state: State, total: int) -> list[str]:
-    payloads = [
-        {
-            "part": 0,
-            "total": total,
-            "officer_channel_id": state.officer_channel_id,
-            "igns": {},
-            "queue": [],
-        }
-    ]
+    first_payload = {
+        "part": 0,
+        "total": total,
+        "officer_channel_id": state.officer_channel_id,
+        "igns": {},
+        "queue": [],
+    }
+    if state.queue_channel_id is not None:
+        first_payload["queue_channel_id"] = state.queue_channel_id
+    if state.board_message_id is not None:
+        first_payload["board_message_id"] = state.board_message_id
+    payloads = [first_payload]
 
     for user_id, ign in state.igns.items():
         current = payloads[-1]
@@ -190,6 +195,12 @@ def decode_state(content: str) -> Shard | None:
         queue = [PendingRequest.from_dict(r) for r in payload.get("queue", [])]
         channel_id = payload.get("officer_channel_id")
         channel_id = int(channel_id) if channel_id is not None else None
+        queue_channel_id = payload.get("queue_channel_id")
+        queue_channel_id = (
+            int(queue_channel_id) if queue_channel_id is not None else None
+        )
+        board_message_id = payload.get("board_message_id")
+        board_message_id = int(board_message_id) if board_message_id is not None else None
         igns = {str(k): str(v) for k, v in dict(payload.get("igns", {})).items()}
         part = int(payload.get("part", 0))
         total = int(payload.get("total", 1))
@@ -202,6 +213,8 @@ def decode_state(content: str) -> Shard | None:
         total=total,
         state=State(
             officer_channel_id=channel_id,
+            queue_channel_id=queue_channel_id,
+            board_message_id=board_message_id,
             queue=queue,
             igns=igns,
         ),
@@ -228,6 +241,22 @@ def decode_shards(contents: list[str]) -> State | None:
         ),
         None,
     )
+    queue_channel_id = next(
+        (
+            shard.state.queue_channel_id
+            for shard in shards
+            if shard.state.queue_channel_id is not None
+        ),
+        None,
+    )
+    board_message_id = next(
+        (
+            shard.state.board_message_id
+            for shard in shards
+            if shard.state.board_message_id is not None
+        ),
+        None,
+    )
     igns: dict[str, str] = {}
     queue: list[PendingRequest] = []
     for shard in shards:
@@ -235,6 +264,8 @@ def decode_shards(contents: list[str]) -> State | None:
         queue.extend(shard.state.queue)
     return State(
         officer_channel_id=officer_channel_id,
+        queue_channel_id=queue_channel_id,
+        board_message_id=board_message_id,
         queue=queue,
         igns=igns,
         missing_parts=missing_parts,
