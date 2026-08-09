@@ -18,7 +18,6 @@ from types import SimpleNamespace
 import attendance_bot
 from attendance_bosses import BossAmbiguous, BossNotFound
 from attendance_bot import _is_officer, error_text
-from attendance_vision import RosterRead, VisionError
 
 
 class FakeRole:
@@ -929,7 +928,7 @@ def test_attendance_timeout_path_gives_uncertain_wording_not_nothing_written(
     sh = _officer_spreadsheet()
     monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
     monkeypatch.setattr(
-        attendance_bot, "read_roster", lambda *a, **k: _roster(["Kobe"])
+        attendance_bot, "extract_names", lambda *a, **k: ["Kobe"]
     )
 
     async def fake_wait_for(event, check=None, timeout=None):
@@ -962,7 +961,7 @@ def test_attendance_timeout_path_gives_uncertain_wording_not_nothing_written(
 def test_attendance_timeout_report_goes_to_stderr_first(monkeypatch, capsys):
     sh = _officer_spreadsheet()
     monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-    monkeypatch.setattr(attendance_bot, "read_roster", lambda *a, **k: _roster(["Kobe"]))
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
 
     async def fake_wait_for(event, check=None, timeout=None):
         return (SimpleNamespace(), "Officer#1")
@@ -994,7 +993,7 @@ def test_attendance_genuine_prewrite_failure_still_says_nothing_was_written(
     """
     sh = _officer_spreadsheet()
     monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-    monkeypatch.setattr(attendance_bot, "read_roster", lambda *a, **k: _roster(["Kobe"]))
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
 
     async def fake_wait_for(event, check=None, timeout=None):
         return (SimpleNamespace(), "Officer#1")
@@ -1096,14 +1095,10 @@ def _confirm(monkeypatch):
 
 
 def _by_image(mapping):
-    def fake_read_roster(image_bytes, mime, **kwargs):
-        return _roster(mapping[image_bytes])
+    def fake_extract(image_bytes, mime, **kwargs):
+        return list(mapping[image_bytes])
 
-    return fake_read_roster
-
-
-def _roster(active=(), dimmed=()):
-    return RosterRead(active=list(active), dimmed=list(dimmed))
+    return fake_extract
 
 
 def test_every_image_on_the_message_is_read(monkeypatch):
@@ -1111,7 +1106,7 @@ def test_every_image_on_the_message_is_read(monkeypatch):
     monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
     monkeypatch.setattr(
         attendance_bot,
-        "read_roster",
+        "extract_names",
         _by_image(
             {
                 b"rally-panel": ["Kobe", "xSigarilyas"],
@@ -1157,7 +1152,7 @@ def test_a_player_on_both_images_is_paid_once(monkeypatch):
     monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
     monkeypatch.setattr(
         attendance_bot,
-        "read_roster",
+        "extract_names",
         _by_image(
             {
                 b"rally-panel": ["Kobe", "xSigarilyas"],
@@ -1187,9 +1182,9 @@ def test_one_image_failing_vision_aborts_the_whole_command(monkeypatch):
     def flaky(image_bytes, mime, **kwargs):
         if image_bytes == b"second-page":
             raise VisionError("Gemini found no names in that image")
-        return _roster(["Kobe"])
+        return ["Kobe"]
 
-    monkeypatch.setattr(attendance_bot, "read_roster", flaky)
+    monkeypatch.setattr(attendance_bot, "extract_names", flaky)
     _confirm(monkeypatch)
 
     ctx = _two_image_ctx()
@@ -1209,11 +1204,11 @@ def test_only_the_image_attachments_are_used(monkeypatch):
 
     seen = []
 
-    def fake_read_roster(image_bytes, mime, **kwargs):
+    def fake_extract(image_bytes, mime, **kwargs):
         seen.append(image_bytes)
-        return _roster(["Kobe"])
+        return ["Kobe"]
 
-    monkeypatch.setattr(attendance_bot, "read_roster", fake_read_roster)
+    monkeypatch.setattr(attendance_bot, "extract_names", fake_extract)
     _confirm(monkeypatch)
 
     ctx = FakeCtx(
@@ -1251,7 +1246,7 @@ def test_the_preview_shows_how_many_images_were_read(monkeypatch):
     monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
     monkeypatch.setattr(
         attendance_bot,
-        "read_roster",
+        "extract_names",
         _by_image(
             {
                 b"rally-panel": ["Kobe", "xSigarilyas"],
@@ -1277,138 +1272,6 @@ def test_the_preview_shows_how_many_images_were_read(monkeypatch):
     assert "Image 2: 1 name" in screenshots
 
 
-def test_dimmed_names_are_visible_in_the_preview_but_never_matched(monkeypatch):
-    sh = _officer_spreadsheet()
-    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-    monkeypatch.setattr(
-        attendance_bot,
-        "read_roster",
-        lambda *a, **k: _roster(["Kobe"], ["LOOKatLOOK"]),
-    )
-    preview = {}
-
-    async def capture_then_confirm(event, check=None, timeout=None):
-        preview["embed"] = ctx.sent[0][2].embed
-        return (SimpleNamespace(), "Officer#1")
-
-    monkeypatch.setattr(attendance_bot.bot, "wait_for", capture_then_confirm)
-    ctx = FakeCtx(FakeMember([FakeRole(123)]), attachments=[FakeAttachment()])
-    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
-
-    fields = {field.name: field.value for field in preview["embed"].fields}
-    skipped_name = next(name for name in fields if "Skipped — Dimmed (1)" in name)
-    assert "LOOKatLOOK" in fields[skipped_name]
-    assert "greyed out in-game" in fields[skipped_name].lower()
-    matched = next(value for name, value in fields.items() if "Matched (1)" in name)
-    assert matched == "Kobe"
-    assert "LOOKatLOOK" not in matched
-
-
-def test_screenshots_read_reports_dimmed_names_per_image(monkeypatch):
-    sh = _officer_spreadsheet()
-    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-    monkeypatch.setattr(
-        attendance_bot,
-        "read_roster",
-        lambda *a, **k: _roster(["Kobe"], ["LOOKatLOOK"]),
-    )
-    preview = {}
-
-    async def capture_then_confirm(event, check=None, timeout=None):
-        preview["embed"] = ctx.sent[0][2].embed
-        return (SimpleNamespace(), "Officer#1")
-
-    monkeypatch.setattr(attendance_bot.bot, "wait_for", capture_then_confirm)
-    ctx = FakeCtx(FakeMember([FakeRole(123)]), attachments=[FakeAttachment()])
-    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
-
-    screenshots = next(
-        field.value
-        for field in preview["embed"].fields
-        if "Screenshots Read (1)" in field.name
-    )
-    assert "Image 1: 1 name, 1 skipped as dimmed" in screenshots
-
-
-def test_skipped_preview_dedupes_a_dimmed_name_across_overlapping_images(monkeypatch):
-    sh = _officer_spreadsheet()
-    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-    monkeypatch.setattr(
-        attendance_bot,
-        "read_roster",
-        lambda *a, **k: _roster(["Kobe"], ["  LOOKatLOOK  "]),
-    )
-    preview = {}
-
-    async def capture_then_confirm(event, check=None, timeout=None):
-        preview["embed"] = ctx.sent[0][2].embed
-        return (SimpleNamespace(), "Officer#1")
-
-    monkeypatch.setattr(attendance_bot.bot, "wait_for", capture_then_confirm)
-    ctx = _two_image_ctx()
-    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
-
-    field = next(
-        field for field in preview["embed"].fields if "Skipped — Dimmed" in field.name
-    )
-    assert "Skipped — Dimmed (1)" in field.name
-    assert field.value.count("LOOKatLOOK") == 1
-
-
-def test_not_recognised_preview_dedupes_repeated_unmatched_names(monkeypatch):
-    sh = _officer_spreadsheet()
-    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-
-    def fake_read_roster(image_bytes, mime, **kwargs):
-        if image_bytes == b"rally-panel":
-            return _roster(["Kobe", "Unreadable Name"])
-        return _roster(["Kobe", " unreadable   name "])
-
-    monkeypatch.setattr(attendance_bot, "read_roster", fake_read_roster)
-    preview = {}
-
-    async def capture_then_confirm(event, check=None, timeout=None):
-        preview["embed"] = ctx.sent[0][2].embed
-        return (SimpleNamespace(), "Officer#1")
-
-    monkeypatch.setattr(attendance_bot.bot, "wait_for", capture_then_confirm)
-    ctx = _two_image_ctx()
-    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
-
-    field = next(
-        field for field in preview["embed"].fields if "Not Recognised" in field.name
-    )
-    assert "Not Recognised (1)" in field.name
-    assert "Unreadable Name" in field.value
-
-
-def test_not_recognised_preview_reserves_room_for_its_note(monkeypatch):
-    sh = _officer_spreadsheet()
-    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-    unmatched = [f"Unrecognised-{number:02d}-" + "x" * 120 for number in range(10)]
-    monkeypatch.setattr(
-        attendance_bot,
-        "read_roster",
-        lambda *a, **k: _roster(["Kobe", *unmatched]),
-    )
-    preview = {}
-
-    async def capture_then_confirm(event, check=None, timeout=None):
-        preview["embed"] = ctx.sent[0][2].embed
-        return (SimpleNamespace(), "Officer#1")
-
-    monkeypatch.setattr(attendance_bot.bot, "wait_for", capture_then_confirm)
-    ctx = FakeCtx(FakeMember([FakeRole(123)]), attachments=[FakeAttachment()])
-    asyncio.run(attendance_bot.attendance_cmd.callback(ctx, boss_name="Lucus"))
-
-    field = next(
-        field for field in preview["embed"].fields if "Not Recognised" in field.name
-    )
-    note = "\n\n*Skipped. Add them to the sheet first if they count.*"
-    assert len(field.value) <= 1024
-    assert field.value.endswith(note)
-
-
 # --------------------------------------------------------------------------
 # The image_sha256 cell: a JSON list now, a bare string on rows already in
 # the live sheet. Both must read, and any single hash matching is enough.
@@ -1418,7 +1281,7 @@ def test_not_recognised_preview_reserves_room_for_its_note(monkeypatch):
 def test_image_hashes_round_trip_as_a_json_list(monkeypatch):
     sh = _officer_spreadsheet()
     monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-    monkeypatch.setattr(attendance_bot, "read_roster", lambda *a, **k: _roster(["Kobe"]))
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
     _confirm(monkeypatch)
 
     ctx = _two_image_ctx()
@@ -1542,7 +1405,7 @@ def test_the_reaction_gate_accepts_any_configured_role(monkeypatch):
     attendance_bot.write_config(sh, "officer_role_ids", json.dumps([111, 222]))
     attendance_bot.write_config(sh, "target_tab", TAB)
     monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-    monkeypatch.setattr(attendance_bot, "read_roster", lambda *a, **k: _roster(["Kobe"]))
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
 
     seen = {}
 
@@ -1771,7 +1634,7 @@ def test_a_legacy_single_boss_log_row_still_undoes(monkeypatch):
 def test_the_preview_lists_every_boss_with_its_own_points(monkeypatch):
     sh = _multi_sheet()
     monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: sh)
-    monkeypatch.setattr(attendance_bot, "read_roster", lambda *a, **k: _roster(["Kobe"]))
+    monkeypatch.setattr(attendance_bot, "extract_names", lambda *a, **k: ["Kobe"])
 
     preview = {}
 

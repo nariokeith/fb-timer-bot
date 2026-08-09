@@ -22,7 +22,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from attendance_bosses import BossAmbiguous, BossNotFound, boss_points, resolve_boss
-from attendance_roster import DuplicatePlayerName, match_names, normalize
+from attendance_roster import DuplicatePlayerName, match_names
 from attendance_sheet import (
     SheetStructureError,
     any_image_already_logged,
@@ -39,7 +39,7 @@ from attendance_sheet import (
     read_players,
     write_config,
 )
-from attendance_vision import VisionError, read_roster
+from attendance_vision import VisionError, extract_names
 
 load_dotenv()
 
@@ -145,24 +145,6 @@ def _clip_players(players: list[str], limit: int = PLAYERS_LIMIT) -> str:
     if not kept:
         return f"… and {remaining} more"
     return ", ".join(kept) + f", … and {remaining} more"
-
-
-def _dedupe_names_for_preview(names: list[str]) -> list[str]:
-    """Drop repeats, keeping the first spelling seen.
-
-    A name that shows up on two overlapping screenshots is one thing for an
-    officer to look at, not two -- and a count that says otherwise is the
-    same inflated total this whole read path exists to stop producing.
-    """
-    seen: set[str] = set()
-    unique: list[str] = []
-    for name in names:
-        normalized = normalize(name)
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        unique.append(name)
-    return unique
 
 
 class PointsWrittenButNotLogged(RuntimeError):
@@ -1008,9 +990,8 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     total_points = sum(points)
 
     raw_names: list[str] = []
-    skipped: list[str] = []
     image_hashes: list[str] = []
-    names_per_image: list[tuple[int, int]] = []
+    names_per_image: list[int] = []
 
     for position, attachment in enumerate(images, start=1):
         await working.edit(
@@ -1024,7 +1005,7 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         mime = (attachment.content_type or "").split(";")[0].strip()
         try:
             image_bytes = await attachment.read()
-            roster = await asyncio.to_thread(read_roster, image_bytes, mime)
+            names = await asyncio.to_thread(extract_names, image_bytes, mime)
         except VisionError as exc:
             # Abort the WHOLE command. Logging the names from the images
             # that did read would silently underpay everyone who only
@@ -1060,11 +1041,8 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         # before downloading it. One hash per image, so a partial re-post
         # of just one screenshot is still caught.
         image_hashes.append(hashlib.sha256(image_bytes).hexdigest())
-        names_per_image.append((len(roster.active), len(roster.dimmed)))
-        raw_names.extend(roster.active)
-        skipped.extend(roster.dimmed)
-
-    skipped = _dedupe_names_for_preview(skipped)
+        names_per_image.append(len(names))
+        raw_names.extend(names)
 
     try:
         duplicate = await asyncio.to_thread(
@@ -1084,8 +1062,6 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
             )
         )
         return
-
-    unmatched = _dedupe_names_for_preview(unmatched)
 
     if not matched:
         await working.edit(
@@ -1112,12 +1088,8 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
     embed.add_field(
         name=f"\U0001f5bc️ Screenshots Read ({len(images)})",
         value="\n".join(
-            f"Image {position}: {active_count} "
-            f"name{'s' if active_count != 1 else ''}"
-            + (f", {dimmed_count} skipped as dimmed" if dimmed_count else "")
-            for position, (active_count, dimmed_count) in enumerate(
-                names_per_image, start=1
-            )
+            f"Image {position}: {count} name{'s' if count != 1 else ''}"
+            for position, count in enumerate(names_per_image, start=1)
         )[:1024],
         inline=False,
     )
@@ -1126,21 +1098,11 @@ async def attendance_cmd(ctx: commands.Context, *, boss_name: str = ""):
         value="\n".join(players)[:1024],
         inline=False,
     )
-    if skipped:
-        # The preview must expose every exclusion the model made. Otherwise
-        # a bad dimming judgement is indistinguishable from a correct one,
-        # and an officer cannot catch it before points are written.
-        skipped_note = "\n\n*Greyed out in-game; these players earn no points.*"
-        embed.add_field(
-            name=f"⛔ Skipped — Dimmed ({len(skipped)})",
-            value="\n".join(skipped)[:1024 - len(skipped_note)] + skipped_note,
-            inline=False,
-        )
     if unmatched:
-        unmatched_note = "\n\n*Skipped. Add them to the sheet first if they count.*"
         embed.add_field(
             name=f"❓ Not Recognised ({len(unmatched)})",
-            value="\n".join(unmatched)[:1024 - len(unmatched_note)] + unmatched_note,
+            value=("\n".join(unmatched)[:1024]
+                   + "\n\n*Skipped. Add them to the sheet first if they count.*"),
             inline=False,
         )
     if duplicate:
