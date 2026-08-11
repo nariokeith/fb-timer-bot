@@ -787,12 +787,15 @@ def _queue_successes(monkeypatch, count):
     return contexts
 
 
-def test_successful_requests_repost_the_board_on_every_fifth_request(monkeypatch):
+def test_successful_requests_repost_the_board_on_every_nth_request(monkeypatch):
+    # Derived from BOARD_REPOST_EVERY, never hardcoded: this test asserted a
+    # cadence of 5 for a while after 9160e2a lowered the constant to 3.
+    before_repost = items_bot.BOARD_REPOST_EVERY - 1
     state_channel, board_channel, first_board = _queue_board(monkeypatch)
 
-    _queue_successes(monkeypatch, 4)
+    _queue_successes(monkeypatch, before_repost)
 
-    assert first_board.edit_calls == 4
+    assert first_board.edit_calls == before_repost
     assert board_channel.sent == []
 
     _queue_successes(monkeypatch, 1)
@@ -804,9 +807,9 @@ def test_successful_requests_repost_the_board_on_every_fifth_request(monkeypatch
     assert items_bot._STATE.board_message_id == second_board.id
     assert saved.board_message_id == second_board.id
 
-    _queue_successes(monkeypatch, 4)
+    _queue_successes(monkeypatch, before_repost)
 
-    assert second_board.edit_calls == 4
+    assert second_board.edit_calls == before_repost
     assert len(board_channel.sent) == 1
 
     _queue_successes(monkeypatch, 1)
