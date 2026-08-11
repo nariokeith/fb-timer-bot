@@ -12,7 +12,9 @@ import hashlib
 import inspect
 import json
 import re
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import attendance_bot
@@ -110,7 +112,25 @@ def test_a_member_holding_none_of_the_configured_roles_is_refused():
 
 
 def test_importing_the_attendance_bot_does_not_import_the_timer():
-    assert "bot" not in sys.modules
+    # Checked in a subprocess, not against this process's sys.modules: the
+    # timer bot has its own test module now, and once any test imports it
+    # the module stays in sys.modules for the rest of the session, so the
+    # in-process form of this assertion depended on test ordering. The
+    # invariant itself still matters -- importing bot.py calls time.tzset()
+    # and reads data.json, which the attendance process must never do.
+    probe = (
+        "import attendance_bot, sys; "
+        "sys.exit(1 if 'bot' in sys.modules else 0)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"importing attendance_bot pulled in the timer\n{result.stderr}"
+    )
 
 
 def test_all_five_commands_are_registered():
@@ -1836,3 +1856,91 @@ def test_the_undo_confirmation_never_says_removed_none(monkeypatch):
 
     description = ctx.sent[-1][1]["embed"].description
     assert "None" not in description
+
+
+# ---------------------------------------------------------------------------
+# Channel guard: which channel this bot answers in.
+# ---------------------------------------------------------------------------
+
+import channel_guard  # noqa: E402  (kept near its first use, above)
+from discord.ext import commands as dpy_commands  # noqa: E402
+
+
+class FakeGuardCtx:
+    def __init__(self, channel_id, command_name):
+        self.channel = type("Channel", (), {"id": channel_id})()
+        self.command = type(
+            "Cmd", (), {"name": command_name, "qualified_name": command_name}
+        )()
+
+
+def test_attendance_commands_are_confined_once_a_channel_is_set(monkeypatch):
+    monkeypatch.setattr(attendance_bot, "_ATTENDANCE_CHANNEL_ID", 55)
+    for name in (
+        "attendance",
+        "undoattendance",
+        "setweek",
+        "setofficerrole",
+        "attendancehelp",
+    ):
+        allowed = attendance_bot.command_channels(FakeGuardCtx(55, name))
+        assert channel_guard.allows(55, allowed)
+        assert not channel_guard.allows(999, allowed)
+
+
+def test_setattendancechannel_stays_usable_anywhere(monkeypatch):
+    monkeypatch.setattr(attendance_bot, "_ATTENDANCE_CHANNEL_ID", 55)
+    ctx = FakeGuardCtx(999, "setattendancechannel")
+    assert attendance_bot.command_channels(ctx) is channel_guard.EXEMPT
+
+
+def test_attendance_is_unrestricted_until_a_channel_is_set(monkeypatch):
+    # Until !setattendancechannel is run, this bot behaves exactly as before.
+    monkeypatch.setattr(attendance_bot, "_ATTENDANCE_CHANNEL_ID", None)
+    allowed = attendance_bot.command_channels(FakeGuardCtx(999, "attendance"))
+    assert channel_guard.allows(999, allowed)
+
+
+def test_the_channel_is_read_from_the_config_tab(monkeypatch):
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: object())
+    monkeypatch.setattr(
+        attendance_bot,
+        "read_config",
+        lambda _s: {attendance_bot.ATTENDANCE_CHANNEL_KEY: " 77 "},
+    )
+    assert attendance_bot._load_attendance_channel() == 77
+
+
+def test_a_missing_or_junk_config_value_leaves_the_guard_inert(monkeypatch):
+    monkeypatch.setattr(attendance_bot, "_spreadsheet", lambda: object())
+    monkeypatch.setattr(attendance_bot, "read_config", lambda _s: {})
+    assert attendance_bot._load_attendance_channel() is None
+    monkeypatch.setattr(
+        attendance_bot,
+        "read_config",
+        lambda _s: {attendance_bot.ATTENDANCE_CHANNEL_KEY: "not-a-number"},
+    )
+    assert attendance_bot._load_attendance_channel() is None
+
+
+def test_setweek_requires_administrator():
+    assert attendance_bot.set_week_cmd.checks, "!setweek must carry a permissions check"
+
+
+def test_setattendancechannel_requires_administrator():
+    assert attendance_bot.set_attendance_channel_cmd.checks
+
+
+def test_wrong_channel_is_swallowed_but_other_check_failures_still_reply():
+    # The regression most likely to be missed: on_command_error replies to
+    # CheckFailure, and WrongChannel is one.
+    ctx = FakeCtx(SimpleNamespace(id=1, roles=[], display_name="Keith"))
+    ctx.command = None
+
+    asyncio.run(
+        attendance_bot.on_command_error(ctx, channel_guard.WrongChannel("nope"))
+    )
+    assert ctx.sent == []
+
+    asyncio.run(attendance_bot.on_command_error(ctx, dpy_commands.CheckFailure("nope")))
+    assert ctx.sent, "a plain CheckFailure must still be reported"

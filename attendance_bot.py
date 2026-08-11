@@ -21,6 +21,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import channel_guard
 from attendance_bosses import BossAmbiguous, BossNotFound, boss_points, resolve_boss
 from attendance_roster import DuplicatePlayerName, match_names
 from attendance_sheet import (
@@ -714,6 +715,40 @@ def _set_officer_roles(role_ids: list[int]) -> None:
     write_config(_spreadsheet(), OFFICER_ROLES_KEY, json.dumps(role_ids))
 
 
+ATTENDANCE_CHANNEL_KEY = "attendance_channel_id"
+
+# Cached rather than read per command: the guard runs on every command, and
+# !attendancehelp does no sheet I/O today -- reading the Config tab each time
+# would spend Sheets quota on every keystroke. Refreshed on startup and
+# whenever !setattendancechannel runs, so editing the cell by hand needs a
+# restart. None means unconfigured, which leaves the guard inert.
+_ATTENDANCE_CHANNEL_ID: int | None = None
+
+
+def _load_attendance_channel() -> int | None:
+    """The configured channel id, or None if unset or unreadable."""
+    raw = read_config(_spreadsheet()).get(ATTENDANCE_CHANNEL_KEY, "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
+def _set_attendance_channel(channel_id: int) -> None:
+    """Record the channel this bot answers in. Run only via _locked."""
+    write_config(_spreadsheet(), ATTENDANCE_CHANNEL_KEY, str(channel_id))
+
+
+_EXEMPT_COMMANDS = frozenset({"setattendancechannel"})
+
+
+def command_channels(ctx):
+    """The channel ids ctx.command may run in, or EXEMPT."""
+    if ctx.command.name in _EXEMPT_COMMANDS:
+        return channel_guard.EXEMPT
+    return (_ATTENDANCE_CHANNEL_ID,)
+
+
+bot.add_check(channel_guard.make_check(command_channels))
+
+
 # A stuck gspread call has no timeout of its own by default (see
 # attendance_sheet.REQUEST_TIMEOUT, which now bounds each individual
 # request) but several such requests can still chain together inside one
@@ -876,6 +911,13 @@ async def _require_officer(ctx, spreadsheet) -> list[int] | None:
 
 @bot.event
 async def on_ready():
+    global _ATTENDANCE_CHANNEL_ID
+    try:
+        _ATTENDANCE_CHANNEL_ID = await asyncio.to_thread(_load_attendance_channel)
+    except Exception as exc:
+        # Leave the cache as-is (None on a cold start) so the guard stays
+        # inert. A bot that answers everywhere beats one that answers nowhere.
+        print(f"Could not read the attendance channel: {exc!r}", flush=True)
     print(f"Attendance bot logged in as {bot.user} (ID: {bot.user.id}).", flush=True)
 
 
@@ -889,6 +931,10 @@ async def on_command_error(ctx, error):
     CommandNotFound traceback into the supervisor's logs.
     """
     if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, channel_guard.WrongChannel):
+        # Silent, and not even logged: with three bots on one prefix this
+        # would otherwise be the noisiest line in the log.
         return
 
     # stderr first, and unconditionally: it is the one report that cannot
@@ -1321,6 +1367,7 @@ async def undo_attendance_cmd(ctx: commands.Context):
 
 
 @bot.command(name="setweek")
+@commands.has_permissions(administrator=True)
 async def set_week_cmd(ctx: commands.Context, *, tab_name: str = ""):
     """Choose which sheet tab attendance goes into: !setweek Week 17.1"""
     spreadsheet = await _open_spreadsheet_or_reject(ctx)
@@ -1392,6 +1439,28 @@ async def set_officer_role_cmd(ctx: commands.Context, *roles: discord.Role):
             f"{mentions} can now record attendance.",
             footer=f"{len(role_ids)} role{'s' if len(role_ids) != 1 else ''} "
                    "permitted. This replaced any previous set.",
+        )
+    )
+
+
+@bot.command(name="setattendancechannel")
+@commands.has_permissions(administrator=True)
+async def set_attendance_channel_cmd(ctx: commands.Context):
+    """Only answer attendance commands here: !setattendancechannel"""
+    global _ATTENDANCE_CHANNEL_ID
+    try:
+        await _locked(_set_attendance_channel, ctx.channel.id)
+    except Exception as exc:
+        await _reject(ctx, "❌ Couldn't Save That", error_text(exc))
+        return
+
+    _ATTENDANCE_CHANNEL_ID = ctx.channel.id
+    await ctx.send(
+        embed=make_embed(
+            "✅ Attendance Channel Set",
+            f"I'll only answer attendance commands in {ctx.channel.mention} "
+            "and ignore them everywhere else.",
+            footer="Run this in a different channel to move it.",
         )
     )
 
