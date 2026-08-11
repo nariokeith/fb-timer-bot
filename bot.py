@@ -35,6 +35,8 @@ from aiohttp import web
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+import channel_guard
+
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -114,6 +116,7 @@ def load_local() -> dict:
     return {
         "channel_id": None,
         "storage_channel_id": None,
+        "tod_channel_id": None,
         "deaths": {},
         "notified": {},
         "spawned": {},
@@ -128,6 +131,9 @@ def save_local() -> None:
 data = load_local()
 data.setdefault("spawned", {})
 data.setdefault("storage_channel_id", None)
+# Absent from data.json and from pinned state written before the channel
+# guard existed; None keeps the guard inert until !settodchannel is run.
+data.setdefault("tod_channel_id", None)
 state_msg: discord.Message | None = None
 state_pinned = False
 # How many history messages restore_state() scans per channel, and how deep
@@ -161,6 +167,7 @@ def encode_state() -> str:
     payload = {
         "channel_id": data["channel_id"],
         "storage_channel_id": data.get("storage_channel_id"),
+        "tod_channel_id": data.get("tod_channel_id"),
         "deaths": _unix_map("deaths"),
         "notified": _unix_map("notified"),
         "spawned": _unix_map("spawned"),
@@ -192,6 +199,8 @@ def decode_state(content: str) -> dict | None:
             "channel_id": payload["channel_id"],
             # Absent in messages written before storage channels existed.
             "storage_channel_id": payload.get("storage_channel_id"),
+            # Absent in messages written before the channel guard existed.
+            "tod_channel_id": payload.get("tod_channel_id"),
             "deaths": from_unix(payload["deaths"]),
             "notified": from_unix(payload["notified"]),
             "spawned": from_unix(payload.get("spawned", {})),
@@ -546,6 +555,40 @@ async def spawn_watcher_error(exc: BaseException) -> None:
     spawn_watcher.restart()
 
 
+# The setup commands must work anywhere -- they are how a channel gets
+# chosen. Everything else is confined to the notification channel and the
+# TOD log. The storage channel is deliberately excluded: it exists only to
+# hold the pinned state message.
+_EXEMPT_COMMANDS = frozenset({
+    "setchannel", "setstoragechannel", "clearstoragechannel", "settodchannel",
+})
+
+
+def command_channels(ctx):
+    """The channel ids ctx.command may run in, or EXEMPT."""
+    if ctx.command.name in _EXEMPT_COMMANDS:
+        return channel_guard.EXEMPT
+    return (data.get("channel_id"), data.get("tod_channel_id"))
+
+
+bot.add_check(channel_guard.make_check(command_channels))
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Keep the log readable; this bot has no user-facing error replies.
+
+    CommandNotFound is swallowed because all three bots share the "!"
+    prefix, so most commands reaching this one belong to another bot --
+    it already fills the logs with tracebacks today. WrongChannel is
+    swallowed silently on purpose: replying would post into the very
+    channel the guard is keeping quiet.
+    """
+    if isinstance(error, (commands.CommandNotFound, channel_guard.WrongChannel)):
+        return
+    print(f"Command {ctx.command} failed: {error!r}", file=sys.stderr, flush=True)
+
+
 @bot.command(name="setchannel")
 async def setchannel(ctx: commands.Context):
     """Use spawn notifications in this channel: !setchannel"""
@@ -596,6 +639,22 @@ async def clearstoragechannel(ctx: commands.Context):
         embed=make_embed(
             "✅ Storage Channel Cleared",
             "Timers are stored in the notification channel again.",
+        )
+    )
+
+
+@bot.command(name="settodchannel")
+@commands.has_permissions(administrator=True)
+async def settodchannel(ctx: commands.Context):
+    """Also take commands in this channel: !settodchannel"""
+    data["tod_channel_id"] = ctx.channel.id
+    await persist()
+    await ctx.send(
+        embed=make_embed(
+            "✅ TOD Log Channel Set",
+            f"I'll accept commands in {ctx.channel.mention} as well as the "
+            "notification channel, and ignore them everywhere else.",
+            footer="Run this in a different channel to move it.",
         )
     )
 
