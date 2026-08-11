@@ -1,5 +1,6 @@
 """Tests for Logs Tracker access, against the shared gspread fakes."""
 
+import gspread
 import pytest
 
 import items_sheet
@@ -56,6 +57,145 @@ def test_snapshot_refuses_a_reordered_ledger_header():
     with pytest.raises(SheetStructureError) as exc:
         items_sheet.read_snapshot(spreadsheet)
     assert "Distribution Log" in str(exc.value)
+
+
+def test_snapshot_costs_two_api_reads():
+    """The whole point of the snapshot: one command, minimal quota.
+
+    Sheets allows 60 reads per minute per credential, and both bots share
+    one service account. Resolving each tab with spreadsheet.worksheet()
+    cost a hidden metadata fetch apiece on top of the values call, so one
+    !request burned seven reads and a busy minute returned 429 to
+    everyone. Metadata once, values once.
+    """
+    spreadsheet = make_spreadsheet()
+    items_sheet.read_snapshot(spreadsheet)
+    assert spreadsheet.reads == 2
+
+
+def test_snapshot_pads_ragged_rows_from_the_api():
+    """batchGet omits trailing blanks; get_all_values padded them back.
+
+    This pins the switch to batchGet as behaviour-preserving. The grids
+    reach the same consumers as before, so they must arrive in the same
+    shape -- rectangular -- rather than ragged. Today's consumers happen
+    to bounds-check (holds_special guards with len(row) < column), so
+    this is not a live crash; it is the guarantee that lets the next
+    consumer index special_grid the way get_all_values always allowed.
+    """
+    grid = [
+        ["Player Name", "Asta's Heart", "Amentis' Foot"],
+        ["Kobe", "TRUE", "FALSE"],
+        ["Dajz", "", ""],
+    ]
+    spreadsheet = FakeSpreadsheet(
+        {items_sheet.SPECIAL_TAB: FakeWorksheet(grid, title=items_sheet.SPECIAL_TAB)}
+    )
+    snapshot = items_sheet.read_snapshot(spreadsheet)
+    assert all(len(row) == 3 for row in snapshot.special_grid)
+    assert items_sheet.holds_special(snapshot, "Dajz", "Amentis' Foot") is False
+
+
+def rate_limited(message="Quota exceeded for quota metric 'Read requests'"):
+    """A gspread APIError shaped exactly like a real Sheets 429.
+
+    Built through APIError's own constructor rather than a stub, so the
+    .code the retry logic branches on is the one gspread would really
+    populate.
+    """
+
+    class _Response:
+        status_code = 429
+        text = message
+
+        def json(self):
+            return {"error": {"code": 429, "message": message, "status": "RESOURCE_EXHAUSTED"}}
+
+    return gspread.exceptions.APIError(_Response())
+
+
+class FlakySpreadsheet:
+    """Fails the first `failures` snapshot reads with 429, then works."""
+
+    def __init__(self, inner, failures: int, error=None):
+        self._inner = inner
+        self._remaining = failures
+        self._error = error or rate_limited()
+        self.attempts = 0
+
+    def worksheets(self):
+        self.attempts += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise self._error
+        return self._inner.worksheets()
+
+    def values_batch_get(self, ranges, params=None):
+        return self._inner.values_batch_get(ranges, params)
+
+
+def test_snapshot_retries_a_rate_limited_read_and_succeeds():
+    """A 429 is a "come back shortly", not a failed request.
+
+    Two bots share one 60-per-minute credential, so a burst can refuse a
+    read that would succeed seconds later. Retrying keeps that off the
+    member's screen entirely.
+    """
+    slept = []
+    spreadsheet = FlakySpreadsheet(make_spreadsheet(), failures=2)
+    snapshot = items_sheet.read_snapshot(spreadsheet, sleep=slept.append)
+    assert "Kobe" in snapshot.roster
+    assert spreadsheet.attempts == 3
+    assert slept == list(items_sheet.RETRY_DELAYS)
+
+
+def test_snapshot_gives_up_after_the_last_retry():
+    spreadsheet = FlakySpreadsheet(make_spreadsheet(), failures=99)
+    with pytest.raises(gspread.exceptions.APIError) as exc:
+        items_sheet.read_snapshot(spreadsheet, sleep=lambda _: None)
+    assert exc.value.code == 429
+    assert spreadsheet.attempts == len(items_sheet.RETRY_DELAYS) + 1
+
+
+def test_snapshot_does_not_retry_a_non_quota_error():
+    """Only 429 is worth waiting on.
+
+    A revoked key or a deleted sheet fails identically on every attempt,
+    so retrying would just make the member wait seconds for the same
+    refusal.
+    """
+    denied = rate_limited("caller does not have permission")
+    denied.code = 403
+    spreadsheet = FlakySpreadsheet(make_spreadsheet(), failures=99, error=denied)
+    with pytest.raises(gspread.exceptions.APIError):
+        items_sheet.read_snapshot(spreadsheet, sleep=lambda _: None)
+    assert spreadsheet.attempts == 1
+
+
+def test_snapshot_matches_grids_by_range_not_by_position():
+    """Each grid is claimed by name, so response order cannot mix them up.
+
+    Pairing the response with the request list positionally would put the
+    Gear Logs grid into special_grid the moment the API answered in a
+    different order -- silently, and with every checkbox answer wrong
+    from then on. Nothing in this bot should rest on that ordering.
+    """
+
+    class Reordering:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def worksheets(self):
+            return self._inner.worksheets()
+
+        def values_batch_get(self, ranges, params=None):
+            response = self._inner.values_batch_get(ranges, params)
+            return {"valueRanges": list(reversed(response["valueRanges"]))}
+
+    snapshot = items_sheet.read_snapshot(Reordering(make_spreadsheet()))
+    assert "Asta's Heart" in snapshot.special_headers
+    assert "Asta's Belt" in snapshot.gear_headers
+    assert snapshot.ledger_rows[0][1] == "Kobe"
 
 
 def test_a_missing_gear_tab_yields_empty_gear_headers():

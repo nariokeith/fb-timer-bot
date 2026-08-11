@@ -7,6 +7,7 @@ coordinates, so the user can keep adding Gear Logs columns while the bot
 is running.
 """
 
+import time
 from dataclasses import dataclass
 
 import gspread
@@ -43,6 +44,40 @@ LEDGER_HEADER = [
 # Google Sheets renders a checked checkbox as this in get_all_values().
 CHECKED_VALUES = {"true"}
 
+# Seconds to wait before each retry of a rate-limited read. Two waits,
+# so the worst case a member feels is ~7 seconds before the answer
+# arrives -- long enough to outlast a one-minute quota window's tail,
+# short enough that Discord's own timeout is never in play.
+RETRY_DELAYS = (2.0, 5.0)
+
+# HTTP status Sheets returns when the per-minute read quota is spent.
+RATE_LIMITED = 429
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    return isinstance(exc, gspread.exceptions.APIError) and exc.code == RATE_LIMITED
+
+
+def _retrying_reads(read, sleep):
+    """Run `read`, retrying only while Sheets says "too many reads".
+
+    Reads only, and deliberately so: this must never wrap a write.
+    Retrying record_gear would increment a count twice, and record_special
+    would refuse the second attempt outright -- see LedgerWriteError.
+
+    Any other APIError (403 on a revoked key, 404 on a deleted sheet)
+    fails the same way every time, so it is raised immediately rather
+    than making the caller wait out the backoff for the same answer.
+    """
+    for delay in RETRY_DELAYS:
+        try:
+            return read()
+        except Exception as exc:
+            if not _is_rate_limited(exc):
+                raise
+            sleep(delay)
+    return read()
+
 
 def open_logs_tracker(sheet_id: str, service_account_json: str):
     return open_spreadsheet(sheet_id, service_account_json)
@@ -66,31 +101,88 @@ class Snapshot:
     special_grid: list[list[str]]
 
 
-def _grid_or_empty(spreadsheet, title: str) -> list[list[str]]:
-    """The tab's full grid, or [] if the tab does not exist yet.
+def _range_title(range_name: str) -> str:
+    """The tab name out of an A1 range like "'Special Logs'!A1:C4".
 
-    Gear Logs is still being built. A missing tab must degrade to "no
-    gear items exist" rather than breaking special-log requests too.
+    The API quotes a title only when it has to, so the response does not
+    necessarily echo the range string that was sent. Unwrapping both
+    forms here is what lets the caller match grids by name instead of
+    trusting that the response arrives in the order requested.
     """
-    try:
-        return spreadsheet.worksheet(title).get_all_values()
-    except gspread.exceptions.WorksheetNotFound:
-        return []
+    title = range_name.rsplit("!", 1)[0] if "!" in range_name else range_name
+    if len(title) >= 2 and title.startswith("'") and title.endswith("'"):
+        title = title[1:-1].replace("''", "'")
+    return title
 
 
-def read_snapshot(spreadsheet) -> Snapshot:
+def _read_grids(
+    spreadsheet, sheets: dict, titles: tuple[str, ...]
+) -> dict[str, list[list[str]]]:
+    """Every named tab's grid in one API read, missing tabs omitted.
+
+    `sheets` is the caller's already-paid-for title -> Worksheet map, so
+    the only call here is values.batchGet: one read for all three grids.
+    Resolving each tab with spreadsheet.worksheet() instead would spend a
+    *separate* metadata fetch per tab -- gspread calls
+    fetch_sheet_metadata() on every worksheet() -- which is what made one
+    !request cost seven reads against a 60-per-minute quota shared with
+    the attendance bot.
+
+    Gear Logs is still being built. A missing tab is simply absent from
+    the result, so the caller can degrade to "no gear items exist"
+    rather than breaking special-log requests too.
+    """
+    wanted = [title for title in titles if title in sheets]
+    if not wanted:
+        return {}
+    response = spreadsheet.values_batch_get(
+        [gspread.utils.absolute_range_name(title) for title in wanted]
+    )
+    returned = {
+        _range_title(value_range.get("range", "")): value_range
+        for value_range in response.get("valueRanges", [])
+    }
+    grids = {}
+    for title in wanted:
+        value_range = returned.get(title)
+        if value_range is None:
+            grids[title] = []
+            continue
+        values = value_range.get("values")
+        # An absent tab and a present-but-empty one both mean "nothing to
+        # read here", so both become []. get_all_values would have said
+        # [[]] for the empty sheet -- a truthy value that would slip past
+        # the caller's "missing or empty" guard.
+        grids[title] = gspread.utils.fill_gaps(values) if values else []
+    return grids
+
+
+def read_snapshot(spreadsheet, sleep=time.sleep) -> Snapshot:
     """Everything a request decision needs, read in one pass.
 
     One snapshot per command rather than a read per question: the Sheets
     API allows 60 reads per minute per user, and every question here
     (roster, both header rows, the ledger) would otherwise be its own
     call.
+
+    Retries itself on a quota refusal, so a burst from the attendance bot
+    -- which shares the credential and therefore the quota -- costs a
+    member a few seconds rather than an error embed. `sleep` is injected
+    only so tests need not actually wait.
     """
-    special_grid = _grid_or_empty(spreadsheet, SPECIAL_TAB)
+    return _retrying_reads(lambda: _read_snapshot_once(spreadsheet), sleep)
+
+
+def _read_snapshot_once(spreadsheet) -> Snapshot:
+    # One metadata fetch, reused for both "which tabs exist" and the
+    # Worksheet handle read_players/read_headers name in their errors.
+    sheets = {sheet.title: sheet for sheet in spreadsheet.worksheets()}
+    grids = _read_grids(spreadsheet, sheets, (SPECIAL_TAB, GEAR_TAB, LEDGER_TAB))
+    special_grid = grids.get(SPECIAL_TAB, [])
     if not special_grid:
         raise SheetStructureError(f"Worksheet {SPECIAL_TAB!r} is missing or empty")
-    gear_grid = _grid_or_empty(spreadsheet, GEAR_TAB)
-    ledger_grid = _grid_or_empty(spreadsheet, LEDGER_TAB)
+    gear_grid = grids.get(GEAR_TAB, [])
+    ledger_grid = grids.get(LEDGER_TAB, [])
     if ledger_grid and ledger_grid[HEADER_ROW - 1] != LEDGER_HEADER:
         raise SheetStructureError(
             f"Worksheet {LEDGER_TAB!r} has an unexpected header "
@@ -98,7 +190,7 @@ def read_snapshot(spreadsheet) -> Snapshot:
             "Refusing to guess ledger column positions."
         )
 
-    special = spreadsheet.worksheet(SPECIAL_TAB)
+    special = sheets[SPECIAL_TAB]
     return Snapshot(
         roster=read_players(special, special_grid),
         special_headers=read_headers(special, special_grid),
