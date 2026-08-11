@@ -14,12 +14,42 @@ Two kinds of bosses:
 | `!setchannel` | Run once in the channel where spawn notifications should go. **Required.** Unless you set a storage channel, the bot also pins a small storage message here — don't delete it; it's how timers survive restarts. |
 | `!setstoragechannel` | Optional. Run in a private channel to move the storage message there, keeping the notification channel clean. Existing timers move across automatically — nothing has to be re-entered. The bot needs View Channel, Send Messages and Read Message History there (Manage Messages too, so it can pin). |
 | `!clearstoragechannel` | Store the timers back in the notification channel. |
+| `!settodchannel` | Optional, Administrator only. Run in a second channel (e.g. a private TOD log) to let the timer bot take commands there too. See [Channel scoping](#channel-scoping) below. |
 | `!killed <boss> [time]` | Record an interval boss kill. Time is optional (defaults to right now). Examples: `!killed Supore` · `!killed Supore 9PM` · `!killed venatus 21:30` · `!killed Ordo 2026-07-20 21:00`. A time later than now is assumed to be yesterday. |
 | `!boss <name>` | Show one boss's next spawn. Names are case-insensitive and prefix-matched (`!boss sup` → Supore). |
 | `!bosses` | List all 40 bosses sorted by next spawn (unknown/overdue at the bottom). |
 | `!timer <seconds>` | Simple live countdown (max 3600s). |
 
 All schedule times and typed kill times ("9PM") are interpreted in the `BOT_TZ` timezone (**Asia/Manila** by default), regardless of where the server runs. Displayed times use Discord timestamps, so everyone sees their own timezone.
+
+## Channel scoping
+
+All three bots share the `!` prefix in one guild, so by default each one
+answers its commands in **every** channel it can read — typing `!request` in
+the attendance channel really did run the item bot's request flow. Each bot
+now accepts commands only in the channels configured for it, and silently
+ignores them everywhere else. No reply, no reaction.
+
+| Bot | Answers in | Set with |
+|---|---|---|
+| Timer | notification channel + TOD log | `!setchannel`, `!settodchannel` |
+| Attendance | one channel | `!setattendancechannel` |
+| Items | queue / officer / raffle channel, per command | `!setqueuechannel`, `!setofficerchannel`, `!setrafflechannel` |
+
+The `!set…channel` commands are exempt from the guard — they are how a
+channel gets chosen, so they work anywhere.
+
+**A bot with nothing configured is unrestricted.** The guard only engages
+once the relevant channel is set, so deploying this changes no behavior
+until you run the setup commands. Two are new and worth running once:
+
+- `!settodchannel` in your TOD log, so `!killed` keeps working there
+- `!setattendancechannel` in your attendance channel
+
+The item bot needs nothing new; its three channels are already stored.
+
+Note that the timer bot's storage channel deliberately does **not** accept
+commands, and that once a channel is configured a bot stops answering DMs.
 
 **Attendance bot** (a separate bot — see below):
 
@@ -28,8 +58,9 @@ All schedule times and typed kill times ("9PM") are interpreted in the `BOT_TZ` 
 | `!attendance <boss>` | Officers only. Attach one or more in-game roster screenshots; the bot reads every image, merges the names and adds that boss's points to the Point System sheet. Shows a preview first — nothing is written until an officer reacts ✅. |
 | `!attendance <boss> - <boss> - <boss>` | Same, for a rally that killed several bosses with one roster, e.g. `!attendance clemantis - dalia - catena`. Each boss gets its own point value, all in one write, and one `!undoattendance` reverses the lot. |
 | `!undoattendance` | Officers only. Reverses the most recent attendance log. |
-| `!setweek <tab>` | Officers only. Sets which sheet tab attendance goes into, e.g. `Week 17.1`. |
+| `!setweek <tab>` | Admins only, and must also hold an officer role. Sets which sheet tab attendance goes into, e.g. `Week 17.1`. |
 | `!setofficerrole @role [@role ...]` | Admins only. Sets every role that may record attendance, replacing the current set. |
+| `!setattendancechannel` | Admins only. Run once in the attendance channel; the bot then ignores its commands everywhere else. See [Channel scoping](#channel-scoping). |
 | `!attendancehelp` | Lists the attendance commands. |
 
 ## Run locally
