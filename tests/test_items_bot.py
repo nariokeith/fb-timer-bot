@@ -10,7 +10,9 @@ import datetime
 
 import discord
 import pytest
+from discord.ext import commands
 
+import channel_guard
 import items_bot
 import items_state
 
@@ -2710,3 +2712,67 @@ def test_a_corrupt_cell_is_not_mistaken_for_an_already_ticked_box(monkeypatch):
 
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winner == ""
     assert ctx.sent[-1]["embed"].title == "❌ Sheet write failed"
+
+
+class FakeGuardCtx:
+    def __init__(self, channel_id, command_name):
+        self.channel = FakeChannel(channel_id)
+        self.command = type(
+            "Cmd", (), {"name": command_name, "qualified_name": command_name}
+        )()
+
+
+def _configured_state():
+    return items_state.State(
+        officer_channel_id=10, queue_channel_id=20, raffle_channel_id=30
+    )
+
+
+def test_member_commands_are_confined_to_the_queue_channel(monkeypatch):
+    monkeypatch.setattr(items_bot, "_STATE", _configured_state())
+    for name in ("request", "cancelrequest", "myrequests", "itemhelp"):
+        ctx = FakeGuardCtx(20, name)
+        assert items_bot.command_channels(ctx) == (20,)
+        # The reported bug: !request in the attendance channel.
+        assert not channel_guard.allows(999, items_bot.command_channels(ctx))
+
+
+def test_officer_and_raffle_commands_use_their_own_channels(monkeypatch):
+    monkeypatch.setattr(items_bot, "_STATE", _configured_state())
+    for name in ("distribute", "setraffleroles"):
+        assert items_bot.command_channels(FakeGuardCtx(10, name)) == (10,)
+    for name in ("poll", "list", "winner"):
+        assert items_bot.command_channels(FakeGuardCtx(30, name)) == (30,)
+
+
+def test_set_channel_commands_stay_usable_anywhere(monkeypatch):
+    monkeypatch.setattr(items_bot, "_STATE", _configured_state())
+    for name in ("setofficerchannel", "setqueuechannel", "setrafflechannel"):
+        ctx = FakeGuardCtx(999, name)
+        assert items_bot.command_channels(ctx) is channel_guard.EXEMPT
+
+
+def test_requests_are_unrestricted_until_a_queue_channel_is_set(monkeypatch):
+    # Deploying before anyone runs !setqueuechannel must change nothing.
+    monkeypatch.setattr(items_bot, "_STATE", items_state.State(officer_channel_id=10))
+    ctx = FakeGuardCtx(999, "request")
+    assert channel_guard.allows(999, items_bot.command_channels(ctx))
+
+
+def test_every_registered_command_is_classified():
+    # Guards against a future command silently defaulting to unguarded.
+    for command in items_bot.bot.commands:
+        assert command.name in items_bot._CLASSIFIED_COMMANDS, (
+            f"!{command.name} is not listed in items_bot's channel map"
+        )
+
+
+def test_wrong_channel_is_swallowed_but_other_check_failures_still_reply():
+    ctx = FakeCtx(FakeChannel(999))
+    asyncio.run(
+        items_bot.on_command_error(ctx, channel_guard.WrongChannel("nope"))
+    )
+    assert ctx.sent == []
+
+    asyncio.run(items_bot.on_command_error(ctx, commands.CheckFailure("nope")))
+    assert ctx.sent, "a plain CheckFailure must still be reported"

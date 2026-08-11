@@ -22,6 +22,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import channel_guard
 import items_rules
 import items_raffle
 import items_board
@@ -443,6 +444,43 @@ async def _refuse_raffle(ctx, verdict: str) -> bool:
     if verdict is not IGNORE:
         await ctx.send(embed=error_embed("Not allowed", verdict))
     return True
+
+
+# Which channel each command belongs in. The !set*channel commands are
+# exempt because they are how a channel is chosen; everything else is
+# confined to the channel matching its audience -- members to the queue
+# board, officers to the private officer channel, raffles to the raffle
+# channel. Until the relevant channel is set the entry resolves to None
+# and channel_guard leaves the command unrestricted.
+_EXEMPT_COMMANDS = frozenset({
+    "setofficerchannel", "setqueuechannel", "setrafflechannel",
+})
+_OFFICER_COMMANDS = frozenset({"distribute", "setraffleroles"})
+_RAFFLE_COMMANDS = frozenset({"poll", "list", "winner"})
+_QUEUE_COMMANDS = frozenset({"request", "cancelrequest", "myrequests", "itemhelp"})
+
+_CLASSIFIED_COMMANDS = (
+    _EXEMPT_COMMANDS | _OFFICER_COMMANDS | _RAFFLE_COMMANDS | _QUEUE_COMMANDS
+)
+
+
+def command_channels(ctx):
+    """The channel ids ctx.command may run in, or EXEMPT."""
+    name = ctx.command.name
+    if name in _OFFICER_COMMANDS:
+        return (_STATE.officer_channel_id,)
+    if name in _RAFFLE_COMMANDS:
+        return (_STATE.raffle_channel_id,)
+    if name in _QUEUE_COMMANDS:
+        return (_STATE.queue_channel_id,)
+    # Exempt, and the deliberate default for anything unclassified: an
+    # unlisted command keeps working everywhere rather than dying
+    # silently. test_every_registered_command_is_classified is what stops
+    # that default from quietly swallowing a new command.
+    return channel_guard.EXEMPT
+
+
+bot.add_check(channel_guard.make_check(command_channels))
 
 
 @bot.command(name="setraffleroles")
@@ -1260,6 +1298,10 @@ async def on_ready():
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, channel_guard.WrongChannel):
+        # Silent on purpose: a reply would post into the very channel the
+        # guard is keeping quiet, and would advertise that the command exists.
         return
     if isinstance(error, commands.MissingPermissions):
         await ctx.send(embed=error_embed("Not allowed", "That command is for administrators."))
