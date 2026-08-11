@@ -34,11 +34,23 @@ else it is silently ignored.
 - No Discord server changes. No channel is created, deleted, renamed, moved,
   or re-permissioned.
 - No change to what any existing command does — same arguments, same output,
-  same sheet writes. Only *where* it is accepted changes.
-- Not fixing the pre-existing failure
-  `test_successful_requests_repost_the_board_on_every_fifth_request`
-  (board repost counter, from commit `9160e2a`). Out of scope; recorded here
-  so it is not mistaken for a regression from this work.
+  same sheet writes. Only *where* it is accepted changes. **One exception,
+  requested explicitly:** `!setweek` gains an administrator gate (see below).
+## Pre-existing test failure (in scope)
+
+`test_successful_requests_repost_the_board_on_every_fifth_request` fails at
+baseline: it asserts 4 board edits and gets 2.
+
+Commit `9160e2a "change the board repost count"` lowered
+`BOARD_REPOST_EVERY` from 5 to 3 (`items_bot.py:43`) and did not update this
+test, which hardcodes the old cadence. Production is correct; the test is
+stale. The neighbouring
+`test_a_refused_request_does_not_advance_the_board_repost_cadence` survived
+because it derives its numbers from `BOARD_REPOST_EVERY - 2`.
+
+Fix: rewrite the stale test in terms of `BOARD_REPOST_EVERY` rather than
+literals, so it cannot drift again, and rename it away from "fifth". No
+production change.
 
 ## Decisions
 
@@ -106,16 +118,19 @@ setting is required.
 - `data["tod_channel_id"]`, default `None`. Added to `load_local`,
   `encode_state`, and `decode_state`. Read with `.get()` in `decode_state`
   so **pinned state messages written before this change still decode**.
+  `#fieldboss-tod-log` is a private, officer-only channel.
 - New command `!settodchannel` — records the current channel's ID. No `clear`
   counterpart (dropped as unnecessary; re-running `!settodchannel` elsewhere
   moves it).
-- **No permission decorator**, matching this bot's existing setup commands:
-  `!setchannel` (`bot.py:549`), `!setstoragechannel` (`:570`) and
-  `!clearstoragechannel` (`:590`) are all ungated today. Adding a gate only
-  to the new command would be inconsistent, and gating the existing three is
-  a behavior change this work has been told not to make. Worth noting that
-  any member can therefore move the timer bot's channels — a pre-existing
-  property, not one introduced here.
+- Gated with `@commands.has_permissions(administrator=True)`. This bot's
+  existing setup commands are all ungated (`!setchannel` `bot.py:549`,
+  `!setstoragechannel` `:570`, `!clearstoragechannel` `:590`), but gating a
+  brand-new command changes no existing behavior, and an exempt command that
+  redirects where the bot listens is exactly the one that should not be
+  member-runnable. Left unfixed and noted: the three existing ungated setup
+  commands mean a member can still repoint the timer bot's notification and
+  storage channels. That is pre-existing, out of scope here, and worth a
+  follow-up.
 - **Exempt:** `!setchannel`, `!setstoragechannel`, `!clearstoragechannel`,
   `!settodchannel`
 - **Guarded to `{channel_id, tod_channel_id}`:** `!killed`, `!boss`,
@@ -141,8 +156,14 @@ tab (`target_tab`, `officer_role_ids`). One new key follows that pattern.
 - New command `!setattendancechannel`, gated with
   `@commands.has_permissions(administrator=True)` — matching
   `!setofficerrole` (`attendance_bot.py:1358`) and items_bot's set-channel
-  commands. (`!setweek` at `:1323` is ungated, but it selects a sheet tab,
-  not who may command the bot.)
+  commands.
+- `!setweek` (`attendance_bot.py:1323`) gains the same administrator gate.
+  It is currently ungated at the decorator level, though it does call
+  `_require_officer` internally, so today any configured officer can
+  repoint attendance at a different sheet tab. The gate narrows that to
+  administrators. **This is a deliberate behavior change to an existing
+  command, requested explicitly** — the only one in this work. Its existing
+  `_require_officer` check stays, so both must now pass.
 - The value is **cached in a module global**, loaded in `on_ready` and
   refreshed when set. The guard must not cost a Sheets API call per command;
   `!attendancehelp` performs zero sheet reads today and must stay that way.
@@ -200,5 +221,7 @@ Two one-time commands complete the setup:
 - Timer state round-trip: `tod_channel_id` survives
   `encode_state`/`decode_state`, and a pre-change state message lacking the
   key still decodes. There is no `tests/test_bot.py` today; this adds one.
-- Full `pytest` run compared against the recorded baseline of
-  **523 passed, 1 failed** (the pre-existing board-repost failure above).
+- `!setweek` rejects a non-administrator and still honours
+  `_require_officer` for an administrator.
+- Full `pytest` run against the recorded baseline of **523 passed, 1 failed**.
+  Target: 0 failed, with the board-repost test fixed and new tests added.
