@@ -279,6 +279,7 @@ channel:
 | `!cancelpoll <special log>` | Cancel an open poll, remove its message, and free the raffle slot. |
 | `!list <special log>` | After the poll closes, show who is eligible. Freezes that list. |
 | `!winner <special log> <IGN>` | Record the winner and tick their checkbox in the Special Logs tab. |
+| `!winner <special log> <IGN> - <IGN>` | Record several winners from one poll, for a log that dropped more than once. Names are split on a hyphen with a space on both sides, so a hyphenated IGN stays intact. |
 
 Members enter by answering **Yes** on the poll. When it closes, `!list` turns
 the voters into IGNs and drops anyone whose checkbox for that log is already
@@ -289,6 +290,8 @@ it, and anyone it could not identify.
 Draw the winner yourself from the eligible list, then run `!winner`. The bot
 refuses a name that is not on the frozen list, refuses a second draw for the
 same raffle, and refuses to draw before `!list` has been run.
+If a sheet write fails part way, the raffle stays open and the bot prints the
+exact command to re-run for the names it did not record.
 
 **Nicknames must contain the IGN.** The bot reads each voter's server nickname
 and strips the guild tag, so `BK | Jjew`, `M2 - Jjew`, `BK Jjew` and a bare

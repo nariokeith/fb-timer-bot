@@ -234,7 +234,8 @@ its state. Then, in the raffle channel, whoever holds a raffle role runs:
 !poll <special log>            opens a 24-hour poll; --hours N to change it
 !cancelpoll <special log>      cancels an open poll and frees its raffle slot
 !list <special log>            after it closes: who is eligible
-!winner <special log> <IGN>    records the draw, ticks their checkbox
+!winner <special log> <IGN>              records the draw, ticks their checkbox
+!winner <special log> <IGN> - <IGN>      records several winners from one poll
 ```
 
 `!list` reads everyone who answered **Yes**, converts their nickname to an IGN,
@@ -243,7 +244,9 @@ prints eligible, already-has-it, and couldn't-identify. Draw the winner
 yourself, then run `!winner`.
 
 `!winner` refuses a name that is not on the list `!list` froze, refuses a
-second draw for the same raffle, and refuses to run before `!list`. On success
+second draw for the same raffle, refuses to run before `!list`, refuses a name
+repeated within one command, and refuses a name already recorded for that
+raffle. On success
 it ticks the checkbox and adds a `Distribution Log` row — the same write an
 officer approval makes.
 
