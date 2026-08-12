@@ -84,6 +84,11 @@ class Raffle:
     was eligible is a real outcome, and it must stay distinguishable
     from one that has not been listed yet -- otherwise !winner would
     tell an officer to run !list again forever.
+
+    `drawn` cannot be inferred from `winners` for the same shape of
+    reason. A !winner command whose sheet write failed part way through
+    leaves some names recorded and the draw unfinished, and that must
+    stay distinguishable from a draw that completed.
     """
 
     item: str
@@ -93,7 +98,8 @@ class Raffle:
     ends_at: str
     eligible: tuple[str, ...] = ()
     listed: bool = False
-    winner: str = ""
+    winners: tuple[str, ...] = ()
+    drawn: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -104,11 +110,20 @@ class Raffle:
             "ends_at": self.ends_at,
             "eligible": list(self.eligible),
             "listed": self.listed,
-            "winner": self.winner,
+            "winners": list(self.winners),
+            "drawn": self.drawn,
         }
 
     @classmethod
     def from_dict(cls, raw: dict) -> "Raffle":
+        # Raffles pinned before multi-winner carry a single "winner"
+        # string. One recorded winner meant the draw was over, so the
+        # migrated raffle is drawn.
+        if "winners" in raw:
+            winners = tuple(str(name) for name in raw["winners"])
+        else:
+            legacy = str(raw.get("winner", ""))
+            winners = (legacy,) if legacy else ()
         return cls(
             item=str(raw["item"]),
             channel_id=int(raw["channel_id"]),
@@ -117,7 +132,8 @@ class Raffle:
             ends_at=str(raw["ends_at"]),
             eligible=tuple(str(name) for name in raw.get("eligible", [])),
             listed=bool(raw.get("listed", False)),
-            winner=str(raw.get("winner", "")),
+            winners=winners,
+            drawn=bool(raw.get("drawn", bool(winners))),
         )
 
 
@@ -484,10 +500,13 @@ def raffle_to_evict(state: State) -> tuple[bool, Raffle | None]:
     Separate from evict_for_new_raffle because the caller must know the
     price before posting a poll: a poll that Discord rejects must not
     have cost a slot, and once posted it cannot be untaken.
+
+    A partly drawn raffle is also unevictable, because its remaining names
+    still have to be recorded.
     """
     if len(state.raffles) < MAX_RAFFLES:
         return True, None
-    drawn = [raffle for raffle in state.raffles if raffle.winner]
+    drawn = [raffle for raffle in state.raffles if raffle.drawn]
     if not drawn:
         return False, None
     return True, min(drawn, key=lambda raffle: raffle.created_at)

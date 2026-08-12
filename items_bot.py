@@ -1375,7 +1375,7 @@ async def poll_cmd(ctx, *, argument: str = ""):
         now = items_rules.now_pht()
         now_text = items_rules.format_timestamp(now)
         existing = items_state.find_raffle(_STATE, item)
-        if existing is not None and existing.ends_at > now_text and not existing.winner:
+        if existing is not None and existing.ends_at > now_text and not existing.winners:
             await ctx.send(
                 embed=error_embed(
                     "Poll refused",
@@ -1391,7 +1391,7 @@ async def poll_cmd(ctx, *, argument: str = ""):
         # unreachable by !list and !winner AND unevictable (eviction takes
         # only drawn raffles) -- a slot leaked until someone edited the
         # pinned state by hand. A drawn raffle is real history and stays.
-        superseded = existing if existing is not None and not existing.winner else None
+        superseded = existing if existing is not None and not existing.winners else None
         if superseded is not None:
             _STATE.raffles.remove(superseded)
 
@@ -1563,7 +1563,16 @@ def _capped(names: list[str], budget: int, join: str) -> str:
     return join.join(kept)
 
 
-def render_pool(item: str, split: items_raffle.VoterSplit, winner: str = "") -> str:
+def _winner_footer(winners: tuple[str, ...]) -> str:
+    if not winners:
+        return ""
+    label = "Winner" if len(winners) == 1 else "Winners"
+    return f"🏆 **{label}: {', '.join(winners)}**"
+
+
+def render_pool(
+    item: str, split: items_raffle.VoterSplit, winners: tuple[str, ...] = ()
+) -> str:
     """The three groups an officer needs, in one description.
 
     Bounded, because the eligible list is frozen and saved BEFORE this is
@@ -1574,7 +1583,8 @@ def render_pool(item: str, split: items_raffle.VoterSplit, winner: str = "") -> 
     it gets the budget first.
     """
     header = f"**Eligible for {item}** ({len(split.eligible)})"
-    footer = f"\n\n🏆 **Winner: {winner}**" if winner else ""
+    trophy = _winner_footer(winners)
+    footer = f"\n\n{trophy}" if trophy else ""
     budget = EMBED_DESCRIPTION_LIMIT - len(header) - len(footer) - 200
 
     numbered = [f"{n}. {ign}" for n, ign in enumerate(split.eligible, start=1)]
@@ -1589,8 +1599,8 @@ def render_pool(item: str, split: items_raffle.VoterSplit, winner: str = "") -> 
         block = "**Couldn't identify** — sort these out by hand"
         mentions = [f"<@{voter.user_id}>" for voter in split.unidentified]
         lines += ["", block, _capped(mentions, max(budget, 0), " ")]
-    if winner:
-        lines += ["", f"🏆 **Winner: {winner}**"]
+    if trophy:
+        lines += ["", trophy]
     return "\n".join(lines)
 
 
@@ -1617,7 +1627,7 @@ async def list_cmd(ctx, *, argument: str = ""):
         split = items_raffle.VoterSplit(eligible=list(raffle.eligible))
         await ctx.send(
             embed=ok_embed(
-                f"Raffle: {raffle.item}", render_pool(raffle.item, split, raffle.winner)
+                f"Raffle: {raffle.item}", render_pool(raffle.item, split, raffle.winners)
             )
         )
         return
@@ -1674,7 +1684,7 @@ async def list_cmd(ctx, *, argument: str = ""):
                         render_pool(
                             raffle.item,
                             items_raffle.VoterSplit(eligible=list(raffle.eligible)),
-                            raffle.winner,
+                            raffle.winners,
                         ),
                     )
                     if raffle is not None
@@ -1727,7 +1737,7 @@ async def list_cmd(ctx, *, argument: str = ""):
 
     await ctx.send(
         embed=ok_embed(
-            f"Raffle: {updated.item}", render_pool(updated.item, split, updated.winner)
+            f"Raffle: {updated.item}", render_pool(updated.item, split, updated.winners)
         )
     )
 
@@ -1756,12 +1766,12 @@ async def winner_cmd(ctx, *, argument: str = ""):
         raffle = items_state.find_raffle(_STATE, item)
         now = items_rules.format_timestamp(items_rules.now_pht())
 
-        if raffle.winner:
+        if raffle.drawn:
             await ctx.send(
                 embed=error_embed(
                     "Winner refused",
                     f"**{raffle.item}** has already been drawn: "
-                    f"**{raffle.winner}** won it.",
+                    f"**{', '.join(raffle.winners)}** won it.",
                 )
             )
             return
@@ -1817,7 +1827,9 @@ async def winner_cmd(ctx, *, argument: str = ""):
             # The checkbox IS ticked. Re-running could only fail against
             # a ticked box, so the raffle closes and the officer is given
             # the exact ledger row instead.
-            items_state.replace_raffle(_STATE, raffle, winner=on_list)
+            items_state.replace_raffle(
+                _STATE, raffle, winners=(on_list,), drawn=True
+            )
             channel = (
                 bot.get_channel(_STATE.officer_channel_id)
                 if _STATE.officer_channel_id is not None
@@ -1843,7 +1855,9 @@ async def winner_cmd(ctx, *, argument: str = ""):
             # restart restored a raffle that looks undrawn. Saying "nothing
             # was recorded" here would be the opposite of the truth: the
             # item HAS been given. Close the raffle to match the sheet.
-            items_state.replace_raffle(_STATE, raffle, winner=on_list)
+            items_state.replace_raffle(
+                _STATE, raffle, winners=(on_list,), drawn=True
+            )
             channel = (
                 bot.get_channel(_STATE.officer_channel_id)
                 if _STATE.officer_channel_id is not None
@@ -1869,7 +1883,9 @@ async def winner_cmd(ctx, *, argument: str = ""):
             )
             return
 
-        items_state.replace_raffle(_STATE, raffle, winner=on_list)
+        items_state.replace_raffle(
+            _STATE, raffle, winners=(on_list,), drawn=True
+        )
         channel = (
             bot.get_channel(_STATE.officer_channel_id)
             if _STATE.officer_channel_id is not None
@@ -1917,13 +1933,13 @@ async def cancelpoll_cmd(ctx, *, argument: str = ""):
             )
             return
 
-        if raffle.winner:
+        if raffle.winners:
             await ctx.send(
                 embed=error_embed(
                     "Cancel refused",
                     f"**{raffle.item}** has already been drawn: "
-                    f"**{raffle.winner}** won it. A drawn raffle is "
-                    "distribution history.",
+                    f"**{', '.join(raffle.winners)}** won it. A drawn raffle "
+                    "is distribution history.",
                 )
             )
             return
