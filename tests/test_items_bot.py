@@ -173,11 +173,13 @@ def reset_module_state():
     """
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
+    items_bot._SHEET_LOCK = asyncio.Lock()
     if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
         items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
     yield
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
+    items_bot._SHEET_LOCK = asyncio.Lock()
     if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
         items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
 
@@ -1954,6 +1956,241 @@ def _posted_poll(channel):
     return polls[0]
 
 
+def test_iam_binds_a_member_to_their_roster_row(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[], display_name="xXshadowXx")
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Kobe"))
+
+    assert items_bot._STATE.bindings["7"] == "Kobe"
+    assert ctx.sent[-1]["embed"].title.startswith("✅")
+
+
+def test_iam_needs_no_raffle_role(monkeypatch):
+    """Ordinary members must be able to identify themselves."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    assert items_bot._STATE.bindings["7"] == "Jjew"
+
+
+def test_iam_is_silent_outside_the_raffle_channel(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(channel_id=999, roles=())
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    assert ctx.sent == []
+    assert items_bot._STATE.bindings == {}
+
+
+def test_iam_refuses_an_ign_another_account_already_claimed(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    items_bot._STATE.bindings["5"] = "Kobe"
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Kobe"))
+
+    assert "already" in ctx.sent[-1]["embed"].description.casefold()
+    assert items_bot._STATE.bindings == {"5": "Kobe"}
+
+
+def test_iam_cannot_take_a_row_another_account_holds_under_an_alias(monkeypatch):
+    """A roster rename leaves an alias spelling behind; it still resolves."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Kobe", "Jjew"))
+    items_bot._STATE.bindings["5"] = "KobePH"
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Kobe"))
+
+    assert items_bot._STATE.bindings == {"5": "KobePH"}
+    assert "already" in ctx.sent[-1]["embed"].description.casefold()
+
+
+def test_iam_lets_a_member_rebind_themselves(monkeypatch):
+    """Changing main must not need an officer."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    items_bot._STATE.bindings["7"] = "Jjew"
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Kobe"))
+
+    assert items_bot._STATE.bindings["7"] == "Kobe"
+
+
+def test_iam_refuses_a_name_not_in_the_roster(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Nobody"))
+
+    assert "No player named" in ctx.sent[-1]["embed"].description
+    assert items_bot._STATE.bindings == {}
+
+
+def test_iam_refuses_a_member_an_officer_marked_not_a_player(monkeypatch):
+    """Letting them clear it themselves would make the mark meaningless."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    items_bot._STATE.not_players.append("7")
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    assert "officer" in ctx.sent[-1]["embed"].description.casefold()
+    assert items_bot._STATE.bindings == {}
+
+
+def test_iam_honours_a_not_a_player_mark_that_lands_while_it_waits(monkeypatch):
+    """An officer can mark the caller while !iam is queued on the lock."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    async def scenario():
+        await items_bot._SHEET_LOCK.acquire()
+        task = asyncio.ensure_future(
+            items_bot.iam_cmd.callback(ctx, argument="Jjew")
+        )
+        for _ in range(5):          # let !iam reach the lock and block there
+            await asyncio.sleep(0)
+        items_bot._STATE.not_players.append("7")   # what !notaplayer does
+        items_bot._SHEET_LOCK.release()
+        await task
+
+    asyncio.run(scenario())
+
+    assert items_bot._STATE.bindings == {}
+    assert "officer" in ctx.sent[-1]["embed"].description.casefold()
+
+
+def test_bind_overrides_another_accounts_claim(monkeypatch):
+    """One IGN maps to at most one account."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    items_bot._STATE.bindings["5"] = "Kobe"
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.bind_cmd.callback(ctx, FakeMember(user_id=7), argument="Kobe")
+    )
+
+    assert items_bot._STATE.bindings == {"7": "Kobe"}
+    assert "5" in ctx.sent[-1]["embed"].description
+
+
+def test_iam_is_announced_in_the_officer_channel(monkeypatch):
+    """The one command a member can use to change state leaves a trail."""
+    state_channel = _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    posted = " ".join(message.content for message in state_channel.sent)
+    assert "<@7>" in posted and "Jjew" in posted
+
+
+def test_a_failed_officer_notice_does_not_undo_the_binding(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+    monkeypatch.setattr(
+        items_bot,
+        "_tell_officers",
+        lambda text: (_ for _ in ()).throw(RuntimeError("channel gone")),
+    )
+
+    try:
+        asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+    except RuntimeError:
+        pass
+
+    assert items_bot._STATE.bindings["7"] == "Jjew"
+
+
+def test_bind_displaces_a_claim_held_under_an_alias(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Kobe", "Jjew"))
+    items_bot._STATE.bindings["5"] = "KobePH"
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.bind_cmd.callback(ctx, FakeMember(user_id=7), argument="Kobe")
+    )
+
+    assert items_bot._STATE.bindings == {"7": "Kobe"}
+
+
+def test_bind_clears_a_not_a_player_mark(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    items_bot._STATE.not_players.append("7")
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.bind_cmd.callback(ctx, FakeMember(user_id=7), argument="Jjew")
+    )
+
+    assert items_bot._STATE.bindings["7"] == "Jjew"
+    assert items_bot._STATE.not_players == []
+
+
+def test_bind_needs_a_raffle_role(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+
+    asyncio.run(
+        items_bot.bind_cmd.callback(ctx, FakeMember(user_id=7), argument="Jjew")
+    )
+
+    assert items_bot._STATE.bindings == {}
+
+
+def test_notaplayer_marks_and_clears_any_binding(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, _ = _raffle_ctx()
+    items_bot._STATE.bindings["7"] = "Jjew"
+
+    asyncio.run(items_bot.notaplayer_cmd.callback(ctx, FakeMember(user_id=7)))
+
+    assert items_bot._STATE.not_players == ["7"]
+    assert items_bot._STATE.bindings == {}
+
+
+def test_a_binding_that_will_not_fit_is_rolled_back(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    monkeypatch.setattr(items_state, "fits", lambda state: False)
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    assert items_bot._STATE.bindings == {}
+    assert "full" in ctx.sent[-1]["embed"].description.casefold()
+
+
 def test_poll_posts_a_poll_and_records_the_raffle(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch)
@@ -2124,9 +2361,102 @@ def test_list_refuses_while_the_poll_is_still_open(monkeypatch):
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").listed is False
 
 
+def test_list_refuses_to_freeze_while_a_voter_is_unresolved(monkeypatch):
+    """A voter nobody can name must not be silently dropped from the pool."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "xXshadowXx")]),
+    )
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is False, "the pool must NOT be frozen"
+    assert raffle.eligible == ()
+    description = ctx.sent[-1]["embed"].description
+    assert "<@2>" in description
+    assert "xXshadowXx" in description
+    assert "!iam" in description
+
+
+def test_list_freezes_once_the_unresolved_voter_is_bound(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    items_bot._STATE.bindings["2"] = "Kobe"
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "xXshadowXx")]),
+    )
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is True
+    assert raffle.eligible == ("Jjew", "Kobe")
+
+
+def test_list_freezes_when_the_only_stranger_is_marked_not_a_player(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    items_bot._STATE.not_players.append("2")
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "a guest")]),
+    )
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is True
+    assert raffle.eligible == ("Jjew",)
+    assert "1 voter skipped" in ctx.sent[-1]["embed"].description
+
+
+def test_render_pool_shows_the_request_fallback_group():
+    voter = items_raffle.Voter(user_id=3, display_name="xXshadowXx")
+    split = items_raffle.VoterSplit(
+        eligible=["Jjew", "Ryuu"], from_request=[(voter, "Ryuu")]
+    )
+
+    text = items_bot.render_pool("Asta's Heart", split)
+
+    assert "last !request" in text
+    assert "<@3>" in text
+    assert "Ryuu" in text
+
+
+def test_render_pool_names_two_accounts_on_one_player():
+    voter = items_raffle.Voter(user_id=9, display_name="xXshadowXx")
+    split = items_raffle.VoterSplit(eligible=["Jjew"], duplicates=[(voter, "Jjew")])
+
+    text = items_bot.render_pool("Asta's Heart", split)
+
+    assert "<@9>" in text
+    assert "one player" in text
+
+
+def _fake_poll_voters(pairs):
+    """Stand in for poll_voters, which would otherwise hit Discord."""
+    async def _voters(message):
+        return [
+            items_raffle.Voter(user_id=user_id, display_name=name)
+            for user_id, name in pairs
+        ]
+    return _voters
+
+
 def test_list_splits_the_voters_and_freezes_the_pool(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch, roster=("Jjew", "Kobe"), holds=("Kobe",))
+    items_bot._STATE.not_players.append("3")
     ctx, channel = _raffle_ctx()
     answer = FakePollAnswer(
         "Yes",
@@ -2142,7 +2472,7 @@ def test_list_splits_the_voters_and_freezes_the_pool(monkeypatch):
     description = ctx.sent[-1]["embed"].description
     assert "Jjew" in description
     assert "Kobe" in description
-    assert "<@3>" in description
+    assert "1 voter skipped" in description
 
 
 def test_listing_twice_replays_the_frozen_pool(monkeypatch):
@@ -2663,7 +2993,8 @@ def test_no_command_is_defined_after_the_main_guard():
 
 def test_every_raffle_command_is_registered_on_the_bot():
     registered = {c.name for c in items_bot.bot.commands}
-    for name in ("poll", "list", "winner", "cancelpoll", "setraffleroles", "setrafflechannel"):
+    for name in ("poll", "list", "winner", "cancelpoll", "iam", "bind",
+                 "notaplayer", "setraffleroles", "setrafflechannel"):
         assert name in registered, f"!{name} is not registered"
 
 
@@ -2745,6 +3076,26 @@ def test_the_pool_embed_stays_within_discords_description_limit():
 
     assert len(rendered) <= 4096, f"{len(rendered)} chars would be rejected by Discord"
     assert "Someone" in rendered, "the winner must never be truncated away"
+
+
+def test_the_refusal_embed_stays_within_discords_description_limit(monkeypatch):
+    """An embed Discord refuses names nobody -- the one thing this does."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(10**17 + n, f"stranger{n:03d}") for n in range(400)]),
+    )
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    description = ctx.sent[-1]["embed"].description
+    assert len(description) <= 4096, f"{len(description)} chars would be rejected"
+    assert "more" in description, "truncation must say how many were left out"
+    assert "!iam" in description, "the instructions must survive truncation"
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").listed is False
 
 
 def test_redrawing_a_winner_whose_box_is_already_ticked_says_so(monkeypatch):
@@ -2916,7 +3267,8 @@ def test_officer_and_raffle_commands_use_their_own_channels(monkeypatch):
     monkeypatch.setattr(items_bot, "_STATE", _configured_state())
     for name in ("distribute", "setraffleroles"):
         assert items_bot.command_channels(FakeGuardCtx(10, name)) == (10,)
-    for name in ("poll", "list", "winner", "cancelpoll"):
+    for name in ("poll", "list", "winner", "cancelpoll", "iam", "bind",
+                 "notaplayer"):
         assert items_bot.command_channels(FakeGuardCtx(30, name)) == (30,)
 
 

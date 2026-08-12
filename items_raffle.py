@@ -86,18 +86,84 @@ class Voter:
 
 
 @dataclass(frozen=True)
+class Identities:
+    """The three places a Discord account can be tied to a roster row.
+
+    Passed in rather than read here so this module stays pure: the bot
+    binds it from the state it already holds.
+    """
+
+    bindings: dict[str, str]
+    not_players: frozenset[str]
+    request_igns: dict[str, str]
+
+
+@dataclass(frozen=True)
 class VoterSplit:
     eligible: list[str] = field(default_factory=list)
     already_have: list[str] = field(default_factory=list)
+    # Blocks the freeze: a voter nobody can name must not be silently
+    # dropped from a pool a winner is drawn from.
     unidentified: list[Voter] = field(default_factory=list)
+    # Resolved only through the IGN they last requested under, which may
+    # be an alt -- shown separately so an officer can check before drawing.
+    from_request: list[tuple[Voter, str]] = field(default_factory=list)
+    skipped: list[Voter] = field(default_factory=list)
+    # Collapsed as a repeat of a player already counted. The pool is right
+    # either way, but an officer seeing two accounts on one row is how a
+    # wrong binding gets noticed.
+    duplicates: list[tuple[Voter, str]] = field(default_factory=list)
+
+
+def _in_roster(ign: str, roster: list[str]) -> str | None:
+    """The roster spelling of this IGN, or None when it is not one."""
+    try:
+        return items_rules.resolve_ign(ign, roster)
+    except items_rules.RequestParseError:
+        # Two roster rows normalise identically. That is a sheet problem,
+        # and nobody can be resolved safely against it.
+        return None
+
+
+def resolve_identity(
+    voter: Voter, roster: list[str], identities: Identities
+) -> tuple[str | None, str | None]:
+    """The roster row this voter is, and which rung of the ladder said so.
+
+    A binding is tried before the nickname so an officer can correct a
+    nickname that resolves to the wrong player. A binding or fallback
+    naming a row that has since left the sheet resolves to nothing rather
+    than staying drawable.
+    """
+    key = str(voter.user_id)
+
+    bound = identities.bindings.get(key)
+    if bound is not None:
+        player = _in_roster(bound, roster)
+        return (player, "binding") if player is not None else (None, None)
+
+    if key in identities.not_players:
+        return None, "skipped"
+
+    player = resolve_voter(voter.display_name, roster)
+    if player is not None:
+        return player, "nickname"
+
+    requested = identities.request_igns.get(key)
+    if requested is not None:
+        player = _in_roster(requested, roster)
+        return (player, "request") if player is not None else (None, None)
+
+    return None, None
 
 
 def classify_voters(
     voters: list[Voter],
     roster: list[str],
     holds: Callable[[str], bool],
+    identities: Identities,
 ) -> VoterSplit:
-    """Split the poll's voters into the three groups an officer needs.
+    """Split the poll's voters into the groups an officer needs.
 
     `holds` answers "is this player's checkbox already ticked for this
     special log". It is passed in rather than read here so this stays
@@ -111,21 +177,35 @@ def classify_voters(
     eligible: list[str] = []
     already_have: list[str] = []
     unidentified: list[Voter] = []
+    from_request: list[tuple[Voter, str]] = []
+    skipped: list[Voter] = []
+    duplicates: list[tuple[Voter, str]] = []
     seen: set[str] = set()
 
     for voter in voters:
-        player = resolve_voter(voter.display_name, roster)
+        player, source = resolve_identity(voter, roster, identities)
+        if source == "skipped":
+            skipped.append(voter)
+            continue
         if player is None:
             unidentified.append(voter)
             continue
         key = normalize(player)
         if key in seen:
+            duplicates.append((voter, player))
             continue
         seen.add(key)
+        if source == "request":
+            from_request.append((voter, player))
         (already_have if holds(player) else eligible).append(player)
 
     return VoterSplit(
-        eligible=eligible, already_have=already_have, unidentified=unidentified
+        eligible=eligible,
+        already_have=already_have,
+        unidentified=unidentified,
+        from_request=from_request,
+        skipped=skipped,
+        duplicates=duplicates,
     )
 
 DEFAULT_POLL_HOURS = 24

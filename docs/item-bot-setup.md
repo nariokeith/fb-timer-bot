@@ -40,9 +40,9 @@ The supervisor is only for Render, where nothing else is running.
    ignores every `!request` — it cannot see message text at all. This is the
    single most common reason a new bot "does nothing".
 
-   Without server members the bot cannot read anyone's server nickname, so
-   every voter in a special log raffle comes back as "couldn't identify" and
-   `!list` produces an empty eligible list. Both are needed.
+   Without server members the bot cannot read anyone's server nickname, so it
+   cannot identify any voter in a special log raffle and `!list` refuses to
+   freeze the pool at all. Both are needed.
 
 4. **OAuth2 → URL Generator**:
    - Scopes: **`bot`**
@@ -236,12 +236,22 @@ its state. Then, in the raffle channel, whoever holds a raffle role runs:
 !list <special log>                      after it closes: who is eligible
 !winner <special log> <IGN>              records the draw, ticks their checkbox
 !winner <special log> <IGN> - <IGN>      records several winners from one poll
+!iam <your IGN>                          any member: which player you are
+!bind @user <IGN>                        officer: identify someone else
+!notaplayer @user                        officer: they have no roster row
 ```
 
 `!list` reads everyone who answered **Yes**, converts their nickname to an IGN,
 and removes anyone already ticked for that log in the `Special Logs` tab. It
-prints eligible, already-has-it, and couldn't-identify. Draw the winner
-yourself, then run `!winner`.
+prints who is eligible, who already has it, anyone it could only identify from
+their last `!request`, and a count of anyone marked not a roster player. Draw
+the winner yourself, then run `!winner`.
+
+`!list` refuses to freeze the pool while any voter is unidentified, so a
+member the bot cannot name is never dropped from a draw without anyone
+noticing. Members fix this themselves with `!iam <IGN>`; an officer can use
+`!bind @user <IGN>`, or `!notaplayer @user` for a guest who has no row in the
+sheet at all.
 
 `!winner` refuses a name that is not on the list `!list` froze, refuses a
 second draw for the same raffle, refuses to run before `!list`, refuses a name
@@ -250,9 +260,9 @@ raffle. On success
 it ticks the checkbox and adds a `Distribution Log` row — the same write an
 officer approval makes.
 
-Members' nicknames must contain their IGN. `BK | Jjew`, `M2 - Jjew`, `BK Jjew`
-and a bare `Jjew` all resolve to the sheet row `Jjew`. Anything that does not
-contain the IGN is reported for you to handle by hand.
+The bot can identify most members from their nickname. `BK | Jjew`,
+`M2 - Jjew`, `BK Jjew` and a bare `Jjew` all resolve to the sheet row `Jjew`.
+When that is not enough, use `!iam`, `!bind` or `!notaplayer`.
 
 ### 7. Tell your members
 

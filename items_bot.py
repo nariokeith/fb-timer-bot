@@ -16,6 +16,7 @@ import asyncio
 import datetime
 import os
 import sys
+from collections.abc import Callable
 from difflib import get_close_matches
 
 import discord
@@ -441,6 +442,27 @@ def raffle_access(ctx) -> str | None:
     return None
 
 
+def raffle_member_access(ctx) -> str | None:
+    """None if a MEMBER command may run here, else a refusal or IGNORE.
+
+    Same channel confinement as raffle_access and the same silence when
+    typed elsewhere, without the role check: !iam exists so that members
+    who hold no raffle role can identify themselves.
+    """
+    if _STATE.raffle_channel_id is None:
+        permissions = getattr(ctx.author, "guild_permissions", None)
+        if getattr(permissions, "administrator", False):
+            return (
+                "No raffle channel is set. Run `!setrafflechannel` in the "
+                "channel where special log polls should be posted."
+            )
+        return IGNORE
+
+    if ctx.channel.id != _STATE.raffle_channel_id:
+        return IGNORE
+    return None
+
+
 async def _refuse_raffle(ctx, verdict: str) -> bool:
     """Send the refusal if there is one. True when the caller must stop."""
     if verdict is None:
@@ -460,7 +482,9 @@ _EXEMPT_COMMANDS = frozenset({
     "setofficerchannel", "setqueuechannel", "setrafflechannel",
 })
 _OFFICER_COMMANDS = frozenset({"distribute", "setraffleroles"})
-_RAFFLE_COMMANDS = frozenset({"poll", "list", "winner", "cancelpoll"})
+_RAFFLE_COMMANDS = frozenset({
+    "poll", "list", "winner", "cancelpoll", "iam", "bind", "notaplayer",
+})
 _QUEUE_COMMANDS = frozenset({"request", "cancelrequest", "myrequests", "itemhelp"})
 
 _CLASSIFIED_COMMANDS = (
@@ -569,6 +593,260 @@ async def setrafflechannel_cmd(ctx):
             "Raffle channel set",
             f"`!poll`, `!list` and `!winner` now work in {ctx.channel.mention}.",
         )
+    )
+
+
+async def _save_binding_change(ctx, undo: Callable[[], None]) -> bool:
+    """Persist a binding change, or undo it and say so. True when saved."""
+    if not items_state.fits(_STATE):
+        undo()
+        await ctx.send(
+            embed=error_embed(
+                "State is full",
+                "The bot state is full and cannot store another entry until "
+                "the request queue is worked down. Nothing was changed.",
+            )
+        )
+        return False
+    channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if channel is not None:
+        await save_state(channel)
+    return True
+
+
+async def _tell_officers(text: str) -> None:
+    """Echo a binding change to the officer channel, if one is set.
+
+    !iam is the only command a member can use to change bot state, and it
+    can claim a row whose owner the bot currently knows only by nickname.
+    An officer who sees the claim can reverse it with !bind.
+    """
+    channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if channel is None:
+        return
+    try:
+        await channel.send(text)
+    except Exception:
+        # A notice is never worth failing a binding that is already saved.
+        pass
+
+
+def _same_player(stored_ign: str, player: str, roster: list[str]) -> bool:
+    """Whether a stored binding names the same roster row as `player`.
+
+    Compared through resolve_ign rather than as raw strings: an alias
+    left behind by a roster rename still resolves at !list time, so a
+    string compare would let two accounts hold one row and silently drop
+    one of them from the pool.
+    """
+    try:
+        resolved = items_rules.resolve_ign(stored_ign, roster)
+    except items_rules.RequestParseError:
+        return False
+    return resolved is not None and items_rules.normalize(resolved) == items_rules.normalize(player)
+
+
+@bot.command(name="iam")
+async def iam_cmd(ctx, *, argument: str = ""):
+    """Bind your own Discord account to your roster row."""
+    if await _refuse_raffle(ctx, raffle_member_access(ctx)):
+        return
+
+    caller = str(ctx.author.id)
+
+    async with _SHEET_LOCK:
+        # Re-read under the lock: an officer's !notaplayer can land while
+        # this command is queued behind another sheet operation, and a
+        # verdict taken before the wait would be stale by now.
+        if caller in _STATE.not_players:
+            await ctx.send(
+                embed=error_embed(
+                    "Not allowed",
+                    "An officer has marked this account as not a roster player. "
+                    "Ask an officer to run `!bind` for you.",
+                )
+            )
+            return
+
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        try:
+            player = items_rules.resolve_ign(argument.strip(), snapshot.roster)
+        except items_rules.RequestParseError as exc:
+            await ctx.send(embed=error_embed("Not recorded", str(exc)))
+            return
+        if player is None:
+            suggestions = get_close_matches(argument.strip(), snapshot.roster, n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            await ctx.send(
+                embed=error_embed(
+                    "Not recorded",
+                    f"No player named {argument.strip()!r} in the sheet.{hint} "
+                    "Usage: `!iam <your IGN>`",
+                )
+            )
+            return
+
+        holder = next(
+            (
+                user_id
+                for user_id, ign in _STATE.bindings.items()
+                if user_id != caller and _same_player(ign, player, snapshot.roster)
+            ),
+            None,
+        )
+        if holder is not None:
+            await ctx.send(
+                embed=error_embed(
+                    "Not recorded",
+                    f"**{player}** is already claimed by <@{holder}>. If that "
+                    "is wrong, ask an officer to run `!bind`.",
+                )
+            )
+            return
+
+        previous = _STATE.bindings.get(caller)
+        _STATE.bindings[caller] = player
+
+        def undo():
+            if previous is None:
+                _STATE.bindings.pop(caller, None)
+            else:
+                _STATE.bindings[caller] = previous
+
+        if not await _save_binding_change(ctx, undo):
+            return
+
+    await ctx.send(
+        embed=ok_embed(
+            "You are recorded",
+            f"This account is **{player}**. You will be recognised in raffle "
+            "polls from now on.",
+        )
+    )
+    await _tell_officers(f"🔗 <@{ctx.author.id}> claimed **{player}** via `!iam`.")
+
+
+@bot.command(name="bind")
+async def bind_cmd(ctx, member: discord.Member, *, argument: str = ""):
+    """Bind someone else's Discord account to a roster row."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    async with _SHEET_LOCK:
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        try:
+            player = items_rules.resolve_ign(argument.strip(), snapshot.roster)
+        except items_rules.RequestParseError as exc:
+            await ctx.send(embed=error_embed("Not recorded", str(exc)))
+            return
+        if player is None:
+            suggestions = get_close_matches(argument.strip(), snapshot.roster, n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            await ctx.send(
+                embed=error_embed(
+                    "Not recorded",
+                    f"No player named {argument.strip()!r} in the sheet.{hint} "
+                    "Usage: `!bind @user <IGN>`",
+                )
+            )
+            return
+
+        target = str(member.id)
+        # One IGN maps to at most one account, or two voters would resolve
+        # to the same row and one of them would be silently collapsed away.
+        displaced = [
+            user_id
+            for user_id, ign in _STATE.bindings.items()
+            if user_id != target and _same_player(ign, player, snapshot.roster)
+        ]
+        previous = dict(_STATE.bindings)
+        was_marked = target in _STATE.not_players
+        for user_id in displaced:
+            _STATE.bindings.pop(user_id, None)
+        _STATE.bindings[target] = player
+        if was_marked:
+            _STATE.not_players.remove(target)
+
+        def undo():
+            _STATE.bindings.clear()
+            _STATE.bindings.update(previous)
+            if was_marked and target not in _STATE.not_players:
+                _STATE.not_players.append(target)
+
+        if not await _save_binding_change(ctx, undo):
+            return
+
+    taken = (
+        " Removed the earlier claim by "
+        + ", ".join(f"<@{user_id}>" for user_id in displaced)
+        + "."
+        if displaced
+        else ""
+    )
+    await ctx.send(
+        embed=ok_embed(
+            "Binding recorded",
+            f"<@{member.id}> is **{player}**.{taken}",
+        )
+    )
+    await _tell_officers(
+        f"🔗 <@{ctx.author.id}> bound <@{member.id}> to **{player}**."
+    )
+
+
+@bot.command(name="notaplayer")
+async def notaplayer_cmd(ctx, member: discord.Member):
+    """Record that this account has no roster row at all."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    # No IGN to resolve, so no sheet read -- but the lock is still held
+    # while _STATE is mutated and saved, so a concurrent !list cannot
+    # classify voters against a half-applied change.
+    async with _SHEET_LOCK:
+        target = str(member.id)
+        previous = _STATE.bindings.get(target)
+        already_marked = target in _STATE.not_players
+        _STATE.bindings.pop(target, None)
+        if not already_marked:
+            _STATE.not_players.append(target)
+
+        def undo():
+            if previous is not None:
+                _STATE.bindings[target] = previous
+            if not already_marked and target in _STATE.not_players:
+                _STATE.not_players.remove(target)
+
+        if not await _save_binding_change(ctx, undo):
+            return
+
+    await ctx.send(
+        embed=ok_embed(
+            "Marked as not a player",
+            f"<@{member.id}> has no roster row and will be skipped in raffle "
+            "polls. Run `!bind` to undo this.",
+        )
+    )
+    await _tell_officers(
+        f"🔗 <@{ctx.author.id}> marked <@{member.id}> as not a roster player."
     )
 
 
@@ -1259,7 +1537,10 @@ async def itemhelp_cmd(ctx):
             "**`!winner <special log> <IGN>`** — record the draw\n"
             "**`!winner <special log> <IGN> - <IGN>`** — several winners "
             "at once\n"
-            "**`!cancelpoll <special log>`** — cancel an open poll"
+            "**`!cancelpoll <special log>`** — cancel an open poll\n"
+            "\n**`!iam <your IGN>`** — tell the bot which player you are\n"
+            "**`!bind @user <IGN>`** — officer: identify someone\n"
+            "**`!notaplayer @user`** — officer: they have no roster row"
         ),
         inline=False,
     )
@@ -1312,6 +1593,17 @@ async def on_command_error(ctx, error):
         return
     if isinstance(error, commands.MissingPermissions):
         await ctx.send(embed=error_embed("Not allowed", "That command is for administrators."))
+        return
+    if isinstance(error, (commands.MemberNotFound, commands.MissingRequiredArgument)):
+        # Arguments are converted after checks run, so a mistyped member
+        # would otherwise surface as an unexplained internal error.
+        await ctx.send(
+            embed=error_embed(
+                "Not recorded",
+                f"`!{ctx.command.name}` needs a member the bot can see. "
+                "Usage: `!bind @user <IGN>` or `!notaplayer @user`.",
+            )
+        )
         return
     print(f"[items] command error: {error!r}", flush=True)
     await ctx.send(embed=error_embed("Something went wrong", str(error)))
@@ -1588,12 +1880,12 @@ def _winner_footer(winners: tuple[str, ...]) -> str:
 def render_pool(
     item: str, split: items_raffle.VoterSplit, winners: tuple[str, ...] = ()
 ) -> str:
-    """The three groups an officer needs, in one description.
+    """Everything an officer needs to see about the pool, in one description.
 
     Bounded, because the eligible list is frozen and saved BEFORE this is
     sent: a description Discord refuses would leave the pool committed
     with nothing shown, and a retry replays the frozen list without the
-    excluded and unidentified groups that only exist on the first run.
+    groups that only exist on the first run.
     The eligible list is the one that must survive truncation intact, so
     it gets the budget first.
     """
@@ -1610,10 +1902,25 @@ def render_pool(
         block = "**Already has it** (excluded)"
         lines += ["", block, _capped(split.already_have, max(budget, 0), ", ")]
         budget -= len(lines[-1]) + len(block)
-    if split.unidentified:
-        block = "**Couldn't identify** — sort these out by hand"
-        mentions = [f"<@{voter.user_id}>" for voter in split.unidentified]
-        lines += ["", block, _capped(mentions, max(budget, 0), " ")]
+    if split.from_request:
+        block = "ℹ️ **Identified from their last !request** — check these"
+        entries = [
+            f"<@{voter.user_id}> → {ign}  (nickname {voter.display_name!r})"
+            for voter, ign in split.from_request
+        ]
+        lines += ["", block, _capped(entries, max(budget, 0), "\n")]
+        budget -= len(lines[-1]) + len(block)
+    if split.duplicates:
+        block = "⚠️ **Two accounts, one player** — counted once"
+        entries = [
+            f"<@{voter.user_id}> → {ign}" for voter, ign in split.duplicates
+        ]
+        lines += ["", block, _capped(entries, max(budget, 0), "\n")]
+        budget -= len(lines[-1]) + len(block)
+    if split.skipped:
+        count = len(split.skipped)
+        noun = "voter" if count == 1 else "voters"
+        lines += ["", f"_{count} {noun} skipped (not roster players)_"]
     if trophy:
         lines += ["", trophy]
     return "\n".join(lines)
@@ -1720,7 +2027,35 @@ async def list_cmd(ctx, *, argument: str = ""):
             voters,
             snapshot.roster,
             holds=lambda ign: items_sheet.holds_special(snapshot, ign, raffle.item),
+            identities=items_raffle.Identities(
+                bindings=dict(_STATE.bindings),
+                not_players=frozenset(_STATE.not_players),
+                request_igns=dict(_STATE.igns),
+            ),
         )
+        if split.unidentified:
+            # Freezing now would drop these voters from the pool a winner
+            # is drawn from, and nothing later would reveal that it happened.
+            header = f"{len(split.unidentified)} voter(s) could not be identified:\n\n"
+            footer = (
+                "\n\nThey must run `!iam <IGN>`, or an officer runs "
+                "`!bind @user <IGN>` or `!notaplayer @user`. Then run `!list` again."
+            )
+            lines = [
+                f"<@{voter.user_id}>  nickname {voter.display_name!r}"
+                for voter in split.unidentified
+            ]
+            # Bounded like every other name list here: an embed Discord
+            # refuses names nobody at all, which is the one thing this
+            # refusal exists to do.
+            budget = EMBED_DESCRIPTION_LIMIT - len(header) - len(footer) - 200
+            await ctx.send(
+                embed=error_embed(
+                    "Pool not frozen",
+                    header + _capped(lines, budget, "\n") + footer,
+                )
+            )
+            return
         updated = items_state.replace_raffle(
             _STATE, raffle, eligible=tuple(split.eligible), listed=True
         )

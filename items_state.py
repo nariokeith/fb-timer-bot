@@ -152,6 +152,13 @@ class State:
     # what lets a typo surface as "you used Kobe before" instead of
     # silently crediting a different row.
     igns: dict[str, str] = field(default_factory=dict)
+    # Discord id -> the IGN this account IS. Set deliberately by !iam or
+    # !bind, unlike `igns` above, which only records what the account last
+    # requested under and may name an alt.
+    bindings: dict[str, str] = field(default_factory=dict)
+    # Discord ids known to have no roster row at all -- guests and former
+    # members. Without this they would block every raffle freeze forever.
+    not_players: list[str] = field(default_factory=list)
     # Roles permitted to run !poll / !list / !winner, and the one channel
     # they work in. Unlike !distribute -- which is authorised by the
     # officer channel itself -- the raffle happens in a member-visible
@@ -204,6 +211,8 @@ def _encode_with_total(state: State, total: int) -> list[str]:
         first_payload["raffle_channel_id"] = state.raffle_channel_id
     if state.raffle_role_ids:
         first_payload["raffle_role_ids"] = list(state.raffle_role_ids)
+    if state.not_players:
+        first_payload["not_players"] = list(state.not_players)
     first_payload["raffles"] = []
     payloads = [first_payload]
 
@@ -219,6 +228,19 @@ def _encode_with_total(state: State, total: int) -> list[str]:
         current["igns"][user_id] = ign
         if len(_render(current)) > MAX_CONTENT:
             raise ValueError("a remembered IGN is too large for a state shard")
+
+    for user_id, ign in state.bindings.items():
+        current = payloads[-1]
+        current.setdefault("bindings", {})[user_id] = ign
+        if len(_render(current)) <= MAX_CONTENT:
+            continue
+
+        current["bindings"].pop(user_id)
+        current = {"part": len(payloads), "total": total, "bindings": {}, "queue": []}
+        payloads.append(current)
+        current["bindings"][user_id] = ign
+        if len(_render(current)) > MAX_CONTENT:
+            raise ValueError("a binding is too large for a state shard")
 
     for request in state.queue:
         request_payload = request.to_dict()
@@ -320,6 +342,10 @@ def decode_state(content: str) -> Shard | None:
         board_message_id = payload.get("board_message_id")
         board_message_id = int(board_message_id) if board_message_id is not None else None
         igns = {str(k): str(v) for k, v in dict(payload.get("igns", {})).items()}
+        bindings = {
+            str(k): str(v) for k, v in dict(payload.get("bindings", {})).items()
+        }
+        not_players = [str(u) for u in payload.get("not_players", [])]
         raffles = [Raffle.from_dict(r) for r in payload.get("raffles", [])]
         raffle_channel_id = payload.get("raffle_channel_id")
         raffle_channel_id = (
@@ -341,6 +367,8 @@ def decode_state(content: str) -> Shard | None:
             board_message_id=board_message_id,
             queue=queue,
             igns=igns,
+            bindings=bindings,
+            not_players=not_players,
             raffle_role_ids=raffle_role_ids,
             raffle_channel_id=raffle_channel_id,
             raffles=raffles,
@@ -401,10 +429,17 @@ def decode_shards(contents: list[str]) -> State | None:
         [],
     )
     igns: dict[str, str] = {}
+    bindings: dict[str, str] = {}
+    not_players: list[str] = []
     queue: list[PendingRequest] = []
     raffles: list[Raffle] = []
     for shard in shards:
         igns.update(shard.state.igns)
+        bindings.update(shard.state.bindings)
+        for user_id in shard.state.not_players:
+            # Shard 0 carries the list, but a re-sharded pin can repeat it.
+            if user_id not in not_players:
+                not_players.append(user_id)
         queue.extend(shard.state.queue)
         raffles.extend(shard.state.raffles)
     return State(
@@ -413,6 +448,8 @@ def decode_shards(contents: list[str]) -> State | None:
         board_message_id=board_message_id,
         queue=queue,
         igns=igns,
+        bindings=bindings,
+        not_players=not_players,
         raffle_role_ids=raffle_role_ids,
         raffle_channel_id=raffle_channel_id,
         raffles=raffles,
