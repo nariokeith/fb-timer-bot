@@ -275,6 +275,63 @@ def _raffle(item="Asta's Heart", created="2026-08-09 10:00:00", ends="2026-08-10
     )
 
 
+def test_bindings_and_not_players_survive_a_round_trip():
+    state = items_state.State(
+        officer_channel_id=1,
+        bindings={"111": "Jjew", "222": "Kobe"},
+        not_players=["333", "444"],
+    )
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert restored.bindings == {"111": "Jjew", "222": "Kobe"}
+    assert restored.not_players == ["333", "444"]
+
+
+def test_a_pin_written_before_bindings_existed_loads_with_them_empty():
+    """Production pins predate this field; they must not fail to load."""
+    old = items_state.State(officer_channel_id=1, igns={"111": "Jjew"})
+
+    restored = items_state.decode_shards(items_state.encode_state(old))
+
+    assert restored.bindings == {}
+    assert restored.not_players == []
+    assert restored.igns == {"111": "Jjew"}
+
+
+def test_bindings_spill_across_shards_and_all_survive():
+    """One shard cannot hold hundreds of bindings; none may be dropped."""
+    state = items_state.State(
+        officer_channel_id=1,
+        bindings={str(10**17 + i): f"PlayerName{i:03d}" for i in range(300)},
+    )
+
+    contents = items_state.encode_state(state)
+    restored = items_state.decode_shards(contents)
+
+    assert len(contents) > 1, "300 bindings must not fit one shard"
+    assert restored.bindings == state.bindings
+
+
+def test_three_hundred_bindings_still_fit_the_pinned_message():
+    """Measured at design time: ~38 bytes each, 18 of 20 shards at 300."""
+    state = items_state.State(
+        officer_channel_id=1,
+        bindings={str(10**17 + i): f"PlayerName{i:03d}" for i in range(300)},
+        raffles=[
+            _raffle(
+                item=f"Special Log Number {n}",
+                created=f"2026-08-09 {n:02d}:00:00",
+                listed=True,
+                eligible=tuple(f"PlayerName{i:02d}" for i in range(40)),
+            )
+            for n in range(20)
+        ],
+    )
+
+    assert items_state.fits(state)
+
+
 def test_to_dict_still_writes_the_legacy_winner_key_for_an_older_bot():
     """A rollback must not read a drawn raffle as undrawn and supersede it."""
     raw = _raffle(winners=("Jjew", "Kobe"), drawn=True).to_dict()
