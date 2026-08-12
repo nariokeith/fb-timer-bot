@@ -173,11 +173,13 @@ def reset_module_state():
     """
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
+    items_bot._SHEET_LOCK = asyncio.Lock()
     if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
         items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
     yield
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
+    items_bot._SHEET_LOCK = asyncio.Lock()
     if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
         items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
 
@@ -2002,6 +2004,20 @@ def test_iam_refuses_an_ign_another_account_already_claimed(monkeypatch):
     assert items_bot._STATE.bindings == {"5": "Kobe"}
 
 
+def test_iam_cannot_take_a_row_another_account_holds_under_an_alias(monkeypatch):
+    """A roster rename leaves an alias spelling behind; it still resolves."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Kobe", "Jjew"))
+    items_bot._STATE.bindings["5"] = "KobePH"
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Kobe"))
+
+    assert items_bot._STATE.bindings == {"5": "KobePH"}
+    assert "already" in ctx.sent[-1]["embed"].description.casefold()
+
+
 def test_iam_lets_a_member_rebind_themselves(monkeypatch):
     """Changing main must not need an officer."""
     _configured_raffle(monkeypatch)
@@ -2041,6 +2057,30 @@ def test_iam_refuses_a_member_an_officer_marked_not_a_player(monkeypatch):
     assert items_bot._STATE.bindings == {}
 
 
+def test_iam_honours_a_not_a_player_mark_that_lands_while_it_waits(monkeypatch):
+    """An officer can mark the caller while !iam is queued on the lock."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    async def scenario():
+        await items_bot._SHEET_LOCK.acquire()
+        task = asyncio.ensure_future(
+            items_bot.iam_cmd.callback(ctx, argument="Jjew")
+        )
+        for _ in range(5):          # let !iam reach the lock and block there
+            await asyncio.sleep(0)
+        items_bot._STATE.not_players.append("7")   # what !notaplayer does
+        items_bot._SHEET_LOCK.release()
+        await task
+
+    asyncio.run(scenario())
+
+    assert items_bot._STATE.bindings == {}
+    assert "officer" in ctx.sent[-1]["embed"].description.casefold()
+
+
 def test_bind_overrides_another_accounts_claim(monkeypatch):
     """One IGN maps to at most one account."""
     _configured_raffle(monkeypatch)
@@ -2054,6 +2094,19 @@ def test_bind_overrides_another_accounts_claim(monkeypatch):
 
     assert items_bot._STATE.bindings == {"7": "Kobe"}
     assert "5" in ctx.sent[-1]["embed"].description
+
+
+def test_bind_displaces_a_claim_held_under_an_alias(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Kobe", "Jjew"))
+    items_bot._STATE.bindings["5"] = "KobePH"
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.bind_cmd.callback(ctx, FakeMember(user_id=7), argument="Kobe")
+    )
+
+    assert items_bot._STATE.bindings == {"7": "Kobe"}
 
 
 def test_bind_clears_a_not_a_player_mark(monkeypatch):
@@ -2815,7 +2868,8 @@ def test_no_command_is_defined_after_the_main_guard():
 
 def test_every_raffle_command_is_registered_on_the_bot():
     registered = {c.name for c in items_bot.bot.commands}
-    for name in ("poll", "list", "winner", "cancelpoll", "setraffleroles", "setrafflechannel"):
+    for name in ("poll", "list", "winner", "cancelpoll", "iam", "bind",
+                 "notaplayer", "setraffleroles", "setrafflechannel"):
         assert name in registered, f"!{name} is not registered"
 
 
@@ -3068,7 +3122,8 @@ def test_officer_and_raffle_commands_use_their_own_channels(monkeypatch):
     monkeypatch.setattr(items_bot, "_STATE", _configured_state())
     for name in ("distribute", "setraffleroles"):
         assert items_bot.command_channels(FakeGuardCtx(10, name)) == (10,)
-    for name in ("poll", "list", "winner", "cancelpoll"):
+    for name in ("poll", "list", "winner", "cancelpoll", "iam", "bind",
+                 "notaplayer"):
         assert items_bot.command_channels(FakeGuardCtx(30, name)) == (30,)
 
 

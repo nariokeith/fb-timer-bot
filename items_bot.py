@@ -618,6 +618,21 @@ async def _save_binding_change(ctx, undo: Callable[[], None]) -> bool:
     return True
 
 
+def _same_player(stored_ign: str, player: str, roster: list[str]) -> bool:
+    """Whether a stored binding names the same roster row as `player`.
+
+    Compared through resolve_ign rather than as raw strings: an alias
+    left behind by a roster rename still resolves at !list time, so a
+    string compare would let two accounts hold one row and silently drop
+    one of them from the pool.
+    """
+    try:
+        resolved = items_rules.resolve_ign(stored_ign, roster)
+    except items_rules.RequestParseError:
+        return False
+    return resolved is not None and items_rules.normalize(resolved) == items_rules.normalize(player)
+
+
 @bot.command(name="iam")
 async def iam_cmd(ctx, *, argument: str = ""):
     """Bind your own Discord account to your roster row."""
@@ -625,17 +640,21 @@ async def iam_cmd(ctx, *, argument: str = ""):
         return
 
     caller = str(ctx.author.id)
-    if caller in _STATE.not_players:
-        await ctx.send(
-            embed=error_embed(
-                "Not allowed",
-                "An officer has marked this account as not a roster player. "
-                "Ask an officer to run `!bind` for you.",
-            )
-        )
-        return
 
     async with _SHEET_LOCK:
+        # Re-read under the lock: an officer's !notaplayer can land while
+        # this command is queued behind another sheet operation, and a
+        # verdict taken before the wait would be stale by now.
+        if caller in _STATE.not_players:
+            await ctx.send(
+                embed=error_embed(
+                    "Not allowed",
+                    "An officer has marked this account as not a roster player. "
+                    "Ask an officer to run `!bind` for you.",
+                )
+            )
+            return
+
         try:
             snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
         except Exception as exc:
@@ -663,8 +682,7 @@ async def iam_cmd(ctx, *, argument: str = ""):
             (
                 user_id
                 for user_id, ign in _STATE.bindings.items()
-                if user_id != caller
-                and items_rules.normalize(ign) == items_rules.normalize(player)
+                if user_id != caller and _same_player(ign, player, snapshot.roster)
             ),
             None,
         )
@@ -735,8 +753,7 @@ async def bind_cmd(ctx, member: discord.Member, *, argument: str = ""):
         displaced = [
             user_id
             for user_id, ign in _STATE.bindings.items()
-            if user_id != target
-            and items_rules.normalize(ign) == items_rules.normalize(player)
+            if user_id != target and _same_player(ign, player, snapshot.roster)
         ]
         previous = dict(_STATE.bindings)
         was_marked = target in _STATE.not_players
