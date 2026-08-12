@@ -16,6 +16,7 @@ import asyncio
 import datetime
 import os
 import sys
+from collections.abc import Callable
 from difflib import get_close_matches
 
 import discord
@@ -441,6 +442,27 @@ def raffle_access(ctx) -> str | None:
     return None
 
 
+def raffle_member_access(ctx) -> str | None:
+    """None if a MEMBER command may run here, else a refusal or IGNORE.
+
+    Same channel confinement as raffle_access and the same silence when
+    typed elsewhere, without the role check: !iam exists so that members
+    who hold no raffle role can identify themselves.
+    """
+    if _STATE.raffle_channel_id is None:
+        permissions = getattr(ctx.author, "guild_permissions", None)
+        if getattr(permissions, "administrator", False):
+            return (
+                "No raffle channel is set. Run `!setrafflechannel` in the "
+                "channel where special log polls should be posted."
+            )
+        return IGNORE
+
+    if ctx.channel.id != _STATE.raffle_channel_id:
+        return IGNORE
+    return None
+
+
 async def _refuse_raffle(ctx, verdict: str) -> bool:
     """Send the refusal if there is one. True when the caller must stop."""
     if verdict is None:
@@ -460,7 +482,9 @@ _EXEMPT_COMMANDS = frozenset({
     "setofficerchannel", "setqueuechannel", "setrafflechannel",
 })
 _OFFICER_COMMANDS = frozenset({"distribute", "setraffleroles"})
-_RAFFLE_COMMANDS = frozenset({"poll", "list", "winner", "cancelpoll"})
+_RAFFLE_COMMANDS = frozenset({
+    "poll", "list", "winner", "cancelpoll", "iam", "bind", "notaplayer",
+})
 _QUEUE_COMMANDS = frozenset({"request", "cancelrequest", "myrequests", "itemhelp"})
 
 _CLASSIFIED_COMMANDS = (
@@ -568,6 +592,215 @@ async def setrafflechannel_cmd(ctx):
         embed=ok_embed(
             "Raffle channel set",
             f"`!poll`, `!list` and `!winner` now work in {ctx.channel.mention}.",
+        )
+    )
+
+
+async def _save_binding_change(ctx, undo: Callable[[], None]) -> bool:
+    """Persist a binding change, or undo it and say so. True when saved."""
+    if not items_state.fits(_STATE):
+        undo()
+        await ctx.send(
+            embed=error_embed(
+                "State is full",
+                "The bot state is full and cannot store another binding until "
+                "the request queue is worked down. Nothing was changed.",
+            )
+        )
+        return False
+    channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if channel is not None:
+        await save_state(channel)
+    return True
+
+
+@bot.command(name="iam")
+async def iam_cmd(ctx, *, argument: str = ""):
+    """Bind your own Discord account to your roster row."""
+    if await _refuse_raffle(ctx, raffle_member_access(ctx)):
+        return
+
+    caller = str(ctx.author.id)
+    if caller in _STATE.not_players:
+        await ctx.send(
+            embed=error_embed(
+                "Not allowed",
+                "An officer has marked this account as not a roster player. "
+                "Ask an officer to run `!bind` for you.",
+            )
+        )
+        return
+
+    async with _SHEET_LOCK:
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        try:
+            player = items_rules.resolve_ign(argument.strip(), snapshot.roster)
+        except items_rules.RequestParseError as exc:
+            await ctx.send(embed=error_embed("Not recorded", str(exc)))
+            return
+        if player is None:
+            suggestions = get_close_matches(argument.strip(), snapshot.roster, n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            await ctx.send(
+                embed=error_embed(
+                    "Not recorded",
+                    f"No player named {argument.strip()!r} in the sheet.{hint} "
+                    "Usage: `!iam <your IGN>`",
+                )
+            )
+            return
+
+        holder = next(
+            (
+                user_id
+                for user_id, ign in _STATE.bindings.items()
+                if user_id != caller
+                and items_rules.normalize(ign) == items_rules.normalize(player)
+            ),
+            None,
+        )
+        if holder is not None:
+            await ctx.send(
+                embed=error_embed(
+                    "Not recorded",
+                    f"**{player}** is already claimed by <@{holder}>. If that "
+                    "is wrong, ask an officer to run `!bind`.",
+                )
+            )
+            return
+
+        previous = _STATE.bindings.get(caller)
+        _STATE.bindings[caller] = player
+
+        def undo():
+            if previous is None:
+                _STATE.bindings.pop(caller, None)
+            else:
+                _STATE.bindings[caller] = previous
+
+        if not await _save_binding_change(ctx, undo):
+            return
+
+    await ctx.send(
+        embed=ok_embed(
+            "You are recorded",
+            f"This account is **{player}**. You will be recognised in raffle "
+            "polls from now on.",
+        )
+    )
+
+
+@bot.command(name="bind")
+async def bind_cmd(ctx, member: discord.Member, *, argument: str = ""):
+    """Bind someone else's Discord account to a roster row."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    async with _SHEET_LOCK:
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        try:
+            player = items_rules.resolve_ign(argument.strip(), snapshot.roster)
+        except items_rules.RequestParseError as exc:
+            await ctx.send(embed=error_embed("Not recorded", str(exc)))
+            return
+        if player is None:
+            suggestions = get_close_matches(argument.strip(), snapshot.roster, n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            await ctx.send(
+                embed=error_embed(
+                    "Not recorded",
+                    f"No player named {argument.strip()!r} in the sheet.{hint} "
+                    "Usage: `!bind @user <IGN>`",
+                )
+            )
+            return
+
+        target = str(member.id)
+        # One IGN maps to at most one account, or two voters would resolve
+        # to the same row and one of them would be silently collapsed away.
+        displaced = [
+            user_id
+            for user_id, ign in _STATE.bindings.items()
+            if user_id != target
+            and items_rules.normalize(ign) == items_rules.normalize(player)
+        ]
+        previous = dict(_STATE.bindings)
+        was_marked = target in _STATE.not_players
+        for user_id in displaced:
+            _STATE.bindings.pop(user_id, None)
+        _STATE.bindings[target] = player
+        if was_marked:
+            _STATE.not_players.remove(target)
+
+        def undo():
+            _STATE.bindings.clear()
+            _STATE.bindings.update(previous)
+            if was_marked and target not in _STATE.not_players:
+                _STATE.not_players.append(target)
+
+        if not await _save_binding_change(ctx, undo):
+            return
+
+    taken = (
+        " Removed the earlier claim by "
+        + ", ".join(f"<@{user_id}>" for user_id in displaced)
+        + "."
+        if displaced
+        else ""
+    )
+    await ctx.send(
+        embed=ok_embed(
+            "Binding recorded",
+            f"<@{member.id}> is **{player}**.{taken}",
+        )
+    )
+
+
+@bot.command(name="notaplayer")
+async def notaplayer_cmd(ctx, member: discord.Member):
+    """Record that this account has no roster row at all."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    # No IGN to resolve, so no sheet read -- but the lock is still held
+    # while _STATE is mutated and saved, so a concurrent !list cannot
+    # classify voters against a half-applied change.
+    async with _SHEET_LOCK:
+        target = str(member.id)
+        previous = _STATE.bindings.get(target)
+        already_marked = target in _STATE.not_players
+        _STATE.bindings.pop(target, None)
+        if not already_marked:
+            _STATE.not_players.append(target)
+
+        def undo():
+            if previous is not None:
+                _STATE.bindings[target] = previous
+            if not already_marked and target in _STATE.not_players:
+                _STATE.not_players.remove(target)
+
+        if not await _save_binding_change(ctx, undo):
+            return
+
+    await ctx.send(
+        embed=ok_embed(
+            "Marked as not a player",
+            f"<@{member.id}> has no roster row and will be skipped in raffle "
+            "polls. Run `!bind` to undo this.",
         )
     )
 

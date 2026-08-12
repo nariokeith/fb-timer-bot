@@ -1954,6 +1954,158 @@ def _posted_poll(channel):
     return polls[0]
 
 
+def test_iam_binds_a_member_to_their_roster_row(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[], display_name="xXshadowXx")
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Kobe"))
+
+    assert items_bot._STATE.bindings["7"] == "Kobe"
+    assert ctx.sent[-1]["embed"].title.startswith("✅")
+
+
+def test_iam_needs_no_raffle_role(monkeypatch):
+    """Ordinary members must be able to identify themselves."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    assert items_bot._STATE.bindings["7"] == "Jjew"
+
+
+def test_iam_is_silent_outside_the_raffle_channel(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(channel_id=999, roles=())
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    assert ctx.sent == []
+    assert items_bot._STATE.bindings == {}
+
+
+def test_iam_refuses_an_ign_another_account_already_claimed(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    items_bot._STATE.bindings["5"] = "Kobe"
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Kobe"))
+
+    assert "already" in ctx.sent[-1]["embed"].description.casefold()
+    assert items_bot._STATE.bindings == {"5": "Kobe"}
+
+
+def test_iam_lets_a_member_rebind_themselves(monkeypatch):
+    """Changing main must not need an officer."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    items_bot._STATE.bindings["7"] = "Jjew"
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Kobe"))
+
+    assert items_bot._STATE.bindings["7"] == "Kobe"
+
+
+def test_iam_refuses_a_name_not_in_the_roster(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Nobody"))
+
+    assert "No player named" in ctx.sent[-1]["embed"].description
+    assert items_bot._STATE.bindings == {}
+
+
+def test_iam_refuses_a_member_an_officer_marked_not_a_player(monkeypatch):
+    """Letting them clear it themselves would make the mark meaningless."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    items_bot._STATE.not_players.append("7")
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    assert "officer" in ctx.sent[-1]["embed"].description.casefold()
+    assert items_bot._STATE.bindings == {}
+
+
+def test_bind_overrides_another_accounts_claim(monkeypatch):
+    """One IGN maps to at most one account."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    items_bot._STATE.bindings["5"] = "Kobe"
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.bind_cmd.callback(ctx, FakeMember(user_id=7), argument="Kobe")
+    )
+
+    assert items_bot._STATE.bindings == {"7": "Kobe"}
+    assert "5" in ctx.sent[-1]["embed"].description
+
+
+def test_bind_clears_a_not_a_player_mark(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    items_bot._STATE.not_players.append("7")
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.bind_cmd.callback(ctx, FakeMember(user_id=7), argument="Jjew")
+    )
+
+    assert items_bot._STATE.bindings["7"] == "Jjew"
+    assert items_bot._STATE.not_players == []
+
+
+def test_bind_needs_a_raffle_role(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+
+    asyncio.run(
+        items_bot.bind_cmd.callback(ctx, FakeMember(user_id=7), argument="Jjew")
+    )
+
+    assert items_bot._STATE.bindings == {}
+
+
+def test_notaplayer_marks_and_clears_any_binding(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, _ = _raffle_ctx()
+    items_bot._STATE.bindings["7"] = "Jjew"
+
+    asyncio.run(items_bot.notaplayer_cmd.callback(ctx, FakeMember(user_id=7)))
+
+    assert items_bot._STATE.not_players == ["7"]
+    assert items_bot._STATE.bindings == {}
+
+
+def test_a_binding_that_will_not_fit_is_rolled_back(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    monkeypatch.setattr(items_state, "fits", lambda state: False)
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    assert items_bot._STATE.bindings == {}
+    assert "full" in ctx.sent[-1]["embed"].description.casefold()
+
+
 def test_poll_posts_a_poll_and_records_the_raffle(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch)
