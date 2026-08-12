@@ -196,3 +196,84 @@ def test_winner_refuses_an_argument_that_reads_two_ways():
     """'Kobe' is both a raffle name and a player here. Refuse, don't pick."""
     with pytest.raises(items_raffle.RaffleArgumentError, match="more than one way"):
         items_raffle.split_item_and_ign("Kobe Kobe Jjew", ["Kobe", "Kobe Kobe"], ROSTER + ["Kobe Jjew"])
+
+
+ITEMS = ["Asta's Heart", "Amentis Foot"]
+
+
+def test_one_winner_still_parses_with_no_dash():
+    assert items_raffle.split_item_and_igns("Asta's Heart Jjew", ITEMS, ROSTER) == (
+        "Asta's Heart",
+        ["Jjew"],
+    )
+
+
+def test_the_item_may_run_into_the_first_winner():
+    assert items_raffle.split_item_and_igns(
+        "Amentis Foot Jjew - Kobe - Ryuu", ITEMS, ROSTER
+    ) == ("Amentis Foot", ["Jjew", "Kobe", "Ryuu"])
+
+
+def test_the_item_may_be_followed_by_its_own_dash():
+    assert items_raffle.split_item_and_igns(
+        "Amentis Foot - Jjew - Kobe", ITEMS, ROSTER
+    ) == ("Amentis Foot", ["Jjew", "Kobe"])
+
+
+def test_a_hyphenated_ign_is_not_split_into_two_winners():
+    """'wile-KAMOTE' has no space around its hyphen, so it is one name."""
+    assert items_raffle.split_item_and_igns(
+        "Amentis Foot wile-KAMOTE - Kobe", ITEMS, ROSTER
+    ) == ("Amentis Foot", ["wile-KAMOTE", "Kobe"])
+
+
+def test_a_multi_word_ign_survives_the_split():
+    assert items_raffle.split_item_and_igns(
+        "Amentis Foot chinchong ni Mumu - Kobe", ITEMS, ROSTER
+    ) == ("Amentis Foot", ["chinchong ni Mumu", "Kobe"])
+
+
+def test_extra_spaces_around_the_dash_are_tolerated():
+    assert items_raffle.split_item_and_igns(
+        "Amentis Foot Jjew   -   Kobe", ITEMS, ROSTER
+    ) == ("Amentis Foot", ["Jjew", "Kobe"])
+
+
+def test_an_alias_resolves_in_a_later_position():
+    assert items_raffle.split_item_and_igns(
+        "Amentis Foot Jjew - KobePH", ITEMS, ROSTER
+    ) == ("Amentis Foot", ["Jjew", "Kobe"])
+
+
+def test_the_same_player_twice_is_refused():
+    with pytest.raises(items_raffle.RaffleArgumentError, match="more than once"):
+        items_raffle.split_item_and_igns("Amentis Foot Jjew - Jjew", ITEMS, ROSTER)
+
+
+def test_an_alias_colliding_with_a_real_name_counts_as_a_duplicate():
+    with pytest.raises(items_raffle.RaffleArgumentError, match="more than once"):
+        items_raffle.split_item_and_igns("Amentis Foot Kobe - KobePH", ITEMS, ROSTER)
+
+
+def test_a_trailing_dash_is_refused():
+    with pytest.raises(items_raffle.RaffleArgumentError, match="empty"):
+        items_raffle.split_item_and_igns("Amentis Foot Jjew - ", ITEMS, ROSTER)
+
+
+def test_a_winner_whose_name_ends_in_a_hyphen_is_not_read_as_a_dangling_dash():
+    """Only a hyphen with whitespace before it is a dangling separator."""
+    roster = ["Jjew", "Kobe", "KAMOTE-"]
+
+    assert items_raffle.split_item_and_igns(
+        "Amentis Foot Kobe - KAMOTE-", ["Amentis Foot"], roster
+    ) == ("Amentis Foot", ["Kobe", "KAMOTE-"])
+
+
+def test_an_unknown_name_in_a_later_position_is_refused_by_name():
+    with pytest.raises(items_raffle.RaffleArgumentError, match="Nobody"):
+        items_raffle.split_item_and_igns("Amentis Foot Jjew - Nobody", ITEMS, ROSTER)
+
+
+def test_an_item_with_no_winner_at_all_is_refused():
+    with pytest.raises(items_raffle.RaffleArgumentError, match="Which player"):
+        items_raffle.split_item_and_igns("Amentis Foot", ITEMS, ROSTER)

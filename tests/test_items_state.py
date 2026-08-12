@@ -275,12 +275,95 @@ def _raffle(item="Asta's Heart", created="2026-08-09 10:00:00", ends="2026-08-10
     )
 
 
+def test_to_dict_still_writes_the_legacy_winner_key_for_an_older_bot():
+    """A rollback must not read a drawn raffle as undrawn and supersede it."""
+    raw = _raffle(winners=("Jjew", "Kobe"), drawn=True).to_dict()
+
+    assert raw["winner"] == "Jjew"
+    assert raw["winners"] == ["Jjew", "Kobe"]
+    assert items_state.Raffle.from_dict(raw).winners == ("Jjew", "Kobe")
+
+
+def test_an_undrawn_raffle_writes_an_empty_legacy_winner():
+    assert _raffle().to_dict()["winner"] == ""
+
+
+def test_a_raffle_saved_under_the_old_single_winner_key_still_loads():
+    """State written before multi-winner is sitting in the pinned message."""
+    legacy = {
+        "item": "Asta's Heart",
+        "channel_id": 42,
+        "message_id": 999,
+        "created_at": "2026-08-09 01:00:00",
+        "ends_at": "2026-08-09 10:00:00",
+        "eligible": ["Jjew", "Kobe"],
+        "listed": True,
+        "winner": "Jjew",
+    }
+
+    raffle = items_state.Raffle.from_dict(legacy)
+
+    assert raffle.winners == ("Jjew",)
+    assert raffle.drawn is True
+
+
+def test_a_legacy_raffle_with_no_winner_loads_as_undrawn():
+    legacy = {
+        "item": "Asta's Heart",
+        "channel_id": 42,
+        "message_id": 999,
+        "created_at": "2026-08-09 01:00:00",
+        "ends_at": "2026-08-09 10:00:00",
+        "winner": "",
+    }
+
+    raffle = items_state.Raffle.from_dict(legacy)
+
+    assert raffle.winners == ()
+    assert raffle.drawn is False
+
+
+def test_several_winners_survive_a_round_trip():
+    raffle = _raffle(winners=("Jjew", "Kobe"), drawn=True)
+
+    restored = items_state.Raffle.from_dict(raffle.to_dict())
+
+    assert restored.winners == ("Jjew", "Kobe")
+    assert restored.drawn is True
+
+
+def test_eviction_will_not_drop_a_partly_drawn_raffle():
+    """Its ticked checkboxes and unfinished draw are only recorded here.
+
+    The oldest raffle carrying winners is the partly drawn one, so a
+    filter on `winners` rather than `drawn` would pick it.
+    """
+    # raffle_to_evict returns early unless every slot is taken, so the
+    # list is padded to capacity with undrawn fillers.
+    raffles = [
+        _raffle(item="Partly drawn", created="2026-08-01 10:00:00",
+                winners=("Kobe",), drawn=False),
+        _raffle(item="Fully drawn", created="2026-08-02 10:00:00",
+                winners=("Jjew",), drawn=True),
+    ]
+    raffles += [
+        _raffle(item=f"Log {n}", created=f"2026-08-03 {n:02d}:00:00")
+        for n in range(items_state.MAX_RAFFLES - 2)
+    ]
+    state = items_state.State(raffles=raffles)
+
+    allowed, victim = items_state.raffle_to_evict(state)
+
+    assert allowed is True
+    assert victim.item == "Fully drawn"
+
+
 def test_a_raffle_survives_an_encode_decode_round_trip():
     state = items_state.State(
         officer_channel_id=1,
         raffle_channel_id=2,
         raffle_role_ids=[10, 11],
-        raffles=[_raffle(eligible=("Jjew", "Kobe"), listed=True, winner="Jjew")],
+        raffles=[_raffle(eligible=("Jjew", "Kobe"), listed=True, winners=("Jjew",), drawn=True)],
     )
 
     restored = items_state.decode_shards(items_state.encode_state(state))
@@ -291,7 +374,7 @@ def test_a_raffle_survives_an_encode_decode_round_trip():
     assert restored.raffles[0].item == "Asta's Heart"
     assert restored.raffles[0].eligible == ("Jjew", "Kobe")
     assert restored.raffles[0].listed is True
-    assert restored.raffles[0].winner == "Jjew"
+    assert restored.raffles[0].winners == ("Jjew",)
 
 
 def test_a_pin_written_before_raffles_existed_still_loads():
@@ -332,7 +415,7 @@ def test_find_raffle_matches_case_and_spacing_insensitively():
 def test_find_raffle_returns_the_most_recent_when_a_name_repeats():
     state = items_state.State(
         raffles=[
-            _raffle(created="2026-08-01 10:00:00", winner="Kobe"),
+            _raffle(created="2026-08-01 10:00:00", winners=("Kobe",), drawn=True),
             _raffle(created="2026-08-09 10:00:00"),
         ]
     )
@@ -344,11 +427,11 @@ def test_replace_raffle_swaps_the_record_in_place():
     original = _raffle()
     state = items_state.State(raffles=[original])
 
-    updated = items_state.replace_raffle(state, original, winner="Jjew")
+    updated = items_state.replace_raffle(state, original, winners=("Jjew",), drawn=True)
 
     assert state.raffles == [updated]
-    assert updated.winner == "Jjew"
-    assert original.winner == ""
+    assert updated.winners == ("Jjew",)
+    assert original.winners == ()
 
 
 def _full_of(**kwargs):
@@ -369,7 +452,7 @@ def test_evicting_drops_the_oldest_DRAWN_raffle_when_full():
     state = _full_of(ends="2026-08-09 12:00:00")
     # Log 0 and Log 1 have been drawn; the rest are ended but undrawn.
     for index in (0, 1):
-        items_state.replace_raffle(state, state.raffles[index], winner="Kobe")
+        items_state.replace_raffle(state, state.raffles[index], winners=("Kobe",), drawn=True)
 
     assert items_state.evict_for_new_raffle(state, "2026-08-09 13:00:00")
     assert "Log 0" not in [r.item for r in state.raffles]
@@ -399,7 +482,7 @@ def test_evicting_refuses_when_every_raffle_is_still_open():
 def test_a_drawn_raffle_is_evictable_even_before_its_poll_closes():
     """A winner is recorded; the poll's clock no longer matters."""
     state = _full_of(ends="2026-12-31 23:59:59")
-    items_state.replace_raffle(state, state.raffles[0], winner="Kobe")
+    items_state.replace_raffle(state, state.raffles[0], winners=("Kobe",), drawn=True)
 
     assert items_state.evict_for_new_raffle(state, "2026-08-09 13:00:00")
     assert "Log 0" not in [r.item for r in state.raffles]
@@ -436,6 +519,32 @@ def test_twenty_listed_raffles_and_a_full_queue_still_fit():
     assert restored.raffles[0].eligible == state.raffles[0].eligible
 
 
+def test_capacity_holds_when_every_raffle_has_several_winners():
+    """Winner lists add bytes to the pinned state; capacity must survive."""
+    state = items_state.State(
+        raffles=[
+            _raffle(
+                item=f"Special Log Number {n}",
+                created=f"2026-08-09 {n:02d}:00:00",
+                listed=True,
+                eligible=tuple(f"PlayerName{i:02d}" for i in range(35)),
+                winners=("PlayerName01", "PlayerName02", "PlayerName03"),
+                drawn=True,
+            )
+            for n in range(20)
+        ],
+        queue=[
+            items_state.PendingRequest(
+                f"id{i:03d}", i, f"Player {i}", "Asta's Belt", "Gear",
+                "2026-08-09 09:00:00",
+            )
+            for i in range(30)
+        ],
+    )
+
+    assert items_state.fits(state)
+
+
 def test_evicting_does_nothing_below_the_ceiling():
     state = items_state.State(raffles=[_raffle()])
 
@@ -452,7 +561,7 @@ def test_raffle_item_names_lists_every_tracked_raffle():
 def test_raffle_to_evict_names_the_victim_without_removing_it():
     """poll_cmd must know the cost BEFORE it posts a poll it cannot untake."""
     state = _full_of(ends="2026-08-09 12:00:00")
-    items_state.replace_raffle(state, state.raffles[2], winner="Kobe")
+    items_state.replace_raffle(state, state.raffles[2], winners=("Kobe",), drawn=True)
 
     allowed, victim = items_state.raffle_to_evict(state)
 
