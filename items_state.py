@@ -201,7 +201,6 @@ def _encode_with_total(state: State, total: int) -> list[str]:
         "total": total,
         "officer_channel_id": state.officer_channel_id,
         "igns": {},
-        "bindings": {},
         "queue": [],
     }
     if state.queue_channel_id is not None:

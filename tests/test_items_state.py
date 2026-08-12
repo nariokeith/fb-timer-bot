@@ -288,6 +288,21 @@ def test_bindings_and_not_players_survive_a_round_trip():
     assert restored.not_players == ["333", "444"]
 
 
+def test_a_state_with_no_bindings_spends_no_bytes_on_them():
+    """An always-present empty key would shrink every guild's shard budget."""
+    state = items_state.State(officer_channel_id=1, igns={"111": "Jjew"})
+
+    assert "bindings" not in items_state.encode_state(state)[0]
+
+
+def test_a_state_with_bindings_still_encodes_them():
+    state = items_state.State(officer_channel_id=1, bindings={"111": "Jjew"})
+
+    assert items_state.decode_shards(items_state.encode_state(state)).bindings == {
+        "111": "Jjew"
+    }
+
+
 def test_a_pin_written_before_bindings_existed_loads_with_them_empty():
     """Production pins predate this field; they must not fail to load."""
     old = items_state.State(officer_channel_id=1, igns={"111": "Jjew"})
