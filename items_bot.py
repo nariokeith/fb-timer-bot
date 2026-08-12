@@ -1987,17 +1987,23 @@ async def list_cmd(ctx, *, argument: str = ""):
         if split.unidentified:
             # Freezing now would drop these voters from the pool a winner
             # is drawn from, and nothing later would reveal that it happened.
+            header = f"{len(split.unidentified)} voter(s) could not be identified:\n\n"
+            footer = (
+                "\n\nThey must run `!iam <IGN>`, or an officer runs "
+                "`!bind @user <IGN>` or `!notaplayer @user`. Then run `!list` again."
+            )
             lines = [
                 f"<@{voter.user_id}>  nickname {voter.display_name!r}"
                 for voter in split.unidentified
             ]
+            # Bounded like every other name list here: an embed Discord
+            # refuses names nobody at all, which is the one thing this
+            # refusal exists to do.
+            budget = EMBED_DESCRIPTION_LIMIT - len(header) - len(footer) - 200
             await ctx.send(
                 embed=error_embed(
                     "Pool not frozen",
-                    f"{len(split.unidentified)} voter(s) could not be "
-                    f"identified:\n\n" + "\n".join(lines) + "\n\nThey must run "
-                    "`!iam <IGN>`, or an officer runs `!bind @user <IGN>` or "
-                    "`!notaplayer @user`. Then run `!list` again.",
+                    header + _capped(lines, budget, "\n") + footer,
                 )
             )
             return

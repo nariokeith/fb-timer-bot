@@ -3036,6 +3036,26 @@ def test_the_pool_embed_stays_within_discords_description_limit():
     assert "Someone" in rendered, "the winner must never be truncated away"
 
 
+def test_the_refusal_embed_stays_within_discords_description_limit(monkeypatch):
+    """An embed Discord refuses names nobody -- the one thing this does."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(10**17 + n, f"stranger{n:03d}") for n in range(400)]),
+    )
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    description = ctx.sent[-1]["embed"].description
+    assert len(description) <= 4096, f"{len(description)} chars would be rejected"
+    assert "more" in description, "truncation must say how many were left out"
+    assert "!iam" in description, "the instructions must survive truncation"
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").listed is False
+
+
 def test_redrawing_a_winner_whose_box_is_already_ticked_says_so(monkeypatch):
     """The state save can fail after the sheet write succeeded.
 
