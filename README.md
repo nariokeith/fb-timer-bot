@@ -276,6 +276,7 @@ channel:
 | Command | What it does |
 |---|---|
 | `!poll <special log> [--hours N]` | Open a 24-hour poll for one special log. `--hours` overrides the duration (1–168). |
+| `!cancelpoll <special log>` | Cancel an open poll, remove its message, and free the raffle slot. |
 | `!list <special log>` | After the poll closes, show who is eligible. Freezes that list. |
 | `!winner <special log> <IGN>` | Record the winner and tick their checkbox in the Special Logs tab. |
 

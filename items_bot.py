@@ -244,6 +244,10 @@ def error_embed(title: str, description: str) -> discord.Embed:
     return _embed(f"❌ {title}", description, 0xE74C3C)
 
 
+def warn_embed(title: str, description: str) -> discord.Embed:
+    return _embed(f"⚠️ {title}", description, 0xF1C40F)
+
+
 def is_officer_channel(channel_id: int) -> bool:
     return (
         _STATE.officer_channel_id is not None
@@ -456,7 +460,7 @@ _EXEMPT_COMMANDS = frozenset({
     "setofficerchannel", "setqueuechannel", "setrafflechannel",
 })
 _OFFICER_COMMANDS = frozenset({"distribute", "setraffleroles"})
-_RAFFLE_COMMANDS = frozenset({"poll", "list", "winner"})
+_RAFFLE_COMMANDS = frozenset({"poll", "list", "winner", "cancelpoll"})
 _QUEUE_COMMANDS = frozenset({"request", "cancelrequest", "myrequests", "itemhelp"})
 
 _CLASSIFIED_COMMANDS = (
@@ -1252,7 +1256,8 @@ async def itemhelp_cmd(ctx):
             "**`!poll <special log> [--hours N]`** — open a poll "
             f"({items_raffle.DEFAULT_POLL_HOURS}h by default)\n"
             "**`!list <special log>`** — after it closes, who is eligible\n"
-            "**`!winner <special log> <IGN>`** — record the draw"
+            "**`!winner <special log> <IGN>`** — record the draw\n"
+            "**`!cancelpoll <special log>`** — cancel an open poll"
         ),
         inline=False,
     )
@@ -1881,6 +1886,134 @@ async def winner_cmd(ctx, *, argument: str = ""):
             "eligible for this log again.",
         )
     )
+
+
+@bot.command(name="cancelpoll")
+async def cancelpoll_cmd(ctx, *, argument: str = ""):
+    """Cancel an open raffle poll."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    async with _SHEET_LOCK:
+        item_query = argument.strip()
+        if not item_query:
+            await ctx.send(
+                embed=error_embed(
+                    "Nothing cancelled", "Usage: `!cancelpoll <special log name>`"
+                )
+            )
+            return
+
+        raffle = items_state.find_raffle(_STATE, item_query)
+        if raffle is None:
+            names = ", ".join(
+                f"`{item}`" for item in items_state.raffle_item_names(_STATE)
+            ) or "_none_"
+            await ctx.send(
+                embed=error_embed(
+                    "Nothing cancelled",
+                    f"No tracked raffle for {item_query!r}. Tracked raffles: {names}.",
+                )
+            )
+            return
+
+        if raffle.winner:
+            await ctx.send(
+                embed=error_embed(
+                    "Cancel refused",
+                    f"**{raffle.item}** has already been drawn: "
+                    f"**{raffle.winner}** won it. A drawn raffle is "
+                    "distribution history.",
+                )
+            )
+            return
+
+        now = items_rules.format_timestamp(items_rules.now_pht())
+        if raffle.ends_at <= now:
+            await ctx.send(
+                embed=error_embed(
+                    "Cancel refused",
+                    f"**{raffle.item}** closed at {raffle.ends_at} PHT. "
+                    f"Run `!poll {raffle.item}` to supersede it.",
+                )
+            )
+            return
+
+        try:
+            # The raffle stays with the channel where its poll was posted,
+            # even when an admin moves the configured raffle channel mid-poll.
+            source = bot.get_channel(raffle.channel_id) or ctx.channel
+            message = await source.fetch_message(raffle.message_id)
+        except discord.NotFound:
+            message = None
+        except Exception as exc:
+            await ctx.send(
+                embed=error_embed(
+                    "Could not cancel the poll",
+                    f"The poll message for **{raffle.item}** could not be read "
+                    f"({exc}). Nothing was cancelled.",
+                )
+            )
+            return
+
+        delete_failed = False
+        if message is not None:
+            if poll_is_open(getattr(message, "poll", None)):
+                try:
+                    await message.end_poll()
+                except Exception as exc:
+                    await ctx.send(
+                        embed=error_embed(
+                            "Could not cancel the poll",
+                            f"The poll for **{raffle.item}** could not be ended "
+                            f"({exc}). Nothing was cancelled.",
+                        )
+                    )
+                    return
+
+            try:
+                await message.delete()
+            except Exception:
+                delete_failed = True
+
+        _STATE.raffles.remove(raffle)
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+
+        if message is None:
+            await ctx.send(
+                embed=warn_embed(
+                    "Poll cancelled, message missing",
+                    f"The tracked poll message for **{raffle.item}** was already "
+                    "gone, so its raffle record was removed. If an old poll "
+                    "message is still visible, delete it by hand.",
+                )
+            )
+            return
+
+        if delete_failed:
+            await ctx.send(
+                embed=warn_embed(
+                    "Poll cancelled, message left behind",
+                    f"**{raffle.item}** was ended and its raffle record was "
+                    "removed, but Discord could not delete the poll message. "
+                    "Delete that message by hand.",
+                )
+            )
+            return
+
+        await ctx.send(
+            embed=ok_embed(
+                "Poll cancelled",
+                f"**{raffle.item}** was ended and removed. Run `!poll "
+                f"{raffle.item}` to open a new poll.",
+            )
+        )
 
 
 # Must stay the LAST statement in this file. bot.run() blocks, so any

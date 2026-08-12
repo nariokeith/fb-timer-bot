@@ -26,6 +26,7 @@ class FakeMessage:
         *,
         raise_on_edit=False,
         raise_on_delete=False,
+        raise_on_end_poll=False,
         raise_on_pin=False,
     ):
         self.content = content
@@ -34,10 +35,13 @@ class FakeMessage:
         self.deleted = False
         self.edits: list[str] = []
         self.edit_calls = 0
+        self.end_poll_calls = 0
         self.pin_calls = 0
         self.raise_on_edit = raise_on_edit
         self.raise_on_delete = raise_on_delete
+        self.raise_on_end_poll = raise_on_end_poll
         self.raise_on_pin = raise_on_pin
+        self.poll_ended = False
         self.embed = None
         self.view = None
         self.poll = None
@@ -69,6 +73,12 @@ class FakeMessage:
         if self.raise_on_delete:
             raise _http_exception()
         self.deleted = True
+
+    async def end_poll(self):
+        self.end_poll_calls += 1
+        if self.raise_on_end_poll:
+            raise _http_exception()
+        self.poll_ended = True
 
 
 def _http_exception():
@@ -2265,6 +2275,106 @@ def test_winner_refuses_an_unknown_raffle(monkeypatch):
     assert "No open raffle" in ctx.sent[-1]["embed"].description
 
 
+def test_cancelpoll_ends_and_deletes_an_open_poll(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    _, message = _open_raffle(channel, poll=FakePoll(finalised=False))
+
+    asyncio.run(items_bot.cancelpoll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert message.poll_ended
+    assert message.deleted
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart") is None
+    assert ctx.sent[-1]["embed"].title == "✅ Poll cancelled"
+
+
+def test_cancelpoll_refuses_a_drawn_raffle_and_keeps_it(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    raffle, message = _open_raffle(channel, winner="Jjew")
+
+    asyncio.run(items_bot.cancelpoll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart") is raffle
+    assert not message.poll_ended
+    assert not message.deleted
+    assert "distribution history" in ctx.sent[-1]["embed"].description
+
+
+def test_cancelpoll_refuses_a_closed_undrawn_raffle_and_keeps_it(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    raffle, message = _open_raffle(channel, ends="2026-08-09 10:00:00")
+
+    asyncio.run(items_bot.cancelpoll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart") is raffle
+    assert not message.poll_ended
+    assert not message.deleted
+    assert "!poll Asta's Heart" in ctx.sent[-1]["embed"].description
+
+
+def test_cancelpoll_refuses_an_unknown_item_name(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel)
+
+    asyncio.run(items_bot.cancelpoll_cmd.callback(ctx, argument="Benji's Heart"))
+
+    assert "No tracked raffle" in ctx.sent[-1]["embed"].description
+    assert "Asta's Heart" in ctx.sent[-1]["embed"].description
+
+
+def test_cancelpoll_refuses_a_blank_argument(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(items_bot.cancelpoll_cmd.callback(ctx))
+
+    assert "!cancelpoll <special log name>" in ctx.sent[-1]["embed"].description
+
+
+def test_cancelpoll_drops_state_when_the_message_is_already_deleted(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    _, message = _open_raffle(channel)
+    message.deleted = True
+
+    asyncio.run(items_bot.cancelpoll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart") is None
+    assert "already gone" in ctx.sent[-1]["embed"].description
+    assert ctx.sent[-1]["embed"].title == "⚠️ Poll cancelled, message missing"
+
+
+def test_cancelpoll_drops_state_when_message_deletion_fails(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    _, message = _open_raffle(channel, poll=FakePoll(finalised=False))
+    message.raise_on_delete = True
+
+    asyncio.run(items_bot.cancelpoll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert message.poll_ended
+    assert not message.deleted
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart") is None
+    assert "delete the poll message" in ctx.sent[-1]["embed"].description.casefold()
+    assert ctx.sent[-1]["embed"].title == "⚠️ Poll cancelled, message left behind"
+
+
+def test_cancelpoll_keeps_state_when_ending_the_poll_fails(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    raffle, message = _open_raffle(channel, poll=FakePoll(finalised=False))
+    message.raise_on_end_poll = True
+
+    asyncio.run(items_bot.cancelpoll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart") is raffle
+    assert not message.deleted
+    assert "Nothing was cancelled" in ctx.sent[-1]["embed"].description
+
+
 def test_a_failed_sheet_write_leaves_the_raffle_open(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch)
@@ -2309,7 +2419,7 @@ def test_help_says_request_is_gear_only_and_lists_the_raffle_commands():
 
     text = str(ctx.sent[-1]["embed"].to_dict())
     assert "gear" in text.casefold()
-    for command in ("!poll", "!list", "!winner", "!setraffleroles", "!setrafflechannel"):
+    for command in ("!poll", "!list", "!winner", "!cancelpoll", "!setraffleroles", "!setrafflechannel"):
         assert command in text
 
 
@@ -2533,7 +2643,7 @@ def test_no_command_is_defined_after_the_main_guard():
 
 def test_every_raffle_command_is_registered_on_the_bot():
     registered = {c.name for c in items_bot.bot.commands}
-    for name in ("poll", "list", "winner", "setraffleroles", "setrafflechannel"):
+    for name in ("poll", "list", "winner", "cancelpoll", "setraffleroles", "setrafflechannel"):
         assert name in registered, f"!{name} is not registered"
 
 
@@ -2587,6 +2697,21 @@ def test_a_poll_discord_has_already_closed_is_listed(monkeypatch):
     asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
 
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").eligible == ("Jjew",)
+
+
+def test_cancelpoll_deletes_a_poll_discord_has_already_closed(monkeypatch):
+    _configured_raffle(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    _, message = _open_raffle(channel)
+    poll = FakePoll()
+    poll.expires_at = discord.utils.utcnow() - datetime.timedelta(minutes=5)
+    message.poll = poll
+
+    asyncio.run(items_bot.cancelpoll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert message.end_poll_calls == 0
+    assert message.deleted
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart") is None
 
 
 def test_the_pool_embed_stays_within_discords_description_limit():
@@ -2741,7 +2866,7 @@ def test_officer_and_raffle_commands_use_their_own_channels(monkeypatch):
     monkeypatch.setattr(items_bot, "_STATE", _configured_state())
     for name in ("distribute", "setraffleroles"):
         assert items_bot.command_channels(FakeGuardCtx(10, name)) == (10,)
-    for name in ("poll", "list", "winner"):
+    for name in ("poll", "list", "winner", "cancelpoll"):
         assert items_bot.command_channels(FakeGuardCtx(30, name)) == (30,)
 
 
