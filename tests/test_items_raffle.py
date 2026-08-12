@@ -260,6 +260,15 @@ def test_a_trailing_dash_is_refused():
         items_raffle.split_item_and_igns("Amentis Foot Jjew - ", ITEMS, ROSTER)
 
 
+def test_a_winner_whose_name_ends_in_a_hyphen_is_not_read_as_a_dangling_dash():
+    """Only a hyphen with whitespace before it is a dangling separator."""
+    roster = ["Jjew", "Kobe", "KAMOTE-"]
+
+    assert items_raffle.split_item_and_igns(
+        "Amentis Foot Kobe - KAMOTE-", ["Amentis Foot"], roster
+    ) == ("Amentis Foot", ["Kobe", "KAMOTE-"])
+
+
 def test_an_unknown_name_in_a_later_position_is_refused_by_name():
     with pytest.raises(items_raffle.RaffleArgumentError, match="Nobody"):
         items_raffle.split_item_and_igns("Amentis Foot Jjew - Nobody", ITEMS, ROSTER)

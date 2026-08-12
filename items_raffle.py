@@ -250,6 +250,7 @@ def split_item_and_ign(
 # A hyphen only separates winners when it has whitespace on BOTH sides.
 # 'wile-KAMOTE' is a roster row, so a bare hyphen cannot be the delimiter.
 WINNER_SPLIT = re.compile(r"\s+-\s+")
+DANGLING_SEPARATOR = re.compile(r"\s-\s*$")
 
 
 def split_item_and_igns(
@@ -265,7 +266,10 @@ def split_item_and_igns(
     before any checkbox is ticked rather than half way through.
     """
     chunks = WINNER_SPLIT.split(argument.strip())
-    if argument.rstrip().endswith("-") or any(
+    # A separator needs whitespace on both sides, so only a hyphen with
+    # whitespace BEFORE it is a dangling one. Testing the last character
+    # alone would reject a roster name that simply ends in a hyphen.
+    if DANGLING_SEPARATOR.search(argument) or any(
         not chunk.strip() for chunk in chunks
     ):
         raise RaffleArgumentError(
