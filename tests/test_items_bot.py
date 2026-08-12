@@ -2838,7 +2838,7 @@ def test_a_corrupt_cell_is_not_mistaken_for_an_already_ticked_box(monkeypatch):
     asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
 
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ()
-    assert ctx.sent[-1]["embed"].title == "❌ Sheet write failed"
+    assert ctx.sent[-1]["embed"].title == "❌ Partly recorded"
 
 
 class FakeGuardCtx:
@@ -2903,3 +2903,156 @@ def test_wrong_channel_is_swallowed_but_other_check_failures_still_reply():
 
     asyncio.run(items_bot.on_command_error(ctx, commands.CheckFailure("nope")))
     assert ctx.sent, "a plain CheckFailure must still be reported"
+
+
+def test_winner_records_three_names_from_one_command(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe", "Ryuu"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, ends="2026-08-09 10:00:00",
+        eligible=("Jjew", "Kobe", "Ryuu"), listed=True,
+    )
+    written = []
+    monkeypatch.setattr(
+        items_sheet, "commit_approval",
+        lambda spreadsheet, **kw: (written.append(kw["ign"]), "C4")[1],
+    )
+
+    asyncio.run(
+        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe - Ryuu")
+    )
+
+    assert written == ["Jjew", "Kobe", "Ryuu"]
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.winners == ("Jjew", "Kobe", "Ryuu")
+    assert raffle.drawn is True
+    assert ctx.sent[-1]["embed"].title == "✅ Winners recorded"
+
+
+def test_a_failure_part_way_keeps_the_raffle_open_for_a_retry(monkeypatch):
+    """The first name is already ticked; the rest must stay drawable."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe", "Ryuu"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, ends="2026-08-09 10:00:00",
+        eligible=("Jjew", "Kobe", "Ryuu"), listed=True,
+    )
+
+    def _fail_on_kobe(spreadsheet, **kw):
+        if kw["ign"] == "Kobe":
+            raise RuntimeError("Sheets is down")
+        return "C4"
+
+    monkeypatch.setattr(items_sheet, "commit_approval", _fail_on_kobe)
+
+    asyncio.run(
+        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe - Ryuu")
+    )
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.winners == ("Jjew",)
+    assert raffle.drawn is False
+    description = ctx.sent[-1]["embed"].description
+    assert "Sheets is down" in description
+    assert "Ryuu" in description, "the un-attempted name must be named"
+    assert "!winner Asta's Heart Kobe - Ryuu" in description
+
+
+def test_the_retry_after_a_partial_failure_completes_the_draw(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe", "Ryuu"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe", "Ryuu"),
+        listed=True, winners=("Jjew",), drawn=False,
+    )
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda spreadsheet, **kw: "C4")
+
+    asyncio.run(
+        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Kobe - Ryuu")
+    )
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.winners == ("Jjew", "Kobe", "Ryuu")
+    assert raffle.drawn is True
+
+
+def test_retyping_an_already_recorded_winner_writes_nothing(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe", "Ryuu"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe", "Ryuu"),
+        listed=True, winners=("Jjew",), drawn=False,
+    )
+    monkeypatch.setattr(
+        items_sheet, "commit_approval",
+        lambda *a, **k: pytest.fail("wrote a second time"),
+    )
+
+    asyncio.run(
+        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe")
+    )
+
+    description = ctx.sent[-1]["embed"].description
+    assert "Jjew" in description
+    assert "already" in description.casefold()
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ("Jjew",)
+
+
+def test_one_bad_name_refuses_the_whole_command(monkeypatch):
+    """Nothing is ticked, so the officer can fix the typo and re-run as typed."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe", "Ryuu"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe"), listed=True
+    )
+    monkeypatch.setattr(
+        items_sheet, "commit_approval", lambda *a, **k: pytest.fail("wrote")
+    )
+
+    asyncio.run(
+        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Ryuu")
+    )
+
+    assert "not on the eligible list" in ctx.sent[-1]["embed"].description
+    assert "Ryuu" in ctx.sent[-1]["embed"].description
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ()
+
+
+def test_a_ledger_failure_on_one_name_does_not_stop_the_others(monkeypatch):
+    """Its checkbox IS ticked, so a retry would skip it and lose the row."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe"), listed=True
+    )
+    row = ["2026-08-09 12:00:00", "Jjew", "Asta's Heart", "Special", "Keith", "1", "abc"]
+
+    def _ledger_failure(spreadsheet, **kw):
+        if kw["ign"] == "Jjew":
+            raise items_sheet.LedgerWriteError("C4", row, RuntimeError("append failed"))
+        return "C5"
+
+    monkeypatch.setattr(items_sheet, "commit_approval", _ledger_failure)
+
+    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.winners == ("Jjew", "Kobe")
+    assert raffle.drawn is True
+    assert "C4" in ctx.sent[-1]["embed"].description
+
+
+def test_render_pool_labels_several_winners():
+    split = items_raffle.VoterSplit(eligible=["Jjew", "Kobe"])
+
+    text = items_bot.render_pool("Asta's Heart", split, ("Jjew", "Kobe"))
+
+    assert "Winners: Jjew, Kobe" in text
+    assert "Winner: Jjew" in items_bot.render_pool("Asta's Heart", split, ("Jjew",))
+    assert "Winner" not in items_bot.render_pool("Asta's Heart", split)

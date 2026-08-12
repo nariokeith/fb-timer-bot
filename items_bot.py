@@ -1756,7 +1756,7 @@ async def winner_cmd(ctx, *, argument: str = ""):
             return
 
         try:
-            item, ign = items_raffle.split_item_and_ign(
+            item, igns = items_raffle.split_item_and_igns(
                 argument, items_state.raffle_item_names(_STATE), snapshot.roster
             )
         except items_raffle.RaffleArgumentError as exc:
@@ -1793,98 +1793,91 @@ async def winner_cmd(ctx, *, argument: str = ""):
             )
             return
 
-        wanted = items_rules.normalize(ign)
-        on_list = next(
-            (name for name in raffle.eligible if items_rules.normalize(name) == wanted),
-            None,
-        )
-        if on_list is None:
-            suggestions = get_close_matches(ign, list(raffle.eligible), n=3, cutoff=0.6)
+        # Every name is checked before the first write, so a typo in the
+        # third name cannot leave the first two ticked.
+        recorded_already: list[str] = []
+        missing: list[str] = []
+        chosen: list[str] = []
+        for ign in igns:
+            wanted = items_rules.normalize(ign)
+            if any(items_rules.normalize(w) == wanted for w in raffle.winners):
+                recorded_already.append(ign)
+                continue
+            on_list = next(
+                (n for n in raffle.eligible if items_rules.normalize(n) == wanted),
+                None,
+            )
+            (chosen if on_list is not None else missing).append(on_list or ign)
+
+        if missing:
+            suggestions = get_close_matches(
+                missing[0], list(raffle.eligible), n=3, cutoff=0.6
+            )
             hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
             await ctx.send(
                 embed=error_embed(
                     "Winner refused",
-                    f"**{ign}** is not on the eligible list for "
-                    f"**{raffle.item}**.{hint}",
+                    f"{', '.join(missing)} — not on the eligible list for "
+                    f"**{raffle.item}**.{hint} Nothing was recorded.",
+                )
+            )
+            return
+        if recorded_already:
+            await ctx.send(
+                embed=error_embed(
+                    "Winner refused",
+                    f"**{', '.join(recorded_already)}** already won "
+                    f"**{raffle.item}** — nothing was written a second time. "
+                    f"Re-run naming only the players still to record.",
                 )
             )
             return
 
-        try:
-            await asyncio.to_thread(
-                lambda: items_sheet.commit_approval(
-                    _SPREADSHEET,
-                    ign=on_list,
-                    item=raffle.item,
-                    item_type=items_rules.SPECIAL,
-                    timestamp=now,
-                    officer=getattr(ctx.author, "display_name", str(ctx.author)),
-                    user_id=ctx.author.id,
-                    request_id=items_state.new_request_id(),
-                )
-            )
-        except items_sheet.LedgerWriteError as exc:
-            # The checkbox IS ticked. Re-running could only fail against
-            # a ticked box, so the raffle closes and the officer is given
-            # the exact ledger row instead.
-            items_state.replace_raffle(
-                _STATE, raffle, winners=(on_list,), drawn=True
-            )
-            channel = (
-                bot.get_channel(_STATE.officer_channel_id)
-                if _STATE.officer_channel_id is not None
-                else None
-            )
-            if channel is not None:
-                await save_state(channel)
-            pasteable = " | ".join(exc.row)
-            await ctx.send(
-                embed=error_embed(
-                    "Winner recorded, ledger not",
-                    f"**{on_list}** won **{raffle.item}** and cell "
-                    f"{exc.address} is ticked, but the Distribution Log row "
-                    f"could not be written: {exc}\nDo NOT run this again — "
-                    f"add this row to `{items_sheet.LEDGER_TAB}` by hand:\n"
-                    f"```\n{pasteable}\n```",
-                )
-            )
-            return
-        except items_sheet.AlreadyHeld:
-            # The checkbox is already ticked. That happens when a previous
-            # !winner wrote the sheet but the state save then failed, so a
-            # restart restored a raffle that looks undrawn. Saying "nothing
-            # was recorded" here would be the opposite of the truth: the
-            # item HAS been given. Close the raffle to match the sheet.
-            items_state.replace_raffle(
-                _STATE, raffle, winners=(on_list,), drawn=True
-            )
-            channel = (
-                bot.get_channel(_STATE.officer_channel_id)
-                if _STATE.officer_channel_id is not None
-                else None
-            )
-            if channel is not None:
-                await save_state(channel)
-            await ctx.send(
-                embed=ok_embed(
-                    "Already recorded",
-                    f"**{on_list}** already has **{raffle.item}** ticked in "
-                    f"`{items_sheet.SPECIAL_TAB}` — nothing was written a "
-                    "second time. The raffle is now closed to match the sheet.",
-                )
-            )
-            return
-        except Exception as exc:
-            await ctx.send(
-                embed=error_embed(
-                    "Sheet write failed",
-                    f"Nothing was recorded, the raffle is still open: {exc}",
-                )
-            )
-            return
+        written: list[str] = []
+        already_ticked: list[str] = []
+        ledger_gaps: list[tuple[str, str, list[str]]] = []
+        failure: tuple[str, str] | None = None
+        not_attempted: list[str] = []
 
-        items_state.replace_raffle(
-            _STATE, raffle, winners=(on_list,), drawn=True
+        for position, ign in enumerate(chosen):
+            try:
+                # ign is bound as a default: a bare closure would send
+                # the LAST name of the loop to every thread.
+                await asyncio.to_thread(
+                    lambda ign=ign: items_sheet.commit_approval(
+                        _SPREADSHEET,
+                        ign=ign,
+                        item=raffle.item,
+                        item_type=items_rules.SPECIAL,
+                        timestamp=now,
+                        officer=getattr(ctx.author, "display_name", str(ctx.author)),
+                        user_id=ctx.author.id,
+                        request_id=items_state.new_request_id(),
+                    )
+                )
+            except items_sheet.LedgerWriteError as exc:
+                # The checkbox IS ticked, so this name is recorded and a
+                # retry would skip it -- the ledger row has to be handed
+                # over now or it is lost.
+                written.append(ign)
+                ledger_gaps.append((ign, exc.address, exc.row))
+            except items_sheet.AlreadyHeld:
+                # A previous run wrote the sheet and then failed to save
+                # state. The item HAS been given; say so and move on.
+                written.append(ign)
+                already_ticked.append(ign)
+            except Exception as exc:
+                failure = (ign, str(exc))
+                not_attempted = chosen[position + 1 :]
+                break
+            else:
+                written.append(ign)
+
+        updated = items_state.replace_raffle(
+            _STATE,
+            raffle,
+            winners=(*raffle.winners, *written),
+            drawn=failure is None,
         )
         channel = (
             bot.get_channel(_STATE.officer_channel_id)
@@ -1894,12 +1887,46 @@ async def winner_cmd(ctx, *, argument: str = ""):
         if channel is not None:
             await save_state(channel)
 
+    lines: list[str] = []
+    if written:
+        label = "Winner" if len(written) == 1 else "Winners"
+        lines.append(
+            f"🏆 **{label}: {', '.join(written)}** — ticked in "
+            f"`{items_sheet.SPECIAL_TAB}`."
+        )
+    if already_ticked:
+        lines.append(
+            f"⚠️ {', '.join(already_ticked)} was already ticked in the sheet, "
+            "so nothing was written a second time."
+        )
+    for ign, address, row in ledger_gaps:
+        pasteable = " | ".join(row)
+        lines.append(
+            f"⚠️ {ign}'s cell {address} is ticked but the "
+            f"`{items_sheet.LEDGER_TAB}` row failed. Do NOT re-run for {ign} — "
+            f"add this row by hand:\n```\n{pasteable}\n```"
+        )
+    if failure is not None:
+        ign, reason = failure
+        remaining = [ign, *not_attempted]
+        lines.append(f"❌ **{ign}** was not recorded: {reason}")
+        if not_attempted:
+            lines.append(f"⏸️ Not attempted: {', '.join(not_attempted)}")
+        lines.append(
+            f"The raffle is still open. Re-run:\n"
+            f"`!winner {updated.item} {' - '.join(remaining)}`"
+        )
+    else:
+        lines.append(
+            "They are no longer eligible for this log. The raffle is closed."
+        )
+
+    title = "Winners recorded" if len(written) != 1 else "Winner recorded"
     await ctx.send(
-        embed=ok_embed(
-            "Winner recorded",
-            f"🏆 **{on_list}** wins **{raffle.item}**. Their checkbox in "
-            f"`{items_sheet.SPECIAL_TAB}` is ticked, so they will not be "
-            "eligible for this log again.",
+        embed=(
+            error_embed("Partly recorded", "\n\n".join(lines))
+            if failure is not None
+            else ok_embed(title, "\n\n".join(lines))
         )
     )
 
