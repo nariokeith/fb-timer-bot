@@ -1912,6 +1912,8 @@ async def winner_cmd(ctx, *, argument: str = ""):
         lines.append(f"❌ **{ign}** was not recorded: {reason}")
         if not_attempted:
             lines.append(f"⏸️ Not attempted: {', '.join(not_attempted)}")
+        if not written:
+            lines.append("Nothing was written to the sheet.")
         lines.append(
             f"The raffle is still open. Re-run:\n"
             f"`!winner {updated.item} {' - '.join(remaining)}`"
@@ -1921,14 +1923,15 @@ async def winner_cmd(ctx, *, argument: str = ""):
             "They are no longer eligible for this log. The raffle is closed."
         )
 
-    title = "Winners recorded" if len(written) != 1 else "Winner recorded"
-    await ctx.send(
-        embed=(
-            error_embed("Partly recorded", "\n\n".join(lines))
-            if failure is not None
-            else ok_embed(title, "\n\n".join(lines))
-        )
-    )
+    if failure is not None:
+        # "Partly" would be a lie when the very first write failed: the
+        # sheet is untouched and the officer must not think otherwise.
+        outcome = "Partly recorded" if written else "Nothing recorded"
+        embed = error_embed(outcome, "\n\n".join(lines))
+    else:
+        title = "Winner recorded" if len(written) == 1 else "Winners recorded"
+        embed = ok_embed(title, "\n\n".join(lines))
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="cancelpoll")

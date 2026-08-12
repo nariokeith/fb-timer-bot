@@ -2838,7 +2838,7 @@ def test_a_corrupt_cell_is_not_mistaken_for_an_already_ticked_box(monkeypatch):
     asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
 
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ()
-    assert ctx.sent[-1]["embed"].title == "❌ Partly recorded"
+    assert ctx.sent[-1]["embed"].title == "❌ Nothing recorded"
 
 
 class FakeGuardCtx:
@@ -2958,6 +2958,30 @@ def test_a_failure_part_way_keeps_the_raffle_open_for_a_retry(monkeypatch):
     assert "Sheets is down" in description
     assert "Ryuu" in description, "the un-attempted name must be named"
     assert "!winner Asta's Heart Kobe - Ryuu" in description
+    assert ctx.sent[-1]["embed"].title == "❌ Partly recorded"
+
+
+def test_a_failure_on_the_very_first_name_says_nothing_was_recorded(monkeypatch):
+    """"Partly recorded" would imply the sheet holds something. It does not."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe"), listed=True
+    )
+
+    def _boom(spreadsheet, **kw):
+        raise RuntimeError("Sheets is down")
+
+    monkeypatch.setattr(items_sheet, "commit_approval", _boom)
+
+    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.winners == ()
+    assert raffle.drawn is False
+    assert ctx.sent[-1]["embed"].title == "❌ Nothing recorded"
+    assert "Nothing was written to the sheet." in ctx.sent[-1]["embed"].description
 
 
 def test_the_retry_after_a_partial_failure_completes_the_draw(monkeypatch):
