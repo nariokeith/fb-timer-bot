@@ -2329,9 +2329,92 @@ def test_list_refuses_while_the_poll_is_still_open(monkeypatch):
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").listed is False
 
 
+def test_list_refuses_to_freeze_while_a_voter_is_unresolved(monkeypatch):
+    """A voter nobody can name must not be silently dropped from the pool."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "xXshadowXx")]),
+    )
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is False, "the pool must NOT be frozen"
+    assert raffle.eligible == ()
+    description = ctx.sent[-1]["embed"].description
+    assert "<@2>" in description
+    assert "xXshadowXx" in description
+    assert "!iam" in description
+
+
+def test_list_freezes_once_the_unresolved_voter_is_bound(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    items_bot._STATE.bindings["2"] = "Kobe"
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "xXshadowXx")]),
+    )
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is True
+    assert raffle.eligible == ("Jjew", "Kobe")
+
+
+def test_list_freezes_when_the_only_stranger_is_marked_not_a_player(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    items_bot._STATE.not_players.append("2")
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "a guest")]),
+    )
+
+    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is True
+    assert raffle.eligible == ("Jjew",)
+    assert "1 voter skipped" in ctx.sent[-1]["embed"].description
+
+
+def test_render_pool_shows_the_request_fallback_group():
+    voter = items_raffle.Voter(user_id=3, display_name="xXshadowXx")
+    split = items_raffle.VoterSplit(
+        eligible=["Jjew", "Ryuu"], from_request=[(voter, "Ryuu")]
+    )
+
+    text = items_bot.render_pool("Asta's Heart", split)
+
+    assert "last !request" in text
+    assert "<@3>" in text
+    assert "Ryuu" in text
+
+
+def _fake_poll_voters(pairs):
+    """Stand in for poll_voters, which would otherwise hit Discord."""
+    async def _voters(message):
+        return [
+            items_raffle.Voter(user_id=user_id, display_name=name)
+            for user_id, name in pairs
+        ]
+    return _voters
+
+
 def test_list_splits_the_voters_and_freezes_the_pool(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch, roster=("Jjew", "Kobe"), holds=("Kobe",))
+    items_bot._STATE.not_players.append("3")
     ctx, channel = _raffle_ctx()
     answer = FakePollAnswer(
         "Yes",
@@ -2347,7 +2430,7 @@ def test_list_splits_the_voters_and_freezes_the_pool(monkeypatch):
     description = ctx.sent[-1]["embed"].description
     assert "Jjew" in description
     assert "Kobe" in description
-    assert "<@3>" in description
+    assert "1 voter skipped" in description
 
 
 def test_listing_twice_replays_the_frozen_pool(monkeypatch):

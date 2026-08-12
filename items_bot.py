@@ -1860,10 +1860,18 @@ def render_pool(
         block = "**Already has it** (excluded)"
         lines += ["", block, _capped(split.already_have, max(budget, 0), ", ")]
         budget -= len(lines[-1]) + len(block)
-    if split.unidentified:
-        block = "**Couldn't identify** — sort these out by hand"
-        mentions = [f"<@{voter.user_id}>" for voter in split.unidentified]
-        lines += ["", block, _capped(mentions, max(budget, 0), " ")]
+    if split.from_request:
+        block = "ℹ️ **Identified from their last !request** — check these"
+        entries = [
+            f"<@{voter.user_id}> → {ign}  (nickname {voter.display_name!r})"
+            for voter, ign in split.from_request
+        ]
+        lines += ["", block, _capped(entries, max(budget, 0), "\n")]
+        budget -= len(lines[-1]) + len(block)
+    if split.skipped:
+        count = len(split.skipped)
+        noun = "voter" if count == 1 else "voters"
+        lines += ["", f"_{count} {noun} skipped (not roster players)_"]
     if trophy:
         lines += ["", trophy]
     return "\n".join(lines)
@@ -1976,6 +1984,23 @@ async def list_cmd(ctx, *, argument: str = ""):
                 request_igns=dict(_STATE.igns),
             ),
         )
+        if split.unidentified:
+            # Freezing now would drop these voters from the pool a winner
+            # is drawn from, and nothing later would reveal that it happened.
+            lines = [
+                f"<@{voter.user_id}>  nickname {voter.display_name!r}"
+                for voter in split.unidentified
+            ]
+            await ctx.send(
+                embed=error_embed(
+                    "Pool not frozen",
+                    f"{len(split.unidentified)} voter(s) could not be "
+                    f"identified:\n\n" + "\n".join(lines) + "\n\nThey must run "
+                    "`!iam <IGN>`, or an officer runs `!bind @user <IGN>` or "
+                    "`!notaplayer @user`. Then run `!list` again.",
+                )
+            )
+            return
         updated = items_state.replace_raffle(
             _STATE, raffle, eligible=tuple(split.eligible), listed=True
         )
