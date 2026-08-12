@@ -274,8 +274,29 @@ def _identities(bindings=None, not_players=(), request_igns=None):
     )
 
 
-def _voter(user_id=1, display_name="xXshadowXx"):
-    return items_raffle.Voter(user_id=user_id, display_name=display_name)
+def test_a_collapsed_duplicate_is_reported_not_dropped():
+    """The pool is right either way, but nothing may vanish unmentioned."""
+    voters = [_voter(1, "BK | Jjew"), _voter(2, "xXshadowXx")]
+    identities = _identities(request_igns={"2": "Jjew"})
+
+    split = items_raffle.classify_voters(
+        voters, ROSTER, holds=lambda ign: False, identities=identities
+    )
+
+    assert split.eligible == ["Jjew"]
+    assert [(v.user_id, ign) for v, ign in split.duplicates] == [(2, "Jjew")]
+
+
+def test_a_duplicate_from_a_binding_is_reported_too():
+    voters = [_voter(1, "BK | Jjew"), _voter(2, "xXshadowXx")]
+    identities = _identities(bindings={"2": "Jjew"})
+
+    split = items_raffle.classify_voters(
+        voters, ROSTER, holds=lambda ign: False, identities=identities
+    )
+
+    assert split.eligible == ["Jjew"]
+    assert [(v.user_id, ign) for v, ign in split.duplicates] == [(2, "Jjew")]
 
 
 def test_a_binding_resolves_a_nickname_nothing_else_could():

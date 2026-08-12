@@ -2096,6 +2096,38 @@ def test_bind_overrides_another_accounts_claim(monkeypatch):
     assert "5" in ctx.sent[-1]["embed"].description
 
 
+def test_iam_is_announced_in_the_officer_channel(monkeypatch):
+    """The one command a member can use to change state leaves a trail."""
+    state_channel = _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+
+    asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+
+    posted = " ".join(message.content for message in state_channel.sent)
+    assert "<@7>" in posted and "Jjew" in posted
+
+
+def test_a_failed_officer_notice_does_not_undo_the_binding(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, _ = _raffle_ctx(roles=())
+    ctx.author = FakeMember(user_id=7, roles=[])
+    monkeypatch.setattr(
+        items_bot,
+        "_tell_officers",
+        lambda text: (_ for _ in ()).throw(RuntimeError("channel gone")),
+    )
+
+    try:
+        asyncio.run(items_bot.iam_cmd.callback(ctx, argument="Jjew"))
+    except RuntimeError:
+        pass
+
+    assert items_bot._STATE.bindings["7"] == "Jjew"
+
+
 def test_bind_displaces_a_claim_held_under_an_alias(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch, roster=("Kobe", "Jjew"))
@@ -2399,6 +2431,16 @@ def test_render_pool_shows_the_request_fallback_group():
     assert "last !request" in text
     assert "<@3>" in text
     assert "Ryuu" in text
+
+
+def test_render_pool_names_two_accounts_on_one_player():
+    voter = items_raffle.Voter(user_id=9, display_name="xXshadowXx")
+    split = items_raffle.VoterSplit(eligible=["Jjew"], duplicates=[(voter, "Jjew")])
+
+    text = items_bot.render_pool("Asta's Heart", split)
+
+    assert "<@9>" in text
+    assert "one player" in text
 
 
 def _fake_poll_voters(pairs):

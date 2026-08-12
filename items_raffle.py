@@ -109,6 +109,10 @@ class VoterSplit:
     # be an alt -- shown separately so an officer can check before drawing.
     from_request: list[tuple[Voter, str]] = field(default_factory=list)
     skipped: list[Voter] = field(default_factory=list)
+    # Collapsed as a repeat of a player already counted. The pool is right
+    # either way, but an officer seeing two accounts on one row is how a
+    # wrong binding gets noticed.
+    duplicates: list[tuple[Voter, str]] = field(default_factory=list)
 
 
 def _in_roster(ign: str, roster: list[str]) -> str | None:
@@ -175,6 +179,7 @@ def classify_voters(
     unidentified: list[Voter] = []
     from_request: list[tuple[Voter, str]] = []
     skipped: list[Voter] = []
+    duplicates: list[tuple[Voter, str]] = []
     seen: set[str] = set()
 
     for voter in voters:
@@ -187,6 +192,7 @@ def classify_voters(
             continue
         key = normalize(player)
         if key in seen:
+            duplicates.append((voter, player))
             continue
         seen.add(key)
         if source == "request":
@@ -199,6 +205,7 @@ def classify_voters(
         unidentified=unidentified,
         from_request=from_request,
         skipped=skipped,
+        duplicates=duplicates,
     )
 
 DEFAULT_POLL_HOURS = 24

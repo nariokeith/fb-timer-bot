@@ -603,7 +603,7 @@ async def _save_binding_change(ctx, undo: Callable[[], None]) -> bool:
         await ctx.send(
             embed=error_embed(
                 "State is full",
-                "The bot state is full and cannot store another binding until "
+                "The bot state is full and cannot store another entry until "
                 "the request queue is worked down. Nothing was changed.",
             )
         )
@@ -616,6 +616,27 @@ async def _save_binding_change(ctx, undo: Callable[[], None]) -> bool:
     if channel is not None:
         await save_state(channel)
     return True
+
+
+async def _tell_officers(text: str) -> None:
+    """Echo a binding change to the officer channel, if one is set.
+
+    !iam is the only command a member can use to change bot state, and it
+    can claim a row whose owner the bot currently knows only by nickname.
+    An officer who sees the claim can reverse it with !bind.
+    """
+    channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if channel is None:
+        return
+    try:
+        await channel.send(text)
+    except Exception:
+        # A notice is never worth failing a binding that is already saved.
+        pass
 
 
 def _same_player(stored_ign: str, player: str, roster: list[str]) -> bool:
@@ -715,6 +736,7 @@ async def iam_cmd(ctx, *, argument: str = ""):
             "polls from now on.",
         )
     )
+    await _tell_officers(f"🔗 <@{ctx.author.id}> claimed **{player}** via `!iam`.")
 
 
 @bot.command(name="bind")
@@ -785,6 +807,9 @@ async def bind_cmd(ctx, member: discord.Member, *, argument: str = ""):
             f"<@{member.id}> is **{player}**.{taken}",
         )
     )
+    await _tell_officers(
+        f"🔗 <@{ctx.author.id}> bound <@{member.id}> to **{player}**."
+    )
 
 
 @bot.command(name="notaplayer")
@@ -819,6 +844,9 @@ async def notaplayer_cmd(ctx, member: discord.Member):
             f"<@{member.id}> has no roster row and will be skipped in raffle "
             "polls. Run `!bind` to undo this.",
         )
+    )
+    await _tell_officers(
+        f"🔗 <@{ctx.author.id}> marked <@{member.id}> as not a roster player."
     )
 
 
@@ -1566,6 +1594,17 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send(embed=error_embed("Not allowed", "That command is for administrators."))
         return
+    if isinstance(error, (commands.MemberNotFound, commands.MissingRequiredArgument)):
+        # Arguments are converted after checks run, so a mistyped member
+        # would otherwise surface as an unexplained internal error.
+        await ctx.send(
+            embed=error_embed(
+                "Not recorded",
+                f"`!{ctx.command.name}` needs a member the bot can see. "
+                "Usage: `!bind @user <IGN>` or `!notaplayer @user`.",
+            )
+        )
+        return
     print(f"[items] command error: {error!r}", flush=True)
     await ctx.send(embed=error_embed("Something went wrong", str(error)))
 
@@ -1841,12 +1880,12 @@ def _winner_footer(winners: tuple[str, ...]) -> str:
 def render_pool(
     item: str, split: items_raffle.VoterSplit, winners: tuple[str, ...] = ()
 ) -> str:
-    """The three groups an officer needs, in one description.
+    """Everything an officer needs to see about the pool, in one description.
 
     Bounded, because the eligible list is frozen and saved BEFORE this is
     sent: a description Discord refuses would leave the pool committed
     with nothing shown, and a retry replays the frozen list without the
-    excluded and unidentified groups that only exist on the first run.
+    groups that only exist on the first run.
     The eligible list is the one that must survive truncation intact, so
     it gets the budget first.
     """
@@ -1868,6 +1907,13 @@ def render_pool(
         entries = [
             f"<@{voter.user_id}> → {ign}  (nickname {voter.display_name!r})"
             for voter, ign in split.from_request
+        ]
+        lines += ["", block, _capped(entries, max(budget, 0), "\n")]
+        budget -= len(lines[-1]) + len(block)
+    if split.duplicates:
+        block = "⚠️ **Two accounts, one player** — counted once"
+        entries = [
+            f"<@{voter.user_id}> → {ign}" for voter, ign in split.duplicates
         ]
         lines += ["", block, _capped(entries, max(budget, 0), "\n")]
         budget -= len(lines[-1]) + len(block)
