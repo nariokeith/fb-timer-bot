@@ -231,9 +231,9 @@ Order matters: `!setofficerchannel` first, because that is where the bot keeps
 its state. Then, in the raffle channel, whoever holds a raffle role runs:
 
 ```
-!poll <special log>            opens a 24-hour poll; --hours N to change it
-!cancelpoll <special log>      cancels an open poll and frees its raffle slot
-!list <special log>            after it closes: who is eligible
+!poll <special log>                      opens a 24-hour poll; --hours N to change it
+!cancelpoll <special log>                cancels an open poll and frees its raffle slot
+!list <special log>                      after it closes: who is eligible
 !winner <special log> <IGN>              records the draw, ticks their checkbox
 !winner <special log> <IGN> - <IGN>      records several winners from one poll
 ```

@@ -1257,7 +1257,7 @@ async def itemhelp_cmd(ctx):
             f"({items_raffle.DEFAULT_POLL_HOURS}h by default)\n"
             "**`!list <special log>`** — after it closes, who is eligible\n"
             "**`!winner <special log> <IGN>`** — record the draw\n"
-            "**`!winner <log> <IGN> - <IGN> - <IGN>`** — several winners "
+            "**`!winner <special log> <IGN> - <IGN>`** — several winners "
             "at once\n"
             "**`!cancelpoll <special log>`** — cancel an open poll"
         ),

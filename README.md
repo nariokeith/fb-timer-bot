@@ -289,9 +289,15 @@ it, and anyone it could not identify.
 
 Draw the winner yourself from the eligible list, then run `!winner`. The bot
 refuses a name that is not on the frozen list, refuses a second draw for the
-same raffle, and refuses to draw before `!list` has been run.
-If a sheet write fails part way, the raffle stays open and the bot prints the
-exact command to re-run for the names it did not record.
+same raffle, refuses a name repeated within one command, refuses a name it has
+already recorded, and refuses to draw before `!list` has been run.
+
+If a checkbox write fails part way through a multi-winner draw, the raffle stays
+open with the names it did record, and the bot prints the exact command to
+re-run for the rest. One case is different: when the checkbox was ticked but its
+`Distribution Log` row failed, that name counts as recorded and the bot hands
+you the row to paste in by hand — re-running would skip the name and the row
+would be lost.
 
 **Nicknames must contain the IGN.** The bot reads each voter's server nickname
 and strips the guild tag, so `BK | Jjew`, `M2 - Jjew`, `BK Jjew` and a bare
