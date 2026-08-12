@@ -1720,6 +1720,11 @@ async def list_cmd(ctx, *, argument: str = ""):
             voters,
             snapshot.roster,
             holds=lambda ign: items_sheet.holds_special(snapshot, ign, raffle.item),
+            identities=items_raffle.Identities(
+                bindings=dict(_STATE.bindings),
+                not_players=frozenset(_STATE.not_players),
+                request_igns=dict(_STATE.igns),
+            ),
         )
         updated = items_state.replace_raffle(
             _STATE, raffle, eligible=tuple(split.eligible), listed=True

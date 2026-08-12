@@ -89,7 +89,7 @@ def test_voters_split_into_eligible_already_have_and_unidentified():
         _voter(3, "BK | Nobody"),
     ]
     split = items_raffle.classify_voters(
-        voters, ROSTER, holds=lambda ign: ign == "Kobe"
+        voters, ROSTER, holds=lambda ign: ign == "Kobe", identities=_identities()
     )
 
     assert split.eligible == ["Jjew"]
@@ -99,20 +99,26 @@ def test_voters_split_into_eligible_already_have_and_unidentified():
 
 def test_the_same_player_voting_from_two_accounts_is_listed_once():
     voters = [_voter(1, "BK | Jjew"), _voter(2, "Jjew")]
-    split = items_raffle.classify_voters(voters, ROSTER, holds=lambda ign: False)
+    split = items_raffle.classify_voters(
+        voters, ROSTER, holds=lambda ign: False, identities=_identities()
+    )
 
     assert split.eligible == ["Jjew"]
 
 
 def test_eligibility_keeps_the_order_players_voted_in():
     voters = [_voter(1, "Ryuu"), _voter(2, "BK | Jjew"), _voter(3, "Kobe")]
-    split = items_raffle.classify_voters(voters, ROSTER, holds=lambda ign: False)
+    split = items_raffle.classify_voters(
+        voters, ROSTER, holds=lambda ign: False, identities=_identities()
+    )
 
     assert split.eligible == ["Ryuu", "Jjew", "Kobe"]
 
 
 def test_no_voters_gives_three_empty_groups():
-    split = items_raffle.classify_voters([], ROSTER, holds=lambda ign: False)
+    split = items_raffle.classify_voters(
+        [], ROSTER, holds=lambda ign: False, identities=_identities()
+    )
 
     assert split.eligible == []
     assert split.already_have == []
@@ -258,6 +264,127 @@ def test_an_alias_colliding_with_a_real_name_counts_as_a_duplicate():
 def test_a_trailing_dash_is_refused():
     with pytest.raises(items_raffle.RaffleArgumentError, match="empty"):
         items_raffle.split_item_and_igns("Amentis Foot Jjew - ", ITEMS, ROSTER)
+
+
+def _identities(bindings=None, not_players=(), request_igns=None):
+    return items_raffle.Identities(
+        bindings=bindings or {},
+        not_players=frozenset(not_players),
+        request_igns=request_igns or {},
+    )
+
+
+def _voter(user_id=1, display_name="xXshadowXx"):
+    return items_raffle.Voter(user_id=user_id, display_name=display_name)
+
+
+def test_a_binding_resolves_a_nickname_nothing_else_could():
+    ign, source = items_raffle.resolve_identity(
+        _voter(7, "xXshadowXx"), ROSTER, _identities(bindings={"7": "Kobe"})
+    )
+
+    assert (ign, source) == ("Kobe", "binding")
+
+
+def test_a_binding_beats_a_nickname_that_would_resolve_differently():
+    """This is how an officer corrects a wrong nickname match."""
+    ign, source = items_raffle.resolve_identity(
+        _voter(7, "BK | Jjew"), ROSTER, _identities(bindings={"7": "Kobe"})
+    )
+
+    assert (ign, source) == ("Kobe", "binding")
+
+
+def test_a_not_a_player_voter_is_skipped():
+    ign, source = items_raffle.resolve_identity(
+        _voter(7, "xXshadowXx"), ROSTER, _identities(not_players=["7"])
+    )
+
+    assert (ign, source) == (None, "skipped")
+
+
+def test_a_nickname_still_resolves_when_nothing_is_bound():
+    ign, source = items_raffle.resolve_identity(
+        _voter(7, "BK | Jjew"), ROSTER, _identities()
+    )
+
+    assert (ign, source) == ("Jjew", "nickname")
+
+
+def test_the_last_request_ign_is_the_fallback():
+    ign, source = items_raffle.resolve_identity(
+        _voter(7, "xXshadowXx"), ROSTER, _identities(request_igns={"7": "Ryuu"})
+    )
+
+    assert (ign, source) == ("Ryuu", "request")
+
+
+def test_a_nickname_beats_the_request_fallback():
+    ign, source = items_raffle.resolve_identity(
+        _voter(7, "BK | Jjew"), ROSTER, _identities(request_igns={"7": "Ryuu"})
+    )
+
+    assert (ign, source) == ("Jjew", "nickname")
+
+
+def test_a_binding_naming_a_row_no_longer_in_the_roster_is_unresolved():
+    """A player removed from the sheet must not stay drawable."""
+    ign, source = items_raffle.resolve_identity(
+        _voter(7, "xXshadowXx"), ROSTER, _identities(bindings={"7": "LeftTheGuild"})
+    )
+
+    assert (ign, source) == (None, None)
+
+
+def test_a_request_fallback_naming_a_missing_row_is_unresolved():
+    ign, source = items_raffle.resolve_identity(
+        _voter(7, "xXshadowXx"), ROSTER, _identities(request_igns={"7": "LeftTheGuild"})
+    )
+
+    assert (ign, source) == (None, None)
+
+
+def test_an_unresolvable_voter_is_unidentified():
+    ign, source = items_raffle.resolve_identity(
+        _voter(7, "xXshadowXx"), ROSTER, _identities()
+    )
+
+    assert (ign, source) == (None, None)
+
+
+def test_classify_splits_every_group():
+    voters = [
+        _voter(1, "BK | Jjew"),          # nickname
+        _voter(2, "xXshadowXx"),         # binding -> Kobe
+        _voter(3, "who even"),           # request -> Ryuu
+        _voter(4, "a guest"),            # skipped
+        _voter(5, "nobody at all"),      # unidentified
+    ]
+    identities = _identities(
+        bindings={"2": "Kobe"}, not_players=["4"], request_igns={"3": "Ryuu"}
+    )
+
+    split = items_raffle.classify_voters(
+        voters, ROSTER, holds=lambda ign: ign == "Ryuu", identities=identities
+    )
+
+    assert split.eligible == ["Jjew", "Kobe"]
+    assert split.already_have == ["Ryuu"]
+    assert [v.user_id for v in split.skipped] == [4]
+    assert [v.user_id for v in split.unidentified] == [5]
+    assert [(v.user_id, ign) for v, ign in split.from_request] == [(3, "Ryuu")]
+
+
+def test_a_duplicate_across_two_accounts_is_still_collapsed():
+    """One player voting from an alt account must not double their odds."""
+    voters = [_voter(1, "BK | Jjew"), _voter(2, "xXshadowXx")]
+    identities = _identities(bindings={"2": "Jjew"})
+
+    split = items_raffle.classify_voters(
+        voters, ROSTER, holds=lambda ign: False, identities=identities
+    )
+
+    assert split.eligible == ["Jjew"]
 
 
 def test_a_winner_whose_name_ends_in_a_hyphen_is_not_read_as_a_dangling_dash():
