@@ -1377,6 +1377,19 @@ async def poll_cmd(ctx, *, argument: str = ""):
         now = items_rules.now_pht()
         now_text = items_rules.format_timestamp(now)
         existing = items_state.find_raffle(_STATE, item)
+        # Neither superseded nor evictable, and find_raffle only ever
+        # returns the newest raffle for a name -- opening a new poll here
+        # would leave the unfinished draw unreachable by !list and !winner.
+        if existing is not None and existing.winners and not existing.drawn:
+            await ctx.send(
+                embed=error_embed(
+                    "Poll refused",
+                    f"**{item}** has an unfinished draw — "
+                    f"**{', '.join(existing.winners)}** already recorded. "
+                    f"Finish it with `!winner` before opening a new poll.",
+                )
+            )
+            return
         if existing is not None and existing.ends_at > now_text and not existing.winners:
             await ctx.send(
                 embed=error_embed(
@@ -1843,8 +1856,9 @@ async def winner_cmd(ctx, *, argument: str = ""):
 
         for position, ign in enumerate(chosen):
             try:
-                # ign is bound as a default: a bare closure would send
-                # the LAST name of the loop to every thread.
+                # ign is bound as a default so that a later refactor
+                # firing these concurrently cannot send the last name of
+                # the loop to every thread.
                 await asyncio.to_thread(
                     lambda ign=ign: items_sheet.commit_approval(
                         _SPREADSHEET,
@@ -1897,9 +1911,10 @@ async def winner_cmd(ctx, *, argument: str = ""):
             f"`{items_sheet.SPECIAL_TAB}`."
         )
     if already_ticked:
+        verb = "was" if len(already_ticked) == 1 else "were"
         lines.append(
-            f"⚠️ {', '.join(already_ticked)} was already ticked in the sheet, "
-            "so nothing was written a second time."
+            f"⚠️ {', '.join(already_ticked)} {verb} already ticked in the "
+            "sheet, so nothing was written a second time."
         )
     for ign, address, row in ledger_gaps:
         pasteable = " | ".join(row)

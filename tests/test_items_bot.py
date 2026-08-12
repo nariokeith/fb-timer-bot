@@ -2013,6 +2013,24 @@ def test_poll_refuses_a_second_open_raffle_for_the_same_log(monkeypatch):
     assert len(items_bot._STATE.raffles) == 1
 
 
+def test_poll_refuses_an_item_whose_draw_is_unfinished(monkeypatch):
+    """A partly drawn raffle is unevictable and unsupersedable; a new poll
+    would hide it behind the newer record forever."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe"),
+        listed=True, winners=("Jjew",), drawn=False,
+    )
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert "unfinished draw" in ctx.sent[-1]["embed"].description
+    assert len(items_bot._STATE.raffles) == 1, "the unfinished raffle must survive"
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ("Jjew",)
+
+
 def _fill_every_raffle_slot(monkeypatch, ends="2099-01-01 00:00:00", already_drawn=()):
     logs = [f"Log {n}" for n in range(items_state.MAX_RAFFLES)]
     _sheet(monkeypatch, special=("Player Name", "Asta's Heart", *logs))
@@ -2753,6 +2771,36 @@ def test_redrawing_a_winner_whose_box_is_already_ticked_says_so(monkeypatch):
 
     raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
     assert raffle.winners == ("Jjew",), "the raffle must not stay open forever"
+    assert "already" in ctx.sent[-1]["embed"].description.casefold()
+
+
+def test_an_already_ticked_middle_name_does_not_stop_the_others(monkeypatch):
+    """AlreadyHeld means the item HAS been given -- keep going."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe", "Ryuu"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, ends="2026-08-09 10:00:00",
+        eligible=("Jjew", "Kobe", "Ryuu"), listed=True,
+    )
+    attempted = []
+
+    def _kobe_already(spreadsheet, **kw):
+        attempted.append(kw["ign"])
+        if kw["ign"] == "Kobe":
+            raise items_sheet.AlreadyHeld("Kobe already has it")
+        return "C4"
+
+    monkeypatch.setattr(items_sheet, "commit_approval", _kobe_already)
+
+    asyncio.run(
+        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe - Ryuu")
+    )
+
+    assert attempted == ["Jjew", "Kobe", "Ryuu"], "Ryuu must still be attempted"
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.winners == ("Jjew", "Kobe", "Ryuu")
+    assert raffle.drawn is True
     assert "already" in ctx.sent[-1]["embed"].description.casefold()
 
 

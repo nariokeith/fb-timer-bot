@@ -275,6 +275,19 @@ def _raffle(item="Asta's Heart", created="2026-08-09 10:00:00", ends="2026-08-10
     )
 
 
+def test_to_dict_still_writes_the_legacy_winner_key_for_an_older_bot():
+    """A rollback must not read a drawn raffle as undrawn and supersede it."""
+    raw = _raffle(winners=("Jjew", "Kobe"), drawn=True).to_dict()
+
+    assert raw["winner"] == "Jjew"
+    assert raw["winners"] == ["Jjew", "Kobe"]
+    assert items_state.Raffle.from_dict(raw).winners == ("Jjew", "Kobe")
+
+
+def test_an_undrawn_raffle_writes_an_empty_legacy_winner():
+    assert _raffle().to_dict()["winner"] == ""
+
+
 def test_a_raffle_saved_under_the_old_single_winner_key_still_loads():
     """State written before multi-winner is sitting in the pinned message."""
     legacy = {

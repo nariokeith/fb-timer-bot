@@ -112,6 +112,10 @@ class Raffle:
             "listed": self.listed,
             "winners": list(self.winners),
             "drawn": self.drawn,
+            # Written for an older bot that may read this pin after a
+            # rollback: it understands only a single winner, and without
+            # this it would read a drawn raffle as undrawn and supersede it.
+            "winner": self.winners[0] if self.winners else "",
         }
 
     @classmethod
