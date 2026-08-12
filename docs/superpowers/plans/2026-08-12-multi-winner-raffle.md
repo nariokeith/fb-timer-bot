@@ -18,7 +18,7 @@ partial failure. Task 4 updates the docs.
 
 - Spec: `docs/superpowers/specs/2026-08-12-multi-winner-raffle-design.md`. Read
   it before starting.
-- Run tests with `python -m pytest` from the repo root. Nothing in this plan
+- Run tests with `./.venv/bin/python -m pytest` from the repo root. Nothing in this plan
   needs network, a Discord token, or a Google API key — every sheet and Discord
   object in these tests is a fake already present in `tests/test_items_bot.py`.
 - Bot state lives in a **pinned Discord message** holding JSON. Raffles written
@@ -175,7 +175,7 @@ def test_capacity_holds_when_every_raffle_has_several_winners():
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_items_state.py -k "legacy or several_winners or partly_drawn" -v`
+Run: `./.venv/bin/python -m pytest tests/test_items_state.py -k "legacy or several_winners or partly_drawn" -v`
 Expected: FAIL — `Raffle.__init__() got an unexpected keyword argument 'winners'`.
 
 - [ ] **Step 3: Change the dataclass in `items_state.py`**
@@ -371,7 +371,7 @@ def _fill_every_raffle_slot(monkeypatch, ends="2099-01-01 00:00:00", already_dra
 
 - [ ] **Step 6: Run the full suite**
 
-Run: `python -m pytest -q`
+Run: `./.venv/bin/python -m pytest -q`
 Expected: PASS. If anything fails on an attribute error, it is a reader you
 missed — `grep -rn "\.winner\b" items_bot.py items_state.py items_board.py tests/`
 finds it.
@@ -482,12 +482,12 @@ def test_an_item_with_no_winner_at_all_is_refused():
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_items_raffle.py -k split_item_and_igns -v`
+Run: `./.venv/bin/python -m pytest tests/test_items_raffle.py -k split_item_and_igns -v`
 Expected: FAIL — `module 'items_raffle' has no attribute 'split_item_and_igns'`.
 (If the `-k` filter matches nothing, run the file without it; the names above do
 not all contain the function name.)
 
-Run instead: `python -m pytest tests/test_items_raffle.py -v`
+Run instead: `./.venv/bin/python -m pytest tests/test_items_raffle.py -v`
 Expected: the twelve new tests ERROR on the missing attribute; everything else
 passes.
 
@@ -572,7 +572,7 @@ def split_item_and_igns(
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `python -m pytest tests/test_items_raffle.py -v`
+Run: `./.venv/bin/python -m pytest tests/test_items_raffle.py -v`
 Expected: PASS, all tests including the pre-existing ones. The existing
 `test_winner_refuses_a_single_word_argument` matches on `"Usage"`, which the new
 `WINNER_USAGE` still contains.
@@ -746,7 +746,7 @@ def test_a_ledger_failure_on_one_name_does_not_stop_the_others(monkeypatch):
     assert "C4" in ctx.sent[-1]["embed"].description
 
 
-def test_render_pool_labels_several_winners(monkeypatch):
+def test_render_pool_labels_several_winners():
     split = items_raffle.VoterSplit(eligible=["Jjew", "Kobe"])
 
     text = items_bot.render_pool("Asta's Heart", split, ("Jjew", "Kobe"))
@@ -762,7 +762,7 @@ way — the singular/plural label must not be rendered twice.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m pytest tests/test_items_bot.py -k "three_names or part_way or retry_after or retyping or bad_name or ledger_failure_on_one or several_winners" -v`
+Run: `./.venv/bin/python -m pytest tests/test_items_bot.py -k "three_names or part_way or retry_after or retyping or bad_name or ledger_failure_on_one or several_winners" -v`
 Expected: FAIL — the multi-name argument is rejected by the current
 single-winner parser with "No open raffle matches that name".
 
@@ -956,12 +956,12 @@ its own embed and returns.
 
 - [ ] **Step 4: Run the new tests**
 
-Run: `python -m pytest tests/test_items_bot.py -k "three_names or part_way or retry_after or retyping or bad_name or ledger_failure_on_one or several_winners" -v`
+Run: `./.venv/bin/python -m pytest tests/test_items_bot.py -k "three_names or part_way or retry_after or retyping or bad_name or ledger_failure_on_one or several_winners" -v`
 Expected: PASS.
 
 - [ ] **Step 5: Run the whole suite and fix the older winner tests**
 
-Run: `python -m pytest -q`
+Run: `./.venv/bin/python -m pytest -q`
 
 Two pre-existing tests assert message wording that this task changes:
 `test_winner_ticks_the_checkbox_and_closes_the_raffle` expects the title
@@ -1035,12 +1035,12 @@ recorded for that raffle.
 
 - [ ] **Step 4: Run the help test**
 
-Run: `python -m pytest tests/test_items_bot.py -k help -v`
+Run: `./.venv/bin/python -m pytest tests/test_items_bot.py -k help -v`
 Expected: PASS.
 
 - [ ] **Step 5: Run the full suite one last time**
 
-Run: `python -m pytest -q`
+Run: `./.venv/bin/python -m pytest -q`
 Expected: PASS, no skips introduced by this work.
 
 - [ ] **Step 6: Commit**
