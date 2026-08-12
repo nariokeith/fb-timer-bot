@@ -287,8 +287,9 @@ channel:
 Members enter by answering **Yes** on the poll. When it closes, `!list` turns
 the voters into IGNs and drops anyone whose checkbox for that log is already
 ticked — that checkbox is the record of who already owns what, so nobody can
-win the same special log twice. It reports three groups: eligible, already has
-it, and anyone it could not identify.
+win the same special log twice. It reports who is eligible, who already has it,
+anyone it could only identify from their last `!request` — that name may be an
+alt, so check those — and a count of anyone marked as not a roster player.
 
 Draw the winner yourself from the eligible list, then run `!winner`. The bot
 refuses a name that is not on the frozen list, refuses a second draw for the

@@ -40,9 +40,9 @@ The supervisor is only for Render, where nothing else is running.
    ignores every `!request` — it cannot see message text at all. This is the
    single most common reason a new bot "does nothing".
 
-   Without server members the bot cannot read anyone's server nickname, so
-   every voter in a special log raffle comes back as "couldn't identify" and
-   `!list` produces an empty eligible list. Both are needed.
+   Without server members the bot cannot read anyone's server nickname, so it
+   cannot identify any voter in a special log raffle and `!list` refuses to
+   freeze the pool at all. Both are needed.
 
 4. **OAuth2 → URL Generator**:
    - Scopes: **`bot`**
@@ -243,8 +243,9 @@ its state. Then, in the raffle channel, whoever holds a raffle role runs:
 
 `!list` reads everyone who answered **Yes**, converts their nickname to an IGN,
 and removes anyone already ticked for that log in the `Special Logs` tab. It
-prints eligible, already-has-it, and couldn't-identify. Draw the winner
-yourself, then run `!winner`.
+prints who is eligible, who already has it, anyone it could only identify from
+their last `!request`, and a count of anyone marked not a roster player. Draw
+the winner yourself, then run `!winner`.
 
 `!list` refuses to freeze the pool while any voter is unidentified, so a
 member the bot cannot name is never dropped from a draw without anyone
