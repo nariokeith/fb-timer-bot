@@ -111,9 +111,12 @@ A later `!bind` undoes it.
 ask an officer. Letting a member clear an officer's mark would make the
 mark meaningless.
 
-All three read the sheet roster to resolve the IGN, so each costs one
-`read_snapshot`. They are one-time-per-member commands, so the volume is
-low, but they take `_SHEET_LOCK` like every other sheet-reading command.
+`!iam` and `!bind` read the sheet roster to resolve the IGN, so each costs
+one `read_snapshot`. They are one-time-per-member commands, so the volume
+is low. `!notaplayer` names no IGN and so reads nothing.
+
+All three hold `_SHEET_LOCK` while they mutate and save state, so a
+concurrent `!list` cannot classify voters against a half-applied change.
 
 ### Permissions and channel
 
