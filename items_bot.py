@@ -1509,7 +1509,10 @@ async def itemhelp_cmd(ctx):
             "**`!winner <special log> <IGN>`** — record the draw\n"
             "**`!winner <special log> <IGN> - <IGN>`** — several winners "
             "at once\n"
-            "**`!cancelpoll <special log>`** — cancel an open poll"
+            "**`!cancelpoll <special log>`** — cancel an open poll\n"
+            "\n**`!iam <your IGN>`** — tell the bot which player you are\n"
+            "**`!bind @user <IGN>`** — officer: identify someone\n"
+            "**`!notaplayer @user`** — officer: they have no roster row"
         ),
         inline=False,
     )

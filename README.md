@@ -280,6 +280,9 @@ channel:
 | `!list <special log>` | After the poll closes, show who is eligible. Freezes that list. |
 | `!winner <special log> <IGN>` | Record the winner and tick their checkbox in the Special Logs tab. |
 | `!winner <special log> <IGN> - <IGN>` | Record several winners from one poll, for a log that dropped more than once. Names are split on a hyphen with a space on both sides, so a hyphenated IGN stays intact. |
+| `!iam <your IGN>` | Tell the bot which roster row your Discord account is. Needed once, by any member whose nickname the bot cannot match. |
+| `!bind @user <IGN>` | Officer: identify someone else, overriding their nickname and any earlier claim on that IGN. |
+| `!notaplayer @user` | Officer: record that this account has no roster row, so it stops blocking raffles. Undone by `!bind`. |
 
 Members enter by answering **Yes** on the poll. When it closes, `!list` turns
 the voters into IGNs and drops anyone whose checkbox for that log is already
@@ -299,10 +302,15 @@ re-run for the rest. One case is different: when the checkbox was ticked but its
 you the row to paste in by hand — re-running would skip the name and the row
 would be lost.
 
-**Nicknames must contain the IGN.** The bot reads each voter's server nickname
-and strips the guild tag, so `BK | Jjew`, `M2 - Jjew`, `BK Jjew` and a bare
-`Jjew` all resolve to the sheet row `Jjew`. A nickname that does not contain
-the IGN cannot be resolved and is listed for an officer to handle by hand.
+**Every voter must be identifiable.** The bot matches each voter's server
+nickname against the sheet, stripping the guild tag, so `BK | Jjew`,
+`M2 - Jjew`, `BK Jjew` and a bare `Jjew` all reach the same row. When a
+nickname does not match, it falls back to the IGN that account last used with
+`!request`, and shows you which voters it resolved that way.
+
+If it still cannot name someone, `!list` **refuses to freeze the pool** and
+names them. Nobody who voted is ever silently left out of a draw. Fix it with
+`!iam`, `!bind` or `!notaplayer`, then run `!list` again.
 
 ### Setup
 
