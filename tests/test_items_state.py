@@ -680,3 +680,74 @@ def test_a_reasonable_number_of_raffle_roles_still_fits():
 
     assert items_state.fits(state)
     assert items_state.decode_shards(items_state.encode_state(state)).raffle_role_ids == state.raffle_role_ids
+
+
+def _session():
+    return items_state.RaffleSession(
+        items=("Asta's Heart", "Amentis Foot", "Benji's Heart"),
+        position=1,
+        results=(("Asta's Heart", ("Kobe",)),),
+        skipped=(),
+    )
+
+
+def test_session_reports_the_current_item():
+    assert _session().current_item == "Amentis Foot"
+
+
+def test_a_finished_session_has_no_current_item():
+    session = items_state.RaffleSession(items=("Asta's Heart",), position=1)
+
+    assert session.finished is True
+    assert session.current_item is None
+
+
+def test_session_winners_are_flattened_from_the_results():
+    session = items_state.RaffleSession(
+        items=("A", "B"),
+        position=2,
+        results=(("A", ("Kobe", "Jjew")), ("B", ("wile-KAMOTE",))),
+    )
+
+    assert session.winners == ("Kobe", "Jjew", "wile-KAMOTE")
+
+
+def test_a_session_survives_a_round_trip_through_the_pin():
+    state = items_state.State(officer_channel_id=1, raffle_session=_session())
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert restored.raffle_session == _session()
+
+
+def test_a_pin_written_before_sessions_existed_loads_as_no_session():
+    state = items_state.State(officer_channel_id=1)
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert restored.raffle_session is None
+
+
+def test_a_session_is_counted_by_fits():
+    """A sitting that cannot be persisted must be refused at !startraffle."""
+    huge = items_state.RaffleSession(items=tuple(f"Log {n}" * 200 for n in range(400)))
+    state = items_state.State(officer_channel_id=1, raffle_session=huge)
+
+    assert items_state.fits(state) is False
+
+
+def test_a_pin_whose_session_is_not_an_object_decodes_as_no_session():
+    """decode_state must return None or a Shard, never raise.
+
+    A hand-edited pin is the realistic source of this, and a raise here
+    would take restart recovery down with it.
+    """
+    content = (
+        f"{items_state.STATE_MARKER}\n```json\n"
+        '{"part":0,"total":1,"raffle_session":"oops"}\n```'
+    )
+
+    shard = items_state.decode_state(content)
+
+    assert shard is not None
+    assert shard.state.raffle_session is None

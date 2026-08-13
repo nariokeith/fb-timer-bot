@@ -141,6 +141,61 @@ class Raffle:
         )
 
 
+@dataclass(frozen=True)
+class RaffleSession:
+    """One sitting: every closed poll drawn in turn, nobody winning twice.
+
+    `winners` is derived from `results` rather than stored beside it, so
+    the list a later pool is filtered against and the list the closing
+    summary prints can never drift apart.
+
+    `skipped` is stored rather than inferred from "in items but not in
+    results", because a raffle can leave state between the skip and the
+    summary -- !poll evicts a drawn raffle to make room -- and a summary
+    that silently forgot a log would be worse than one that repeats it.
+    """
+
+    items: tuple[str, ...] = ()
+    position: int = 0
+    results: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    skipped: tuple[str, ...] = ()
+
+    @property
+    def finished(self) -> bool:
+        return self.position >= len(self.items)
+
+    @property
+    def current_item(self) -> str | None:
+        return None if self.finished else self.items[self.position]
+
+    @property
+    def winners(self) -> tuple[str, ...]:
+        return tuple(ign for _, igns in self.results for ign in igns)
+
+    def to_dict(self) -> dict:
+        return {
+            "items": list(self.items),
+            "position": self.position,
+            "results": [
+                {"item": item, "winners": list(igns)} for item, igns in self.results
+            ],
+            "skipped": list(self.skipped),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "RaffleSession":
+        results = tuple(
+            (str(entry["item"]), tuple(str(n) for n in entry.get("winners", [])))
+            for entry in raw.get("results", [])
+        )
+        return cls(
+            items=tuple(str(name) for name in raw.get("items", [])),
+            position=int(raw.get("position", 0)),
+            results=results,
+            skipped=tuple(str(name) for name in raw.get("skipped", [])),
+        )
+
+
 @dataclass
 class State:
     officer_channel_id: int | None = None
@@ -166,6 +221,10 @@ class State:
     raffle_role_ids: list[int] = field(default_factory=list)
     raffle_channel_id: int | None = None
     raffles: list["Raffle"] = field(default_factory=list)
+    # The sitting currently being drawn, or None. Persisted because the
+    # free tier restarts: a session held in memory would take the
+    # "already won" list with it and quietly re-admit an excluded player.
+    raffle_session: "RaffleSession | None" = None
     # A partial pin read can still restore requests, but the bot needs to
     # warn officers that it could not recover the complete queue.
     missing_parts: tuple[int, ...] = ()
@@ -213,6 +272,8 @@ def _encode_with_total(state: State, total: int) -> list[str]:
         first_payload["raffle_role_ids"] = list(state.raffle_role_ids)
     if state.not_players:
         first_payload["not_players"] = list(state.not_players)
+    if state.raffle_session is not None:
+        first_payload["raffle_session"] = state.raffle_session.to_dict()
     first_payload["raffles"] = []
     payloads = [first_payload]
 
@@ -347,6 +408,17 @@ def decode_state(content: str) -> Shard | None:
         }
         not_players = [str(u) for u in payload.get("not_players", [])]
         raffles = [Raffle.from_dict(r) for r in payload.get("raffles", [])]
+        session_payload = payload.get("raffle_session")
+        # isinstance, not "is not None": a corrupt pin holding a string
+        # here would make from_dict raise AttributeError, which the
+        # except below does not catch, and decode_state is contracted to
+        # return None on a bad message rather than take restart recovery
+        # down with it.
+        raffle_session = (
+            RaffleSession.from_dict(session_payload)
+            if isinstance(session_payload, dict)
+            else None
+        )
         raffle_channel_id = payload.get("raffle_channel_id")
         raffle_channel_id = (
             int(raffle_channel_id) if raffle_channel_id is not None else None
@@ -372,6 +444,7 @@ def decode_state(content: str) -> Shard | None:
             raffle_role_ids=raffle_role_ids,
             raffle_channel_id=raffle_channel_id,
             raffles=raffles,
+            raffle_session=raffle_session,
         ),
     )
 
@@ -428,6 +501,14 @@ def decode_shards(contents: list[str]) -> State | None:
         ),
         [],
     )
+    raffle_session = next(
+        (
+            shard.state.raffle_session
+            for shard in shards
+            if shard.state.raffle_session is not None
+        ),
+        None,
+    )
     igns: dict[str, str] = {}
     bindings: dict[str, str] = {}
     not_players: list[str] = []
@@ -453,6 +534,7 @@ def decode_shards(contents: list[str]) -> State | None:
         raffle_role_ids=raffle_role_ids,
         raffle_channel_id=raffle_channel_id,
         raffles=raffles,
+        raffle_session=raffle_session,
         missing_parts=missing_parts,
     )
 
