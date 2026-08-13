@@ -82,11 +82,11 @@ class Raffle:
 
     `listed` cannot be inferred from `eligible`: a raffle where nobody
     was eligible is a real outcome, and it must stay distinguishable
-    from one that has not been listed yet -- otherwise !winner would
-    tell an officer to run !list again forever.
+    from one that has not been listed yet -- otherwise the raffle session
+    would tell an officer to retry the same poll forever.
 
     `drawn` cannot be inferred from `winners` for the same shape of
-    reason. A !winner command whose sheet write failed part way through
+    reason. A `!won` command whose sheet write failed part way through
     leaves some names recorded and the draw unfinished, and that must
     stay distinguishable from a draw that completed.
     """
@@ -214,7 +214,7 @@ class State:
     # Discord ids known to have no roster row at all -- guests and former
     # members. Without this they would block every raffle freeze forever.
     not_players: list[str] = field(default_factory=list)
-    # Roles permitted to run !poll / !list / !winner, and the one channel
+    # Roles permitted to run the raffle commands, and the one channel
     # they work in. Unlike !distribute -- which is authorised by the
     # officer channel itself -- the raffle happens in a member-visible
     # channel, so the channel cannot also be the permission.
@@ -621,7 +621,7 @@ def evict_for_new_raffle(state: State, now: str) -> bool:
     Only a raffle that has been DRAWN may be dropped -- `now` is unused
     and kept for callers, because a poll's clock is not what makes a
     raffle finished. An ended-but-undrawn raffle still holds the frozen
-    eligible pool that !winner checks against, and it is the only copy:
+    eligible pool that `!won` checks against, and it is the only copy:
     the poll message may be gone, and Discord will not recompute it.
     Dropping one to make room would destroy the record of who was
     eligible without anyone being told.

@@ -58,6 +58,32 @@ def test_split_igns_refuses_the_same_player_twice():
         items_raffle.split_igns("Jjew - jjew", ROSTER)
 
 
+def test_split_igns_tolerates_extra_spaces_around_the_dash():
+    assert items_raffle.split_igns("Jjew   -   Kobe", ROSTER) == ["Jjew", "Kobe"]
+
+
+def test_split_igns_resolves_an_alias_in_a_later_position():
+    assert items_raffle.split_igns("Jjew - KobePH", ROSTER) == ["Jjew", "Kobe"]
+
+
+def test_split_igns_counts_an_alias_colliding_with_a_real_name_as_a_duplicate():
+    """Two spellings of one row is still one player winning twice."""
+    with pytest.raises(items_raffle.RaffleArgumentError, match="more than once"):
+        items_raffle.split_igns("Kobe - KobePH", ROSTER)
+
+
+def test_split_igns_does_not_read_a_name_ending_in_a_hyphen_as_a_dangling_dash():
+    """Only a hyphen with whitespace BEFORE it is a dangling separator."""
+    roster = ["Jjew", "Kobe", "KAMOTE-"]
+
+    assert items_raffle.split_igns("Kobe - KAMOTE-", roster) == ["Kobe", "KAMOTE-"]
+
+
+def test_split_igns_refuses_an_unknown_name_in_a_later_position_by_name():
+    with pytest.raises(items_raffle.RaffleArgumentError, match="Nobody"):
+        items_raffle.split_igns("Jjew - Nobody", ROSTER)
+
+
 @pytest.mark.parametrize(
     "nickname",
     ["Jjew", "BK | Jjew", "M2 | Jjew", "BK Jjew", "BK - Jjew", "  BK|Jjew  "],
@@ -71,8 +97,6 @@ def test_a_multi_word_ign_survives_tag_stripping():
         items_raffle.resolve_voter("M2 - chinchong ni Mumu", ROSTER)
         == "chinchong ni Mumu"
     )
-
-
 def test_an_ign_containing_a_hyphen_is_not_split_apart():
     """The remainder is a slice of the original string, not re-joined tokens.
 
@@ -249,107 +273,6 @@ def test_a_poll_argument_that_is_only_a_flag_is_refused():
         items_raffle.parse_poll_argument("--hours 48")
 
 
-def test_winner_splits_a_multi_word_item_from_a_multi_word_ign():
-    item, ign = items_raffle.split_item_and_ign(
-        "Asta's Heart chinchong ni Mumu", ["Asta's Heart"], ROSTER
-    )
-
-    assert (item, ign) == ("Asta's Heart", "chinchong ni Mumu")
-
-
-def test_winner_resolves_the_ign_through_an_alias():
-    item, ign = items_raffle.split_item_and_ign(
-        "Asta's Heart KobePH", ["Asta's Heart"], ROSTER
-    )
-
-    assert (item, ign) == ("Asta's Heart", "Kobe")
-
-
-def test_winner_refuses_an_unknown_item():
-    with pytest.raises(items_raffle.RaffleArgumentError, match="No open raffle"):
-        items_raffle.split_item_and_ign("Benji's Heart Jjew", ["Asta's Heart"], ROSTER)
-
-
-def test_winner_refuses_an_unknown_player():
-    with pytest.raises(items_raffle.RaffleArgumentError, match="No player named"):
-        items_raffle.split_item_and_ign(
-            "Asta's Heart Nobody", ["Asta's Heart"], ROSTER
-        )
-
-
-def test_winner_refuses_a_single_word_argument():
-    with pytest.raises(items_raffle.RaffleArgumentError, match="Usage"):
-        items_raffle.split_item_and_ign("Asta's", ["Asta's Heart"], ROSTER)
-
-
-def test_winner_refuses_an_argument_that_reads_two_ways():
-    """'Kobe' is both a raffle name and a player here. Refuse, don't pick."""
-    with pytest.raises(items_raffle.RaffleArgumentError, match="more than one way"):
-        items_raffle.split_item_and_ign("Kobe Kobe Jjew", ["Kobe", "Kobe Kobe"], ROSTER + ["Kobe Jjew"])
-
-
-ITEMS = ["Asta's Heart", "Amentis Foot"]
-
-
-def test_one_winner_still_parses_with_no_dash():
-    assert items_raffle.split_item_and_igns("Asta's Heart Jjew", ITEMS, ROSTER) == (
-        "Asta's Heart",
-        ["Jjew"],
-    )
-
-
-def test_the_item_may_run_into_the_first_winner():
-    assert items_raffle.split_item_and_igns(
-        "Amentis Foot Jjew - Kobe - Ryuu", ITEMS, ROSTER
-    ) == ("Amentis Foot", ["Jjew", "Kobe", "Ryuu"])
-
-
-def test_the_item_may_be_followed_by_its_own_dash():
-    assert items_raffle.split_item_and_igns(
-        "Amentis Foot - Jjew - Kobe", ITEMS, ROSTER
-    ) == ("Amentis Foot", ["Jjew", "Kobe"])
-
-
-def test_a_hyphenated_ign_is_not_split_into_two_winners():
-    """'wile-KAMOTE' has no space around its hyphen, so it is one name."""
-    assert items_raffle.split_item_and_igns(
-        "Amentis Foot wile-KAMOTE - Kobe", ITEMS, ROSTER
-    ) == ("Amentis Foot", ["wile-KAMOTE", "Kobe"])
-
-
-def test_a_multi_word_ign_survives_the_split():
-    assert items_raffle.split_item_and_igns(
-        "Amentis Foot chinchong ni Mumu - Kobe", ITEMS, ROSTER
-    ) == ("Amentis Foot", ["chinchong ni Mumu", "Kobe"])
-
-
-def test_extra_spaces_around_the_dash_are_tolerated():
-    assert items_raffle.split_item_and_igns(
-        "Amentis Foot Jjew   -   Kobe", ITEMS, ROSTER
-    ) == ("Amentis Foot", ["Jjew", "Kobe"])
-
-
-def test_an_alias_resolves_in_a_later_position():
-    assert items_raffle.split_item_and_igns(
-        "Amentis Foot Jjew - KobePH", ITEMS, ROSTER
-    ) == ("Amentis Foot", ["Jjew", "Kobe"])
-
-
-def test_the_same_player_twice_is_refused():
-    with pytest.raises(items_raffle.RaffleArgumentError, match="more than once"):
-        items_raffle.split_item_and_igns("Amentis Foot Jjew - Jjew", ITEMS, ROSTER)
-
-
-def test_an_alias_colliding_with_a_real_name_counts_as_a_duplicate():
-    with pytest.raises(items_raffle.RaffleArgumentError, match="more than once"):
-        items_raffle.split_item_and_igns("Amentis Foot Kobe - KobePH", ITEMS, ROSTER)
-
-
-def test_a_trailing_dash_is_refused():
-    with pytest.raises(items_raffle.RaffleArgumentError, match="empty"):
-        items_raffle.split_item_and_igns("Amentis Foot Jjew - ", ITEMS, ROSTER)
-
-
 def _identities(bindings=None, not_players=(), request_igns=None):
     return items_raffle.Identities(
         bindings=bindings or {},
@@ -490,22 +413,3 @@ def test_a_duplicate_across_two_accounts_is_still_collapsed():
     )
 
     assert split.eligible == ["Jjew"]
-
-
-def test_a_winner_whose_name_ends_in_a_hyphen_is_not_read_as_a_dangling_dash():
-    """Only a hyphen with whitespace before it is a dangling separator."""
-    roster = ["Jjew", "Kobe", "KAMOTE-"]
-
-    assert items_raffle.split_item_and_igns(
-        "Amentis Foot Kobe - KAMOTE-", ["Amentis Foot"], roster
-    ) == ("Amentis Foot", ["Kobe", "KAMOTE-"])
-
-
-def test_an_unknown_name_in_a_later_position_is_refused_by_name():
-    with pytest.raises(items_raffle.RaffleArgumentError, match="Nobody"):
-        items_raffle.split_item_and_igns("Amentis Foot Jjew - Nobody", ITEMS, ROSTER)
-
-
-def test_an_item_with_no_winner_at_all_is_refused():
-    with pytest.raises(items_raffle.RaffleArgumentError, match="Which player"):
-        items_raffle.split_item_and_igns("Amentis Foot", ITEMS, ROSTER)

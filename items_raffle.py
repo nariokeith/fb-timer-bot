@@ -237,10 +237,6 @@ MAX_POLL_HOURS = 168
 HOURS_FLAG = "--hours"
 
 POLL_USAGE = "Usage: `!poll <special log name> [--hours N]`"
-WINNER_USAGE = (
-    "Usage: `!winner <special log name> <IGN>`, or "
-    "`!winner <special log name> <IGN> - <IGN> - <IGN>` for several winners."
-)
 
 
 class RaffleArgumentError(RuntimeError):
@@ -290,129 +286,10 @@ def parse_poll_argument(argument: str) -> PollArgument:
     return PollArgument(item_query=item_query, hours=hours)
 
 
-def split_item_and_ign(
-    argument: str, item_names: list[str], roster: list[str]
-) -> tuple[str, str]:
-    """Split '<item name> <IGN>' where BOTH parts may contain spaces.
-
-    Every split point is tried; a reading is accepted only when the
-    prefix names one of `item_names` and the suffix resolves to a roster
-    row. Two valid readings is a refusal, not a coin toss -- the write
-    this feeds is a permanent checkbox.
-
-    Ascending split index tries the LONGEST IGN first, which is what
-    lets 'chinchong ni Mumu' win over a shorter player name inside it.
-    """
-    words = argument.split()
-    if len(words) < 2:
-        raise RaffleArgumentError(WINNER_USAGE)
-
-    index = {normalize(name): name for name in item_names}
-    readings: list[tuple[str, str]] = []
-    saw_known_ign = False
-
-    for i in range(1, len(words)):
-        candidate_ign = " ".join(words[i:])
-        try:
-            player = items_rules.resolve_ign(candidate_ign, roster)
-        except items_rules.RequestParseError as exc:
-            raise RaffleArgumentError(str(exc)) from None
-        if player is None:
-            continue
-        saw_known_ign = True
-        item = index.get(normalize(" ".join(words[:i])))
-        if item is not None:
-            readings.append((item, player))
-
-    if len(readings) == 1:
-        return readings[0]
-    if len(readings) > 1:
-        spelled = "; ".join(f"{item!r} for {ign!r}" for item, ign in readings)
-        raise RaffleArgumentError(
-            f"That could be read more than one way ({spelled}). Refusing to guess."
-        )
-    if saw_known_ign:
-        suggestions = get_close_matches(argument, item_names, n=3, cutoff=0.5)
-        hint = f" Open raffles: {', '.join(suggestions)}." if suggestions else ""
-        raise RaffleArgumentError(
-            f"No open raffle matches that name.{hint} {WINNER_USAGE}"
-        )
-
-    tail = words[-1]
-    suggestions = get_close_matches(tail, roster, n=3, cutoff=0.6)
-    hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-    raise RaffleArgumentError(
-        f"No player named {tail!r} in the sheet.{hint} The IGN goes last: "
-        f"{WINNER_USAGE}"
-    )
-
-
 # A hyphen only separates winners when it has whitespace on BOTH sides.
 # 'wile-KAMOTE' is a roster row, so a bare hyphen cannot be the delimiter.
 WINNER_SPLIT = re.compile(r"\s+-\s+")
 DANGLING_SEPARATOR = re.compile(r"\s-\s*$")
-
-
-def split_item_and_igns(
-    argument: str, item_names: list[str], roster: list[str]
-) -> tuple[str, list[str]]:
-    """Split '<item> <IGN> - <IGN> - ...' into the item and its winners.
-
-    The item may run into the first name or be followed by its own dash;
-    officers type both. The two readings cannot collide, because the
-    first is only taken when the leading chunk is EXACTLY a raffle name.
-
-    Every name is resolved before this returns, so a typo is refused
-    before any checkbox is ticked rather than half way through.
-    """
-    chunks = WINNER_SPLIT.split(argument.strip())
-    # A separator needs whitespace on both sides, so only a hyphen with
-    # whitespace BEFORE it is a dangling one. Testing the last character
-    # alone would reject a roster name that simply ends in a hyphen.
-    if DANGLING_SEPARATOR.search(argument) or any(
-        not chunk.strip() for chunk in chunks
-    ):
-        raise RaffleArgumentError(
-            f"There is an empty name between two dashes. {WINNER_USAGE}"
-        )
-    chunks = [chunk.strip() for chunk in chunks]
-
-    index = {normalize(name): name for name in item_names}
-    head = index.get(normalize(chunks[0]))
-    if head is not None and len(chunks) == 1:
-        raise RaffleArgumentError(f"Which player won **{head}**? {WINNER_USAGE}")
-
-    if head is not None:
-        item, igns = head, []
-    else:
-        item, first = split_item_and_ign(chunks[0], item_names, roster)
-        igns = [first]
-
-    for chunk in chunks[1:]:
-        try:
-            player = items_rules.resolve_ign(chunk, roster)
-        except items_rules.RequestParseError as exc:
-            raise RaffleArgumentError(str(exc)) from None
-        if player is None:
-            suggestions = get_close_matches(chunk, roster, n=3, cutoff=0.6)
-            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-            raise RaffleArgumentError(
-                f"No player named {chunk!r} in the sheet.{hint} {WINNER_USAGE}"
-            )
-        igns.append(player)
-
-    # Aliases mean two different chunks can name one roster row, and a
-    # repeat is always a miscount -- a player cannot win the same log
-    # twice.
-    counts = Counter(normalize(ign) for ign in igns)
-    repeated = sorted({ign for ign in igns if counts[normalize(ign)] > 1})
-    if repeated:
-        raise RaffleArgumentError(
-            f"{', '.join(repeated)} is named more than once. "
-            "Each winner may only be listed once."
-        )
-
-    return item, igns
 
 
 WON_USAGE = (
@@ -425,7 +302,7 @@ def split_igns(argument: str, roster: list[str]) -> list[str]:
     """The winners named in a `!won` argument, in roster spelling.
 
     The session supplies the log, so this parses names only -- none of
-    the item/IGN boundary guessing `!winner` needed.
+    the item/IGN boundary guessing the old item-plus-name command needed.
 
     Every name is resolved before this returns, so a typo in the third
     name is refused before any checkbox is ticked rather than half way

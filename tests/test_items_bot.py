@@ -2398,77 +2398,6 @@ def _open_raffle(channel, item="Asta's Heart", ends="2099-01-01 00:00:00", **kwa
     return raffle, message
 
 
-def test_list_refuses_while_the_poll_is_still_open(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel)  # ends_at defaults to 2099, so the poll is live
-
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
-
-    assert ctx.sent[-1]["embed"].title == "❌ Poll still open"
-    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").listed is False
-
-
-def test_list_refuses_to_freeze_while_a_voter_is_unresolved(monkeypatch):
-    """A voter nobody can name must not be silently dropped from the pool."""
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch, roster=("Jjew",))
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, ends="2026-08-09 10:00:00")
-    monkeypatch.setattr(
-        items_bot, "poll_voters",
-        _fake_poll_voters([(1, "BK | Jjew"), (2, "xXshadowXx")]),
-    )
-
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
-
-    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
-    assert raffle.listed is False, "the pool must NOT be frozen"
-    assert raffle.eligible == ()
-    description = ctx.sent[-1]["embed"].description
-    assert "<@2>" in description
-    assert "xXshadowXx" in description
-    assert "!iam" in description
-
-
-def test_list_freezes_once_the_unresolved_voter_is_bound(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
-    items_bot._STATE.bindings["2"] = "Kobe"
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, ends="2026-08-09 10:00:00")
-    monkeypatch.setattr(
-        items_bot, "poll_voters",
-        _fake_poll_voters([(1, "BK | Jjew"), (2, "xXshadowXx")]),
-    )
-
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
-
-    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
-    assert raffle.listed is True
-    assert raffle.eligible == ("Jjew", "Kobe")
-
-
-def test_list_freezes_when_the_only_stranger_is_marked_not_a_player(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch, roster=("Jjew",))
-    items_bot._STATE.not_players.append("2")
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, ends="2026-08-09 10:00:00")
-    monkeypatch.setattr(
-        items_bot, "poll_voters",
-        _fake_poll_voters([(1, "BK | Jjew"), (2, "a guest")]),
-    )
-
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
-
-    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
-    assert raffle.listed is True
-    assert raffle.eligible == ("Jjew",)
-    assert "1 voter skipped" in ctx.sent[-1]["embed"].description
-
-
 def test_render_pool_shows_the_request_fallback_group():
     voter = items_raffle.Voter(user_id=3, display_name="xXshadowXx")
     split = items_raffle.VoterSplit(
@@ -2633,29 +2562,7 @@ def test_render_pool_names_who_won_earlier_in_the_session():
     assert "Won earlier this session" in description
 
 
-def test_list_splits_the_voters_and_freezes_the_pool(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch, roster=("Jjew", "Kobe"), holds=("Kobe",))
-    items_bot._STATE.not_players.append("3")
-    ctx, channel = _raffle_ctx()
-    answer = FakePollAnswer(
-        "Yes",
-        [FakeVoter(1, "BK | Jjew"), FakeVoter(2, "M2 | Kobe"), FakeVoter(3, "Stranger")],
-    )
-    _open_raffle(channel, ends="2026-08-09 10:00:00", poll=FakePoll(answers=[answer]))
-
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
-
-    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
-    assert raffle.listed is True
-    assert raffle.eligible == ("Jjew",)
-    description = ctx.sent[-1]["embed"].description
-    assert "Jjew" in description
-    assert "Kobe" in description
-    assert "1 voter skipped" in description
-
-
-def test_listing_twice_replays_the_frozen_pool(monkeypatch):
+def test_startraffle_replays_the_frozen_pool(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch)
     ctx, channel = _raffle_ctx()
@@ -2664,35 +2571,31 @@ def test_listing_twice_replays_the_frozen_pool(monkeypatch):
     )
     channel._pins[-1].poll = FakePoll(answers=[FakePollAnswer("Yes", [FakeVoter(9, "Kobe")])])
 
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
 
     assert "Jjew" in ctx.sent[-1]["embed"].description
     assert "Kobe" not in ctx.sent[-1]["embed"].description
 
 
-def test_list_refuses_an_unknown_raffle(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, _ = _raffle_ctx()
-
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Benji's Heart"))
-
-    assert "No raffle" in ctx.sent[-1]["embed"].description
-
-
-def test_list_refuses_when_the_poll_message_is_gone(monkeypatch):
+def test_startraffle_refuses_when_the_poll_message_is_gone(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch)
     ctx, channel = _raffle_ctx()
     _, message = _open_raffle(channel, ends="2026-08-09 10:00:00")
     message.deleted = True
 
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
 
     assert "poll message" in ctx.sent[-1]["embed"].description
 
 
-def test_a_deleted_poll_message_does_not_matter_once_listed(monkeypatch):
+def test_startraffle_reuses_the_frozen_pool_after_poll_deletion(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch)
     ctx, channel = _raffle_ctx()
@@ -2701,108 +2604,12 @@ def test_a_deleted_poll_message_does_not_matter_once_listed(monkeypatch):
     )
     message.deleted = True
 
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
 
     assert "Jjew" in ctx.sent[-1]["embed"].description
-
-
-def test_list_shows_the_winner_once_drawn(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(
-        channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True,
-        winners=("Jjew",), drawn=True
-    )
-
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
-
-    assert "Winner" in ctx.sent[-1]["embed"].description
-
-
-def test_winner_ticks_the_checkbox_and_closes_the_raffle(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe"), listed=True)
-    calls = {}
-
-    def _commit(spreadsheet, **kwargs):
-        calls.update(kwargs)
-        return "C4"
-
-    monkeypatch.setattr(items_sheet, "commit_approval", _commit)
-
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
-
-    assert calls["ign"] == "Jjew"
-    assert calls["item"] == "Asta's Heart"
-    assert calls["item_type"] == items_rules.SPECIAL
-    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ("Jjew",)
-    assert ctx.sent[-1]["embed"].title == "✅ Winner recorded"
-
-
-def test_winner_refuses_a_player_not_on_the_frozen_list(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
-    monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: pytest.fail("wrote"))
-
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Kobe"))
-
-    assert "not on the eligible list" in ctx.sent[-1]["embed"].description
-    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ()
-
-
-def test_winner_refuses_before_list_has_been_run(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, ends="2026-08-09 10:00:00")
-    monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: pytest.fail("wrote"))
-
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
-
-    assert "!list" in ctx.sent[-1]["embed"].description
-
-
-def test_winner_refuses_while_the_poll_is_open(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, eligible=("Jjew",), listed=True)
-    monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: pytest.fail("wrote"))
-
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
-
-    assert ctx.sent[-1]["embed"].title == "❌ Poll still open"
-
-
-def test_winner_refuses_a_second_draw(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(
-        channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe"),
-        listed=True, winners=("Kobe",), drawn=True,
-    )
-    monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: pytest.fail("wrote"))
-
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
-
-    assert "already been drawn" in ctx.sent[-1]["embed"].description
-
-
-def test_winner_refuses_an_unknown_raffle(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
-
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Benji's Heart Jjew"))
-
-    assert "No open raffle" in ctx.sent[-1]["embed"].description
 
 
 def test_cancelpoll_ends_and_deletes_an_open_poll(monkeypatch):
@@ -2905,43 +2712,6 @@ def test_cancelpoll_keeps_state_when_ending_the_poll_fails(monkeypatch):
     assert "Nothing was cancelled" in ctx.sent[-1]["embed"].description
 
 
-def test_a_failed_sheet_write_leaves_the_raffle_open(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
-
-    def _boom(spreadsheet, **kwargs):
-        raise RuntimeError("Sheets is down")
-
-    monkeypatch.setattr(items_sheet, "commit_approval", _boom)
-
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
-
-    assert "Sheets is down" in ctx.sent[-1]["embed"].description
-    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ()
-
-
-def test_a_ledger_failure_closes_the_raffle_and_hands_over_the_row(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch)
-    ctx, channel = _raffle_ctx()
-    _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
-    row = ["2026-08-09 12:00:00", "Jjew", "Asta's Heart", "Special", "Keith", "1", "abc"]
-
-    def _ledger_failure(spreadsheet, **kwargs):
-        raise items_sheet.LedgerWriteError("C4", row, RuntimeError("append failed"))
-
-    monkeypatch.setattr(items_sheet, "commit_approval", _ledger_failure)
-
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
-
-    description = ctx.sent[-1]["embed"].description
-    assert "C4" in description
-    assert "Jjew" in description
-    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ("Jjew",)
-
-
 def test_help_says_request_is_gear_only_and_lists_the_raffle_commands():
     ctx = FakeCtx(FakeChannel(1))
 
@@ -2949,7 +2719,10 @@ def test_help_says_request_is_gear_only_and_lists_the_raffle_commands():
 
     text = str(ctx.sent[-1]["embed"].to_dict())
     assert "gear" in text.casefold()
-    for command in ("!poll", "!list", "!winner", "!cancelpoll", "!setraffleroles", "!setrafflechannel"):
+    for command in (
+        "!poll", "!startraffle", "!won", "!skipraffle", "!cancelpoll",
+        "!setraffleroles", "!setrafflechannel",
+    ):
         assert command in text
 
 
@@ -3031,7 +2804,7 @@ def test_a_failed_poll_post_does_not_consume_the_evicted_slot(monkeypatch):
     assert ctx.sent[-1]["embed"].title == "❌ Could not post the poll"
 
 
-def test_list_refuses_to_freeze_a_pool_it_could_never_save(monkeypatch):
+def test_startraffle_refuses_to_freeze_a_pool_it_could_never_save(monkeypatch):
     """An unsaveable freeze poisons every later save, not just this one.
 
     save_state gives up when encode_state raises, so an in-memory pool
@@ -3047,7 +2820,7 @@ def test_list_refuses_to_freeze_a_pool_it_could_never_save(monkeypatch):
         "Yes", [FakeVoter(n, name) for n, name in enumerate(roster)]
     )])
 
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
 
     unchanged = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
     assert unchanged.listed is False
@@ -3056,21 +2829,14 @@ def test_list_refuses_to_freeze_a_pool_it_could_never_save(monkeypatch):
     assert "too large" in ctx.sent[-1]["embed"].description.casefold()
 
 
-def test_two_officers_listing_the_same_raffle_at_once(monkeypatch):
-    """list_cmd resolves the raffle BEFORE taking the sheet lock.
-
-    The second caller therefore holds a stale Raffle object that has
-    already been swapped out of state. Re-finding it under the lock is
-    what keeps replace_raffle from raising 'x not in list'.
-    """
+def test_two_officers_starting_the_same_raffle_at_once(monkeypatch):
+    """Concurrent session starts freeze one poll without replacing its state."""
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch, roster=("Jjew",))
     ctx, channel = _raffle_ctx()
     _, message = _open_raffle(channel, ends="2026-08-09 10:00:00")
     message.poll = FakePoll(answers=[FakePollAnswer("Yes", [FakeVoter(1, "BK | Jjew")])])
 
-    # The fakes never suspend, so without a real yield point the two
-    # calls would simply run one after the other and prove nothing.
     original_fetch = channel.fetch_message
 
     async def slow_fetch(message_id):
@@ -3081,8 +2847,8 @@ def test_two_officers_listing_the_same_raffle_at_once(monkeypatch):
 
     async def both():
         await asyncio.gather(
-            items_bot.list_cmd.callback(ctx, argument="Asta's Heart"),
-            items_bot.list_cmd.callback(ctx, argument="Asta's Heart"),
+            items_bot.startraffle_cmd.callback(ctx),
+            items_bot.startraffle_cmd.callback(ctx),
         )
 
     asyncio.run(both())
@@ -3093,16 +2859,15 @@ def test_two_officers_listing_the_same_raffle_at_once(monkeypatch):
     assert len(items_bot._STATE.raffles) == 1
 
 
-def test_two_officers_drawing_the_same_raffle_tick_the_box_once(monkeypatch):
-    """The unrecoverable case: a checkbox must never be ticked twice.
-
-    winner_cmd resolves the raffle INSIDE _SHEET_LOCK, so the second
-    officer sees the winner already recorded and is refused.
-    """
+def test_two_officers_winning_the_same_raffle_tick_the_box_once(monkeypatch):
+    """The session lock prevents concurrent `!won` calls from double-writing."""
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch, roster=("Jjew",))
     ctx, channel = _raffle_ctx()
     _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
 
     writes = []
 
@@ -3112,8 +2877,6 @@ def test_two_officers_drawing_the_same_raffle_tick_the_box_once(monkeypatch):
 
     monkeypatch.setattr(items_sheet, "commit_approval", commit)
 
-    # A real suspension point inside the sheet write, so the two calls
-    # genuinely interleave rather than running back to back.
     real_to_thread = asyncio.to_thread
 
     async def slow_to_thread(func, *args, **kwargs):
@@ -3124,15 +2887,40 @@ def test_two_officers_drawing_the_same_raffle_tick_the_box_once(monkeypatch):
 
     async def both():
         await asyncio.gather(
-            items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"),
-            items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"),
+            items_bot.won_cmd.callback(ctx, argument="Jjew"),
+            items_bot.won_cmd.callback(ctx, argument="Jjew"),
         )
 
     asyncio.run(both())
 
     assert writes == ["Jjew"], f"checkbox written {len(writes)} times"
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ("Jjew",)
-    assert "already been drawn" in ctx.sent[-1]["embed"].description
+
+
+def test_a_refused_poll_keeps_the_superseded_raffle_drawable(monkeypatch):
+    """A failed replacement leaves the old frozen raffle usable by a session."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    channel = PollRejectingChannel(42)
+    _register_channel(channel)
+    _open_raffle(
+        channel, ends="2020-01-01 00:00:00", eligible=("Jjew",), listed=True
+    )
+    ctx = FakeCtx(channel)
+    ctx.author = FakeMember(roles=[FakeRole(10)])
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart") is not None
+
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+    assert "Jjew" in ctx.sent[-1]["embed"].description
+
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda spreadsheet, **kw: "B2")
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Jjew"))
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ("Jjew",)
 
 
 def test_no_command_is_defined_after_the_main_guard():
@@ -3173,12 +2961,14 @@ def test_no_command_is_defined_after_the_main_guard():
 
 def test_every_raffle_command_is_registered_on_the_bot():
     registered = {c.name for c in items_bot.bot.commands}
-    for name in ("poll", "list", "winner", "cancelpoll", "iam", "bind",
-                 "notaplayer", "setraffleroles", "setrafflechannel"):
+    for name in (
+        "poll", "cancelpoll", "startraffle", "won", "skipraffle", "iam",
+        "bind", "notaplayer", "setraffleroles", "setrafflechannel",
+    ):
         assert name in registered, f"!{name} is not registered"
 
 
-def test_list_reads_the_poll_from_the_raffles_own_channel(monkeypatch):
+def test_startraffle_reads_the_poll_from_the_raffles_own_channel(monkeypatch):
     """An admin who moves the raffle channel mid-poll can still draw it."""
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch, roster=("Jjew",))
@@ -3191,12 +2981,12 @@ def test_list_reads_the_poll_from_the_raffles_own_channel(monkeypatch):
     ctx = FakeCtx(new_channel)
     ctx.author = FakeMember(roles=[FakeRole(10)])
 
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
 
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").eligible == ("Jjew",)
 
 
-def test_list_defers_to_discords_own_expiry_not_the_stored_one(monkeypatch):
+def test_startraffle_defers_to_discords_own_expiry_not_the_stored_one(monkeypatch):
     """ends_at is computed before the poll is posted, so it runs early.
 
     Freezing inside that gap would permanently exclude anyone who had
@@ -3210,13 +3000,13 @@ def test_list_defers_to_discords_own_expiry_not_the_stored_one(monkeypatch):
     poll.expires_at = discord.utils.utcnow() + datetime.timedelta(minutes=5)
     message.poll = poll
 
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
 
     assert ctx.sent[-1]["embed"].title == "❌ Poll still open"
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").listed is False
 
 
-def test_a_poll_discord_has_already_closed_is_listed(monkeypatch):
+def test_startraffle_lists_a_poll_discord_has_already_closed(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch, roster=("Jjew",))
     ctx, channel = _raffle_ctx()
@@ -3225,7 +3015,7 @@ def test_a_poll_discord_has_already_closed_is_listed(monkeypatch):
     poll.expires_at = discord.utils.utcnow() - datetime.timedelta(minutes=5)
     message.poll = poll
 
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
 
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").eligible == ("Jjew",)
 
@@ -3269,7 +3059,7 @@ def test_the_refusal_embed_stays_within_discords_description_limit(monkeypatch):
         _fake_poll_voters([(10**17 + n, f"stranger{n:03d}") for n in range(400)]),
     )
 
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
 
     description = ctx.sent[-1]["embed"].description
     assert len(description) <= 4096, f"{len(description)} chars would be rejected"
@@ -3282,7 +3072,7 @@ def test_redrawing_a_winner_whose_box_is_already_ticked_says_so(monkeypatch):
     """The state save can fail after the sheet write succeeded.
 
     After a restart the raffle looks open but the checkbox is ticked, so
-    the officer retries !winner. record_special refuses, and a generic
+    the officer retries `!won`. The sheet reports the box is already held, and a generic
     'nothing was recorded' would be actively wrong -- the item HAS been
     given. Close the raffle and say so instead.
     """
@@ -3290,6 +3080,9 @@ def test_redrawing_a_winner_whose_box_is_already_ticked_says_so(monkeypatch):
     _sheet(monkeypatch, roster=("Jjew",))
     ctx, channel = _raffle_ctx()
     _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
 
     def already_ticked(spreadsheet, **kwargs):
         raise items_sheet.AlreadyHeld(
@@ -3298,11 +3091,11 @@ def test_redrawing_a_winner_whose_box_is_already_ticked_says_so(monkeypatch):
 
     monkeypatch.setattr(items_sheet, "commit_approval", already_ticked)
 
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Jjew"))
 
     raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
     assert raffle.winners == ("Jjew",), "the raffle must not stay open forever"
-    assert "already" in ctx.sent[-1]["embed"].description.casefold()
+    assert "already" in ctx.sent[-2]["embed"].description.casefold()
 
 
 def test_an_already_ticked_middle_name_does_not_stop_the_others(monkeypatch):
@@ -3313,6 +3106,9 @@ def test_an_already_ticked_middle_name_does_not_stop_the_others(monkeypatch):
     _open_raffle(
         channel, ends="2026-08-09 10:00:00",
         eligible=("Jjew", "Kobe", "Ryuu"), listed=True,
+    )
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
     )
     attempted = []
 
@@ -3325,14 +3121,14 @@ def test_an_already_ticked_middle_name_does_not_stop_the_others(monkeypatch):
     monkeypatch.setattr(items_sheet, "commit_approval", _kobe_already)
 
     asyncio.run(
-        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe - Ryuu")
+        items_bot.won_cmd.callback(ctx, argument="Jjew - Kobe - Ryuu")
     )
 
     assert attempted == ["Jjew", "Kobe", "Ryuu"], "Ryuu must still be attempted"
     raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
     assert raffle.winners == ("Jjew", "Kobe", "Ryuu")
     assert raffle.drawn is True
-    assert "already" in ctx.sent[-1]["embed"].description.casefold()
+    assert "already" in ctx.sent[-2]["embed"].description.casefold()
 
 
 def _state_fingerprint():
@@ -3371,29 +3167,6 @@ def test_every_poll_failure_path_leaves_the_raffle_set_untouched(monkeypatch):
     monkeypatch.undo()
 
 
-def test_a_refused_poll_keeps_the_superseded_raffle_listable(monkeypatch):
-    """Not just present in state -- still usable."""
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch, roster=("Jjew",))
-    items_bot._STATE.raffles = [items_state.Raffle(
-        item="Asta's Heart", channel_id=42, message_id=999,
-        created_at="2026-08-09 01:00:00", ends_at="2020-01-01 00:00:00",
-        listed=True, eligible=("Jjew",),
-    )]
-    monkeypatch.setattr(items_sheet, "commit_approval", lambda spreadsheet, **kw: "B2")
-    channel = PollRejectingChannel(42)
-    _register_channel(channel)
-    ctx = FakeCtx(channel)
-    ctx.author = FakeMember(roles=[FakeRole(10)])
-
-    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
-    asyncio.run(items_bot.list_cmd.callback(ctx, argument="Asta's Heart"))
-
-    assert "Jjew" in ctx.sent[-1]["embed"].description
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
-    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ("Jjew",)
-
-
 def test_a_corrupt_cell_is_not_mistaken_for_an_already_ticked_box(monkeypatch):
     """record_special quotes the offending cell into its message.
 
@@ -3405,6 +3178,9 @@ def test_a_corrupt_cell_is_not_mistaken_for_an_already_ticked_box(monkeypatch):
     _sheet(monkeypatch, roster=("Jjew",))
     ctx, channel = _raffle_ctx()
     _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
 
     def corrupt_cell(spreadsheet, **kwargs):
         raise items_sheet.SheetStructureError(
@@ -3414,7 +3190,7 @@ def test_a_corrupt_cell_is_not_mistaken_for_an_already_ticked_box(monkeypatch):
 
     monkeypatch.setattr(items_sheet, "commit_approval", corrupt_cell)
 
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew"))
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Jjew"))
 
     assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").winners == ()
     assert ctx.sent[-1]["embed"].title == "❌ Nothing recorded"
@@ -3447,8 +3223,10 @@ def test_officer_and_raffle_commands_use_their_own_channels(monkeypatch):
     monkeypatch.setattr(items_bot, "_STATE", _configured_state())
     for name in ("distribute", "setraffleroles"):
         assert items_bot.command_channels(FakeGuardCtx(10, name)) == (10,)
-    for name in ("poll", "list", "winner", "cancelpoll", "iam", "bind",
-                 "notaplayer"):
+    for name in (
+        "poll", "cancelpoll", "startraffle", "won", "skipraffle", "iam",
+        "bind", "notaplayer",
+    ):
         assert items_bot.command_channels(FakeGuardCtx(30, name)) == (30,)
 
 
@@ -3485,31 +3263,6 @@ def test_wrong_channel_is_swallowed_but_other_check_failures_still_reply():
     assert ctx.sent, "a plain CheckFailure must still be reported"
 
 
-def test_winner_records_three_names_from_one_command(monkeypatch):
-    _configured_raffle(monkeypatch)
-    _sheet(monkeypatch, roster=("Jjew", "Kobe", "Ryuu"))
-    ctx, channel = _raffle_ctx()
-    _open_raffle(
-        channel, ends="2026-08-09 10:00:00",
-        eligible=("Jjew", "Kobe", "Ryuu"), listed=True,
-    )
-    written = []
-    monkeypatch.setattr(
-        items_sheet, "commit_approval",
-        lambda spreadsheet, **kw: (written.append(kw["ign"]), "C4")[1],
-    )
-
-    asyncio.run(
-        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe - Ryuu")
-    )
-
-    assert written == ["Jjew", "Kobe", "Ryuu"]
-    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
-    assert raffle.winners == ("Jjew", "Kobe", "Ryuu")
-    assert raffle.drawn is True
-    assert ctx.sent[-1]["embed"].title == "✅ Winners recorded"
-
-
 def test_a_failure_part_way_keeps_the_raffle_open_for_a_retry(monkeypatch):
     """The first name is already ticked; the rest must stay drawable."""
     _configured_raffle(monkeypatch)
@@ -3518,6 +3271,9 @@ def test_a_failure_part_way_keeps_the_raffle_open_for_a_retry(monkeypatch):
     _open_raffle(
         channel, ends="2026-08-09 10:00:00",
         eligible=("Jjew", "Kobe", "Ryuu"), listed=True,
+    )
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
     )
 
     def _fail_on_kobe(spreadsheet, **kw):
@@ -3528,7 +3284,7 @@ def test_a_failure_part_way_keeps_the_raffle_open_for_a_retry(monkeypatch):
     monkeypatch.setattr(items_sheet, "commit_approval", _fail_on_kobe)
 
     asyncio.run(
-        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe - Ryuu")
+        items_bot.won_cmd.callback(ctx, argument="Jjew - Kobe - Ryuu")
     )
 
     raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
@@ -3733,13 +3489,16 @@ def test_a_failure_on_the_very_first_name_says_nothing_was_recorded(monkeypatch)
     _open_raffle(
         channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe"), listed=True
     )
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
 
     def _boom(spreadsheet, **kw):
         raise RuntimeError("Sheets is down")
 
     monkeypatch.setattr(items_sheet, "commit_approval", _boom)
 
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe"))
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Jjew - Kobe"))
 
     raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
     assert raffle.winners == ()
@@ -3756,10 +3515,13 @@ def test_the_retry_after_a_partial_failure_completes_the_draw(monkeypatch):
         channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe", "Ryuu"),
         listed=True, winners=("Jjew",), drawn=False,
     )
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
     monkeypatch.setattr(items_sheet, "commit_approval", lambda spreadsheet, **kw: "C4")
 
     asyncio.run(
-        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Kobe - Ryuu")
+        items_bot.won_cmd.callback(ctx, argument="Kobe - Ryuu")
     )
 
     raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
@@ -3775,13 +3537,16 @@ def test_retyping_an_already_recorded_winner_writes_nothing(monkeypatch):
         channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe", "Ryuu"),
         listed=True, winners=("Jjew",), drawn=False,
     )
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
     monkeypatch.setattr(
         items_sheet, "commit_approval",
         lambda *a, **k: pytest.fail("wrote a second time"),
     )
 
     asyncio.run(
-        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe")
+        items_bot.won_cmd.callback(ctx, argument="Jjew - Kobe")
     )
 
     description = ctx.sent[-1]["embed"].description
@@ -3798,12 +3563,15 @@ def test_one_bad_name_refuses_the_whole_command(monkeypatch):
     _open_raffle(
         channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe"), listed=True
     )
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
     monkeypatch.setattr(
         items_sheet, "commit_approval", lambda *a, **k: pytest.fail("wrote")
     )
 
     asyncio.run(
-        items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Ryuu")
+        items_bot.won_cmd.callback(ctx, argument="Jjew - Ryuu")
     )
 
     assert "not on the eligible list" in ctx.sent[-1]["embed"].description
@@ -3819,6 +3587,9 @@ def test_a_ledger_failure_on_one_name_does_not_stop_the_others(monkeypatch):
     _open_raffle(
         channel, ends="2026-08-09 10:00:00", eligible=("Jjew", "Kobe"), listed=True
     )
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
     row = ["2026-08-09 12:00:00", "Jjew", "Asta's Heart", "Special", "Keith", "1", "abc"]
 
     def _ledger_failure(spreadsheet, **kw):
@@ -3828,12 +3599,12 @@ def test_a_ledger_failure_on_one_name_does_not_stop_the_others(monkeypatch):
 
     monkeypatch.setattr(items_sheet, "commit_approval", _ledger_failure)
 
-    asyncio.run(items_bot.winner_cmd.callback(ctx, argument="Asta's Heart Jjew - Kobe"))
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Jjew - Kobe"))
 
     raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
     assert raffle.winners == ("Jjew", "Kobe")
     assert raffle.drawn is True
-    assert "C4" in ctx.sent[-1]["embed"].description
+    assert "C4" in ctx.sent[-2]["embed"].description
 
 
 def test_render_pool_labels_several_winners():

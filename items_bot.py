@@ -484,7 +484,8 @@ _EXEMPT_COMMANDS = frozenset({
 })
 _OFFICER_COMMANDS = frozenset({"distribute", "setraffleroles"})
 _RAFFLE_COMMANDS = frozenset({
-    "poll", "list", "winner", "startraffle", "won", "skipraffle", "cancelpoll", "iam", "bind", "notaplayer",
+    "poll", "cancelpoll", "startraffle", "won", "skipraffle",
+    "iam", "bind", "notaplayer",
 })
 _QUEUE_COMMANDS = frozenset({"request", "cancelrequest", "myrequests", "itemhelp"})
 
@@ -563,7 +564,7 @@ async def setraffleroles_cmd(ctx, *roles: discord.Role):
     await ctx.send(
         embed=ok_embed(
             "Raffle roles set",
-            f"{mentions} can now run `!poll`, `!list` and `!winner`.",
+            f"{mentions} can now run `!poll`, `!startraffle`, `!won` and `!skipraffle`.",
         )
     )
 
@@ -592,7 +593,7 @@ async def setrafflechannel_cmd(ctx):
     await ctx.send(
         embed=ok_embed(
             "Raffle channel set",
-            f"`!poll`, `!list` and `!winner` now work in {ctx.channel.mention}.",
+            f"`!poll`, `!startraffle`, `!won` and `!skipraffle` now work in {ctx.channel.mention}.",
         )
     )
 
@@ -644,7 +645,7 @@ def _same_player(stored_ign: str, player: str, roster: list[str]) -> bool:
     """Whether a stored binding names the same roster row as `player`.
 
     Compared through resolve_ign rather than as raw strings: an alias
-    left behind by a roster rename still resolves at !list time, so a
+    left behind by a roster rename still resolves when the raffle freezes, so a
     string compare would let two accounts hold one row and silently drop
     one of them from the pool.
     """
@@ -822,7 +823,7 @@ async def notaplayer_cmd(ctx, member: discord.Member):
         return
 
     # No IGN to resolve, so no sheet read -- but the lock is still held
-    # while _STATE is mutated and saved, so a concurrent !list cannot
+    # while _STATE is mutated and saved, so a concurrent raffle command cannot
     # classify voters against a half-applied change.
     async with _SHEET_LOCK:
         target = str(member.id)
@@ -1532,15 +1533,15 @@ async def itemhelp_cmd(ctx):
         name="🎲 Special log raffle",
         value=(
             "Special logs are drawn from a poll, not a queue. Answer **Yes** "
-            "on the poll in the raffle channel to enter. A log you already "
-            "have is skipped automatically.\n\n"
+            "on the poll in the raffle channel to enter. A player may win "
+            "only once per session.\n\n"
             "_Raffle roles only:_\n"
             "**`!poll <special log> [--hours N]`** — open a poll "
             f"({items_raffle.DEFAULT_POLL_HOURS}h by default)\n"
-            "**`!list <special log>`** — after it closes, who is eligible\n"
-            "**`!winner <special log> <IGN>`** — record the draw\n"
-            "**`!winner <special log> <IGN> - <IGN>`** — several winners "
-            "at once\n"
+            "**`!startraffle`** — draw every closed poll, one at a time\n"
+            "**`!won <IGN>`** — record the current poll's winner\n"
+            "**`!won <IGN> - <IGN>`** — several winners for one log\n"
+            "**`!skipraffle`** — leave the current poll undrawn\n"
             "**`!cancelpoll <special log>`** — cancel an open poll\n"
             "\n**`!iam <your IGN>`** — tell the bot which player you are\n"
             "**`!bind @user <IGN>`** — officer: identify someone\n"
@@ -1675,14 +1676,14 @@ async def poll_cmd(ctx, *, argument: str = ""):
         existing = items_state.find_raffle(_STATE, item)
         # Neither superseded nor evictable, and find_raffle only ever
         # returns the newest raffle for a name -- opening a new poll here
-        # would leave the unfinished draw unreachable by !list and !winner.
+        # would leave the unfinished draw unreachable by the raffle session.
         if existing is not None and existing.winners and not existing.drawn:
             await ctx.send(
                 embed=error_embed(
                     "Poll refused",
                     f"**{item}** has an unfinished draw — "
                     f"**{', '.join(existing.winners)}** already recorded. "
-                    f"Finish it with `!winner` before opening a new poll.",
+                    f"Finish it with `!startraffle` and `!won` before opening a new poll.",
                 )
             )
             return
@@ -1699,7 +1700,7 @@ async def poll_cmd(ctx, *, argument: str = ""):
         # An earlier raffle for this item that ended without a winner is
         # superseded, not kept. find_raffle only ever returns the newest
         # raffle for a name, so leaving the old one behind would make it
-        # unreachable by !list and !winner AND unevictable (eviction takes
+        # unreachable by the raffle session AND unevictable (eviction takes
         # only drawn raffles) -- a slot leaked until someone edited the
         # pinned state by hand. A drawn raffle is real history and stays.
         superseded = existing if existing is not None and not existing.winners else None
@@ -1714,7 +1715,7 @@ async def poll_cmd(ctx, *, argument: str = ""):
                 embed=error_embed(
                     "Poll refused",
                     f"All {items_state.MAX_RAFFLES} tracked raffles are still "
-                    "waiting for a winner. Run `!winner` on one of them "
+                    "waiting for a winner. Draw one with `!startraffle` "
                     "first — the bot will not discard a raffle you have not "
                     "drawn yet.",
                 )
@@ -1788,7 +1789,7 @@ async def poll_cmd(ctx, *, argument: str = ""):
         embed=ok_embed(
             "Raffle open",
             f"**{item}** — answer **{POLL_ANSWER}** above to enter. Closes at "
-            f"{raffle.ends_at} PHT. Run `!list {item}` after that.{note}",
+            f"{raffle.ends_at} PHT. Run `!startraffle` after it closes.{note}",
         )
     )
 
@@ -1798,7 +1799,7 @@ def poll_is_open(poll) -> bool:
 
     The stored ends_at is computed before the poll is posted, so it runs
     a little ahead of the expiry Discord actually assigned. In that gap
-    !list would read a partial voter list and freeze it permanently.
+    `!startraffle` would read a partial voter list and freeze it permanently.
     Discord's own expiry settles it; when the object cannot answer (an
     older poll payload), False defers to the stored timestamp, which the
     caller has already checked.
@@ -1853,7 +1854,7 @@ async def poll_voters(message) -> list[items_raffle.Voter]:
     return voters
 
 
-# Discord rejects an embed description longer than this, and !list saves
+# Discord rejects an embed description longer than this, and the session saves
 # the frozen pool before it sends -- so an over-long render would lose the
 # officer's only view of a pool that has already been committed.
 EMBED_DESCRIPTION_LIMIT = 4096
@@ -2225,41 +2226,6 @@ async def startraffle_cmd(ctx):
     await _post_current_poll(ctx)
 
 
-@bot.command(name="list")
-async def list_cmd(ctx, *, argument: str = ""):
-    """Show who is eligible for a closed raffle."""
-    if await _refuse_raffle(ctx, raffle_access(ctx)):
-        return
-
-    item_query = argument.strip()
-    raffle = items_state.find_raffle(_STATE, item_query) if item_query else None
-    if raffle is None:
-        await ctx.send(embed=error_embed(
-            "Nothing to list",
-            f"No raffle for {item_query!r}. Usage: `!list <special log name>`",
-        ))
-        return
-
-    if raffle.listed:
-        # Replayed verbatim, never recomputed: the pool a winner is drawn
-        # from must not be able to change between looking and drawing.
-        split = items_raffle.VoterSplit(eligible=list(raffle.eligible))
-        await ctx.send(embed=ok_embed(
-            f"Raffle: {raffle.item}",
-            render_pool(raffle.item, split, raffle.winners),
-        ))
-        return
-
-    frozen = await _freeze_raffle(ctx, raffle)
-    if frozen is None:
-        return
-    updated, split = frozen
-    await ctx.send(embed=ok_embed(
-        f"Raffle: {updated.item}",
-        render_pool(updated.item, split, updated.winners),
-    ))
-
-
 @dataclasses.dataclass
 class WriteOutcome:
     """What a !won attempt actually managed to write."""
@@ -2525,100 +2491,6 @@ async def won_cmd(ctx, *, argument: str = ""):
     # Outside the lock: _freeze_raffle takes it, and asyncio.Lock is not
     # reentrant -- calling this inside the block above would deadlock.
     await _post_current_poll(ctx)
-
-
-@bot.command(name="winner")
-async def winner_cmd(ctx, *, argument: str = ""):
-    """Record the winner of a closed raffle."""
-    if await _refuse_raffle(ctx, raffle_access(ctx)):
-        return
-
-    async with _SHEET_LOCK:
-        try:
-            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
-        except Exception as exc:
-            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
-            return
-
-        try:
-            item, igns = items_raffle.split_item_and_igns(
-                argument, items_state.raffle_item_names(_STATE), snapshot.roster
-            )
-        except items_raffle.RaffleArgumentError as exc:
-            await ctx.send(embed=error_embed("Winner refused", str(exc)))
-            return
-
-        raffle = items_state.find_raffle(_STATE, item)
-        now = items_rules.format_timestamp(items_rules.now_pht())
-
-        if raffle.drawn:
-            await ctx.send(
-                embed=error_embed(
-                    "Winner refused",
-                    f"**{raffle.item}** has already been drawn: "
-                    f"**{', '.join(raffle.winners)}** won it.",
-                )
-            )
-            return
-        if raffle.ends_at > now:
-            await ctx.send(
-                embed=error_embed(
-                    "Poll still open",
-                    f"**{raffle.item}** closes at {raffle.ends_at} PHT.",
-                )
-            )
-            return
-        if not raffle.listed:
-            await ctx.send(
-                embed=error_embed(
-                    "Winner refused",
-                    f"Run `!list {raffle.item}` first. The winner is checked "
-                    "against the eligible list that command freezes.",
-                )
-            )
-            return
-
-        # Every name is checked before the first write, so a typo in the
-        # third name cannot leave the first two ticked.
-        recorded_already: list[str] = []
-        missing: list[str] = []
-        chosen: list[str] = []
-        for ign in igns:
-            wanted = items_rules.normalize(ign)
-            if any(items_rules.normalize(w) == wanted for w in raffle.winners):
-                recorded_already.append(ign)
-                continue
-            on_list = next(
-                (n for n in raffle.eligible if items_rules.normalize(n) == wanted),
-                None,
-            )
-            (chosen if on_list is not None else missing).append(on_list or ign)
-
-        if missing:
-            suggestions = get_close_matches(
-                missing[0], list(raffle.eligible), n=3, cutoff=0.6
-            )
-            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-            await ctx.send(
-                embed=error_embed(
-                    "Winner refused",
-                    f"{', '.join(missing)} — not on the eligible list for "
-                    f"**{raffle.item}**.{hint} Nothing was recorded.",
-                )
-            )
-            return
-        if recorded_already:
-            await ctx.send(
-                embed=error_embed(
-                    "Winner refused",
-                    f"**{', '.join(recorded_already)}** already won "
-                    f"**{raffle.item}** — nothing was written a second time. "
-                    f"Re-run naming only the players still to record.",
-                )
-            )
-            return
-
-        await _record_winners(ctx, raffle, chosen)
 
 
 @bot.command(name="cancelpoll")
