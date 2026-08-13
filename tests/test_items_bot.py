@@ -2156,6 +2156,54 @@ def test_bind_clears_a_not_a_player_mark(monkeypatch):
     assert items_bot._STATE.not_players == []
 
 
+def test_binding_the_unidentified_voter_retries_the_stuck_poll(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "xXshadowXx")]),
+    )
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+    assert ctx.sent[-1]["embed"].title == "❌ Pool not frozen"
+
+    member = FakeMember(user_id=2)
+    asyncio.run(items_bot.bind_cmd.callback(ctx, member, argument="Kobe"))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is True, "the fix should have retried the freeze"
+    assert "Asta's Heart" in ctx.sent[-1]["embed"].title
+
+
+def test_a_binding_with_no_session_running_retries_nothing(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, _ = _raffle_ctx()
+    member = FakeMember(user_id=2)
+
+    asyncio.run(items_bot.bind_cmd.callback(ctx, member, argument="Kobe"))
+
+    assert items_bot._STATE.raffle_session is None
+    assert "🎲" not in str(ctx.sent[-1]["embed"].title)
+
+
+def test_notaplayer_also_retries_the_stuck_poll(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "xXshadowXx")]),
+    )
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+
+    asyncio.run(items_bot.notaplayer_cmd.callback(ctx, FakeMember(user_id=2)))
+
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").listed is True
+
+
 def test_bind_needs_a_raffle_role(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch, roster=("Jjew",))

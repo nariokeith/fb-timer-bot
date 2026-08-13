@@ -738,6 +738,7 @@ async def iam_cmd(ctx, *, argument: str = ""):
         )
     )
     await _tell_officers(f"🔗 <@{ctx.author.id}> claimed **{player}** via `!iam`.")
+    await _retry_blocked_session(ctx)
 
 
 @bot.command(name="bind")
@@ -811,6 +812,7 @@ async def bind_cmd(ctx, member: discord.Member, *, argument: str = ""):
     await _tell_officers(
         f"🔗 <@{ctx.author.id}> bound <@{member.id}> to **{player}**."
     )
+    await _retry_blocked_session(ctx)
 
 
 @bot.command(name="notaplayer")
@@ -849,6 +851,7 @@ async def notaplayer_cmd(ctx, member: discord.Member):
     await _tell_officers(
         f"🔗 <@{ctx.author.id}> marked <@{member.id}> as not a roster player."
     )
+    await _retry_blocked_session(ctx)
 
 
 from dataclasses import dataclass
@@ -2089,6 +2092,27 @@ async def _end_session(ctx) -> None:
         "Raffle session finished",
         "\n".join(lines) + "\n\nRun `!startraffle` again to draw any log left undrawn.",
     ))
+
+
+async def _retry_blocked_session(ctx) -> None:
+    """Re-attempt the poll a session is held on, after an identity is fixed.
+
+    A session is held exactly when its current raffle is not listed: the
+    pool is posted only after a successful freeze, so an unlisted current
+    raffle means the freeze refused. Read from state rather than tracked
+    in a flag, which could drift out of sync with the raffle it describes.
+
+    A retry that still finds an unidentified voter simply refuses again.
+    It never advances the session and never writes to the sheet, so a
+    failed retry costs nothing.
+    """
+    session = _STATE.raffle_session
+    if session is None or session.finished:
+        return
+    raffle = items_state.find_raffle(_STATE, session.current_item)
+    if raffle is not None and raffle.listed:
+        return
+    await _post_current_poll(ctx)
 
 
 async def _post_current_poll(ctx) -> None:
