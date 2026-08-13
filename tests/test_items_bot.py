@@ -6,6 +6,7 @@ following the local-fakes style of test_attendance_bot.py.
 """
 
 import asyncio
+import dataclasses
 import datetime
 
 import discord
@@ -2451,6 +2452,137 @@ def _fake_poll_voters(pairs):
             for user_id, name in pairs
         ]
     return _voters
+
+
+def test_startraffle_refuses_when_no_poll_has_closed(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel)  # ends in 2099, still open
+
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+
+    assert "no closed poll" in ctx.sent[-1]["embed"].description.lower()
+    assert items_bot._STATE.raffle_session is None
+
+
+def test_startraffle_walks_the_closed_polls_oldest_first(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(
+        channel, item="Log B", ends="2026-08-09 10:00:00",
+        eligible=("Jjew",), listed=True,
+    )
+    items_bot._STATE.raffles[-1] = dataclasses.replace(
+        items_bot._STATE.raffles[-1], created_at="2026-08-09 11:00:00"
+    )
+    _open_raffle(
+        channel, item="Log A", ends="2026-08-09 10:00:00",
+        eligible=("Jjew", "Kobe"), listed=True,
+    )
+
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+
+    session = items_bot._STATE.raffle_session
+    assert session.items == ("Log A", "Log B")
+    assert session.position == 0
+    description = ctx.sent[-1]["embed"].description
+    assert "Jjew" in description and "Kobe" in description
+    assert "🎲 Poll 1 of 2" in ctx.sent[-1]["embed"].title
+
+
+def test_startraffle_freezes_a_pool_that_has_not_been_listed(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"), holds=("Kobe",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "Kobe")]),
+    )
+
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is True
+    assert raffle.eligible == ("Jjew",)
+
+
+def test_startraffle_holds_on_an_unidentified_voter(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00")
+    monkeypatch.setattr(
+        items_bot, "poll_voters",
+        _fake_poll_voters([(1, "BK | Jjew"), (2, "xXshadowXx")]),
+    )
+
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+
+    assert ctx.sent[-1]["embed"].title == "❌ Pool not frozen"
+    session = items_bot._STATE.raffle_session
+    assert session is not None and session.position == 0
+    assert items_state.find_raffle(items_bot._STATE, "Asta's Heart").listed is False
+
+
+def test_startraffle_during_a_session_retries_the_current_poll(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, ends="2026-08-09 10:00:00", eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
+
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+
+    assert items_bot._STATE.raffle_session.items == ("Asta's Heart",)
+    assert "Jjew" in ctx.sent[-1]["embed"].description
+
+
+def test_a_session_with_one_poll_ends_after_it_is_drawn(monkeypatch):
+    """Reaching the end posts the summary and clears the session."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, _ = _raffle_ctx()
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=1,
+        results=(("Asta's Heart", ("Kobe",)),),
+    )
+
+    asyncio.run(items_bot._post_current_poll(ctx))
+
+    assert items_bot._STATE.raffle_session is None
+    description = ctx.sent[-1]["embed"].description
+    assert "Asta's Heart" in description and "Kobe" in description
+
+
+def test_the_summary_marks_a_skipped_log(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, _ = _raffle_ctx()
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=2,
+        results=(("Log A", ("Kobe",)),), skipped=("Log B",),
+    )
+
+    asyncio.run(items_bot._post_current_poll(ctx))
+
+    description = ctx.sent[-1]["embed"].description
+    assert "Log B" in description and "skipped" in description.lower()
+
+
+def test_render_pool_names_who_won_earlier_in_the_session():
+    split = items_raffle.VoterSplit(eligible=["Jjew"])
+
+    description = items_bot.render_pool(
+        "Asta's Heart", split, won_this_session=["Kobe"]
+    )
+
+    assert "Kobe" in description
+    assert "Won earlier this session" in description
 
 
 def test_list_splits_the_voters_and_freezes_the_pool(monkeypatch):

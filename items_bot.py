@@ -17,7 +17,7 @@ import dataclasses
 import datetime
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from difflib import get_close_matches
 
 import discord
@@ -484,7 +484,7 @@ _EXEMPT_COMMANDS = frozenset({
 })
 _OFFICER_COMMANDS = frozenset({"distribute", "setraffleroles"})
 _RAFFLE_COMMANDS = frozenset({
-    "poll", "list", "winner", "cancelpoll", "iam", "bind", "notaplayer",
+    "poll", "list", "winner", "startraffle", "cancelpoll", "iam", "bind", "notaplayer",
 })
 _QUEUE_COMMANDS = frozenset({"request", "cancelrequest", "myrequests", "itemhelp"})
 
@@ -1879,7 +1879,10 @@ def _winner_footer(winners: tuple[str, ...]) -> str:
 
 
 def render_pool(
-    item: str, split: items_raffle.VoterSplit, winners: tuple[str, ...] = ()
+    item: str,
+    split: items_raffle.VoterSplit,
+    winners: tuple[str, ...] = (),
+    won_this_session: Sequence[str] = (),
 ) -> str:
     """Everything an officer needs to see about the pool, in one description.
 
@@ -1902,6 +1905,10 @@ def render_pool(
     if split.already_have:
         block = "**Already has it** (excluded)"
         lines += ["", block, _capped(split.already_have, max(budget, 0), ", ")]
+        budget -= len(lines[-1]) + len(block)
+    if won_this_session:
+        block = "🏆 **Won earlier this session** (excluded)"
+        lines += ["", block, _capped(list(won_this_session), max(budget, 0), ", ")]
         budget -= len(lines[-1]) + len(block)
     if split.from_request:
         block = "ℹ️ **Identified from their last !request** — check these"
@@ -2050,6 +2057,148 @@ async def _freeze_raffle(ctx, raffle):
             await save_state(channel)
 
     return updated, split
+
+
+async def _end_session(ctx) -> None:
+    """Post the summary of the whole sitting and clear it from state."""
+    session = _STATE.raffle_session
+    lines: list[str] = []
+    won = {item: igns for item, igns in session.results}
+    for item in session.items:
+        if item in won:
+            igns = won[item]
+            label = "Winner" if len(igns) == 1 else "Winners"
+            lines.append(f"🏆 **{item}** — {label}: {', '.join(igns)}")
+        elif item in session.skipped:
+            lines.append(f"⏭️ **{item}** — skipped, still undrawn")
+        else:
+            # Reached only if a raffle left state mid-sitting. Say so
+            # rather than printing a log with no outcome at all.
+            lines.append(f"❔ **{item}** — no outcome recorded")
+
+    _STATE.raffle_session = None
+    channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if channel is not None:
+        await save_state(channel)
+
+    await ctx.send(embed=ok_embed(
+        "Raffle session finished",
+        "\n".join(lines) + "\n\nRun `!startraffle` again to draw any log left undrawn.",
+    ))
+
+
+async def _post_current_poll(ctx) -> None:
+    """Show the pool for the session's current poll, or finish the sitting.
+
+    Returns silently when the freeze refused: _freeze_raffle has already
+    said why, and the session deliberately stays on this poll so the
+    officer can fix the cause and have it retried.
+
+    Must NOT be called while holding _SHEET_LOCK -- _freeze_raffle takes it.
+    """
+    session = _STATE.raffle_session
+    if session is None:
+        return
+    if session.finished:
+        await _end_session(ctx)
+        return
+
+    item = session.current_item
+    raffle = items_state.find_raffle(_STATE, item)
+    if raffle is None or raffle.drawn:
+        # The raffle was superseded or drawn from outside the session.
+        # Skip past it rather than stalling on a poll that no longer exists.
+        _STATE.raffle_session = dataclasses.replace(
+            session, position=session.position + 1, skipped=(*session.skipped, item)
+        )
+        await ctx.send(embed=warn_embed(
+            "Poll gone",
+            f"**{item}** is no longer waiting to be drawn, so it was passed over.",
+        ))
+        await _post_current_poll(ctx)
+        return
+
+    if raffle.listed:
+        split = items_raffle.VoterSplit(eligible=list(raffle.eligible))
+    else:
+        frozen = await _freeze_raffle(ctx, raffle)
+        if frozen is None:
+            return
+        raffle, split = frozen
+
+    pool, excluded = items_raffle.remaining_pool(raffle.eligible, session.winners)
+    body = render_pool(
+        raffle.item,
+        dataclasses.replace(split, eligible=pool),
+        raffle.winners,
+        won_this_session=excluded,
+    )
+    footer = (
+        "\n\nDraw the winner yourself, then run `!won <IGN>`. "
+        "`!skipraffle` leaves this log undrawn."
+        if pool
+        else "\n\nNobody is left eligible for this log. Run `!skipraffle` to move on."
+    )
+    await ctx.send(embed=ok_embed(
+        f"🎲 Poll {session.position + 1} of {len(session.items)} — {raffle.item}",
+        body + footer,
+    ))
+
+
+@bot.command(name="startraffle")
+async def startraffle_cmd(ctx):
+    """Begin a raffle session, or retry the poll the current one is stuck on."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    if _STATE.raffle_session is not None:
+        # A session already running means this is the manual retry for a
+        # poll whose freeze refused, not a request for a second sitting.
+        await _post_current_poll(ctx)
+        return
+
+    now = items_rules.format_timestamp(items_rules.now_pht())
+    candidates = items_state.session_candidates(_STATE, now)
+    if not candidates:
+        await ctx.send(embed=error_embed(
+            "Nothing to draw",
+            "There is no closed poll waiting for a winner. Open one with "
+            "`!poll <special log>` and run this again once it closes.",
+        ))
+        return
+
+    previous = _STATE.raffle_session
+    _STATE.raffle_session = items_state.RaffleSession(
+        items=tuple(raffle.item for raffle in candidates)
+    )
+    if not items_state.fits(_STATE):
+        _STATE.raffle_session = previous
+        await ctx.send(embed=error_embed(
+            "Session not started",
+            "The bot's storage is full, so this sitting could not be saved. "
+            "Work the request queue down and try again.",
+        ))
+        return
+
+    channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if channel is not None:
+        await save_state(channel)
+
+    names = ", ".join(raffle.item for raffle in candidates)
+    await ctx.send(embed=ok_embed(
+        f"🎲 Raffle session started — {len(candidates)} poll(s)",
+        f"{names}\n\nEach pool is shown in turn. A player who wins may not "
+        "win again in this session.",
+    ))
+    await _post_current_poll(ctx)
 
 
 @bot.command(name="list")
