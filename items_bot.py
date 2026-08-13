@@ -13,6 +13,7 @@ roles instead.
 """
 
 import asyncio
+import dataclasses
 import datetime
 import os
 import sys
@@ -2086,6 +2087,125 @@ async def list_cmd(ctx, *, argument: str = ""):
     ))
 
 
+@dataclasses.dataclass
+class WriteOutcome:
+    """What a !won attempt actually managed to write."""
+
+    written: list[str]
+    failed: bool
+
+
+async def _record_winners(ctx, raffle, chosen: list[str]) -> WriteOutcome:
+    """Tick each winner's checkbox, save, and report what happened.
+
+    The caller must already hold _SHEET_LOCK: this mutates state and
+    saves it, and asyncio.Lock is not reentrant.
+
+    `failed` means a write failed hard and names are still to be
+    recorded, so the caller must leave the raffle current rather than
+    moving on.
+    """
+    now = items_rules.format_timestamp(items_rules.now_pht())
+    written: list[str] = []
+    already_ticked: list[str] = []
+    ledger_gaps: list[tuple[str, str, list[str]]] = []
+    failure: tuple[str, str] | None = None
+    not_attempted: list[str] = []
+
+    for position, ign in enumerate(chosen):
+        try:
+            # ign is bound as a default so that a later refactor firing
+            # these concurrently cannot send the last name of the loop to
+            # every thread.
+            await asyncio.to_thread(
+                lambda ign=ign: items_sheet.commit_approval(
+                    _SPREADSHEET,
+                    ign=ign,
+                    item=raffle.item,
+                    item_type=items_rules.SPECIAL,
+                    timestamp=now,
+                    officer=getattr(ctx.author, "display_name", str(ctx.author)),
+                    user_id=ctx.author.id,
+                    request_id=items_state.new_request_id(),
+                )
+            )
+        except items_sheet.LedgerWriteError as exc:
+            # The checkbox IS ticked, so this name is recorded and a
+            # retry would skip it -- the ledger row has to be handed
+            # over now or it is lost.
+            written.append(ign)
+            ledger_gaps.append((ign, exc.address, exc.row))
+        except items_sheet.AlreadyHeld:
+            # A previous run wrote the sheet and then failed to save
+            # state. The item HAS been given; say so and move on.
+            written.append(ign)
+            already_ticked.append(ign)
+        except Exception as exc:
+            failure = (ign, str(exc))
+            not_attempted = chosen[position + 1 :]
+            break
+        else:
+            written.append(ign)
+
+    updated = items_state.replace_raffle(
+        _STATE, raffle, winners=(*raffle.winners, *written), drawn=failure is None
+    )
+    channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if channel is not None:
+        await save_state(channel)
+
+    lines: list[str] = []
+    if written:
+        label = "Winner" if len(written) == 1 else "Winners"
+        lines.append(
+            f"🏆 **{label}: {', '.join(written)}** — ticked in "
+            f"`{items_sheet.SPECIAL_TAB}`."
+        )
+    if already_ticked:
+        verb = "was" if len(already_ticked) == 1 else "were"
+        lines.append(
+            f"⚠️ {', '.join(already_ticked)} {verb} already ticked in the "
+            "sheet, so nothing was written a second time."
+        )
+    for ign, address, row in ledger_gaps:
+        pasteable = " | ".join(row)
+        lines.append(
+            f"⚠️ {ign}'s cell {address} is ticked but the "
+            f"`{items_sheet.LEDGER_TAB}` row failed. Do NOT re-run for {ign} — "
+            f"add this row by hand:\n```\n{pasteable}\n```"
+        )
+    if failure is not None:
+        ign, reason = failure
+        remaining = [ign, *not_attempted]
+        lines.append(f"❌ **{ign}** was not recorded: {reason}")
+        if not_attempted:
+            lines.append(f"⏸️ Not attempted: {', '.join(not_attempted)}")
+        if not written:
+            lines.append("Nothing was written to the sheet.")
+        lines.append(
+            f"The raffle is still open. Re-run:\n"
+            f"`!winner {updated.item} {' - '.join(remaining)}`"
+        )
+    else:
+        lines.append("They are no longer eligible for this log. The raffle is closed.")
+
+    if failure is not None:
+        # "Partly" would be a lie when the very first write failed: the
+        # sheet is untouched and the officer must not think otherwise.
+        outcome = "Partly recorded" if written else "Nothing recorded"
+        embed = error_embed(outcome, "\n\n".join(lines))
+    else:
+        title = "Winner recorded" if len(written) == 1 else "Winners recorded"
+        embed = ok_embed(title, "\n\n".join(lines))
+    await ctx.send(embed=embed)
+
+    return WriteOutcome(written=written, failed=failure is not None)
+
+
 @bot.command(name="winner")
 async def winner_cmd(ctx, *, argument: str = ""):
     """Record the winner of a closed raffle."""
@@ -2177,107 +2297,7 @@ async def winner_cmd(ctx, *, argument: str = ""):
             )
             return
 
-        written: list[str] = []
-        already_ticked: list[str] = []
-        ledger_gaps: list[tuple[str, str, list[str]]] = []
-        failure: tuple[str, str] | None = None
-        not_attempted: list[str] = []
-
-        for position, ign in enumerate(chosen):
-            try:
-                # ign is bound as a default so that a later refactor
-                # firing these concurrently cannot send the last name of
-                # the loop to every thread.
-                await asyncio.to_thread(
-                    lambda ign=ign: items_sheet.commit_approval(
-                        _SPREADSHEET,
-                        ign=ign,
-                        item=raffle.item,
-                        item_type=items_rules.SPECIAL,
-                        timestamp=now,
-                        officer=getattr(ctx.author, "display_name", str(ctx.author)),
-                        user_id=ctx.author.id,
-                        request_id=items_state.new_request_id(),
-                    )
-                )
-            except items_sheet.LedgerWriteError as exc:
-                # The checkbox IS ticked, so this name is recorded and a
-                # retry would skip it -- the ledger row has to be handed
-                # over now or it is lost.
-                written.append(ign)
-                ledger_gaps.append((ign, exc.address, exc.row))
-            except items_sheet.AlreadyHeld:
-                # A previous run wrote the sheet and then failed to save
-                # state. The item HAS been given; say so and move on.
-                written.append(ign)
-                already_ticked.append(ign)
-            except Exception as exc:
-                failure = (ign, str(exc))
-                not_attempted = chosen[position + 1 :]
-                break
-            else:
-                written.append(ign)
-
-        updated = items_state.replace_raffle(
-            _STATE,
-            raffle,
-            winners=(*raffle.winners, *written),
-            drawn=failure is None,
-        )
-        channel = (
-            bot.get_channel(_STATE.officer_channel_id)
-            if _STATE.officer_channel_id is not None
-            else None
-        )
-        if channel is not None:
-            await save_state(channel)
-
-    lines: list[str] = []
-    if written:
-        label = "Winner" if len(written) == 1 else "Winners"
-        lines.append(
-            f"🏆 **{label}: {', '.join(written)}** — ticked in "
-            f"`{items_sheet.SPECIAL_TAB}`."
-        )
-    if already_ticked:
-        verb = "was" if len(already_ticked) == 1 else "were"
-        lines.append(
-            f"⚠️ {', '.join(already_ticked)} {verb} already ticked in the "
-            "sheet, so nothing was written a second time."
-        )
-    for ign, address, row in ledger_gaps:
-        pasteable = " | ".join(row)
-        lines.append(
-            f"⚠️ {ign}'s cell {address} is ticked but the "
-            f"`{items_sheet.LEDGER_TAB}` row failed. Do NOT re-run for {ign} — "
-            f"add this row by hand:\n```\n{pasteable}\n```"
-        )
-    if failure is not None:
-        ign, reason = failure
-        remaining = [ign, *not_attempted]
-        lines.append(f"❌ **{ign}** was not recorded: {reason}")
-        if not_attempted:
-            lines.append(f"⏸️ Not attempted: {', '.join(not_attempted)}")
-        if not written:
-            lines.append("Nothing was written to the sheet.")
-        lines.append(
-            f"The raffle is still open. Re-run:\n"
-            f"`!winner {updated.item} {' - '.join(remaining)}`"
-        )
-    else:
-        lines.append(
-            "They are no longer eligible for this log. The raffle is closed."
-        )
-
-    if failure is not None:
-        # "Partly" would be a lie when the very first write failed: the
-        # sheet is untouched and the officer must not think otherwise.
-        outcome = "Partly recorded" if written else "Nothing recorded"
-        embed = error_embed(outcome, "\n\n".join(lines))
-    else:
-        title = "Winner recorded" if len(written) == 1 else "Winners recorded"
-        embed = ok_embed(title, "\n\n".join(lines))
-    await ctx.send(embed=embed)
+        await _record_winners(ctx, raffle, chosen)
 
 
 @bot.command(name="cancelpoll")
