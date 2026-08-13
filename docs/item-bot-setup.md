@@ -41,8 +41,8 @@ The supervisor is only for Render, where nothing else is running.
    single most common reason a new bot "does nothing".
 
    Without server members the bot cannot read anyone's server nickname, so it
-   cannot identify any voter in a special log raffle and `!list` refuses to
-   freeze the pool at all. Both are needed.
+   cannot identify any voter in a special log raffle and the session refuses
+   to freeze the pool at all. Both are needed.
 
 4. **OAuth2 → URL Generator**:
    - Scopes: **`bot`**
@@ -233,36 +233,45 @@ its state. Then, in the raffle channel, whoever holds a raffle role runs:
 ```
 !poll <special log>                      opens a 24-hour poll; --hours N to change it
 !cancelpoll <special log>                cancels an open poll and frees its raffle slot
-!list <special log>                      after it closes: who is eligible
-!winner <special log> <IGN>              records the draw, ticks their checkbox
-!winner <special log> <IGN> - <IGN>      records several winners from one poll
+!startraffle                             draws every closed poll, one at a time
+!won <IGN>                               records the current poll's winner
+!won <IGN> - <IGN>                       records several winners for one poll
+!skipraffle                              leaves the current poll undrawn
 !iam <your IGN>                          any member: which player you are
 !bind @user <IGN>                        officer: identify someone else
 !notaplayer @user                        officer: they have no roster row
 ```
 
-`!list` reads everyone who answered **Yes**, converts their nickname to an IGN,
-and removes anyone already ticked for that log in the `Special Logs` tab. It
-prints who is eligible, who already has it, anyone it could only identify from
-their last `!request`, and a count of anyone marked not a roster player. Draw
-the winner yourself, then run `!winner`.
+`!startraffle` opens a session for every closed, undrawn poll, oldest first, and
+posts one pool at a time. A player may win only once per session.
 
-`!list` refuses to freeze the pool while any voter is unidentified, so a
-member the bot cannot name is never dropped from a draw without anyone
-noticing. Members fix this themselves with `!iam <IGN>`; an officer can use
-`!bind @user <IGN>`, or `!notaplayer @user` for a guest who has no row in the
-sheet at all.
+Each pool excludes anyone already holding that special log — anyone whose
+checkbox is ticked in the `Special Logs` tab — and anyone who won earlier in
+the session. The draw is still done by hand by the officer from the eligible
+list; the bot never picks a name.
 
-`!winner` refuses a name that is not on the list `!list` froze, refuses a
-second draw for the same raffle, refuses to run before `!list`, refuses a name
-repeated within one command, and refuses a name already recorded for that
-raffle. On success
-it ticks the checkbox and adds a `Distribution Log` row — the same write an
-officer approval makes.
+A winner can only be recorded inside a session. Run `!won <IGN>` for the
+current poll, or `!won <IGN> - <IGN>` for several winners of one log. The bot
+checks every name against the current pool before it ticks any checkbox. On success it ticks the checkbox, adds the
+`Distribution Log` row, and advances to the next poll. If a checkbox write
+fails part way through several winners, the current poll stays open with the
+names already recorded; re-run only the remaining names. If the checkbox was
+ticked but the ledger row failed, do not re-run that name — paste the row by
+hand. `!skipraffle` moves on without drawing, leaving the poll undrawn for a
+later session.
 
-The bot can identify most members from their nickname. `BK | Jjew`,
-`M2 - Jjew`, `BK Jjew` and a bare `Jjew` all resolve to the sheet row `Jjew`.
-When that is not enough, use `!iam`, `!bind` or `!notaplayer`.
+Every voter must be identifiable. The bot matches each voter's server nickname
+against the sheet, stripping the guild tag, so `BK | Jjew`, `M2 - Jjew`,
+`BK Jjew` and a bare `Jjew` all resolve to the sheet row `Jjew`. When that is
+not enough, it falls back to the IGN that account last used with `!request`,
+and shows you which voters it resolved that way.
+
+If it still cannot name someone, the session refuses to freeze the pool and
+names them, holding the session on that poll. Members fix this with
+`!iam <IGN>`; an officer can use `!bind @user <IGN>`, or `!notaplayer @user`
+for a guest with no row in the sheet. A successful one automatically retries
+the held poll. If the retry still finds an unidentified voter, it holds again;
+`!startraffle` can also retry the current poll manually.
 
 ### 7. Tell your members
 

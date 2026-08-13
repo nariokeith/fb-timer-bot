@@ -277,24 +277,30 @@ channel:
 |---|---|
 | `!poll <special log> [--hours N]` | Open a 24-hour poll for one special log. `--hours` overrides the duration (1–168). |
 | `!cancelpoll <special log>` | Cancel an open poll, remove its message, and free the raffle slot. |
-| `!list <special log>` | After the poll closes, show who is eligible. Freezes that list. |
-| `!winner <special log> <IGN>` | Record the winner and tick their checkbox in the Special Logs tab. |
-| `!winner <special log> <IGN> - <IGN>` | Record several winners from one poll, for a log that dropped more than once. Names are split on a hyphen with a space on both sides, so a hyphenated IGN stays intact. |
-| `!iam <your IGN>` | Tell the bot which roster row your Discord account is. Needed once, by any member whose nickname the bot cannot match. |
-| `!bind @user <IGN>` | Officer: identify someone else, overriding their nickname and any earlier claim on that IGN. |
-| `!notaplayer @user` | Officer: record that this account has no roster row, so it stops blocking raffles. Undone by `!bind`. |
+| `!startraffle` | Draw every closed, undrawn poll, one at a time. Starts a session, or retries the current poll if one is already active. |
+| `!won <IGN>` | Record the current poll's winner and tick their checkbox in the Special Logs tab. |
+| `!won <IGN> - <IGN>` | Record several winners for the current poll. Names are split on a hyphen with a space on both sides, so a hyphenated IGN stays intact. |
+| `!skipraffle` | Leave the current poll undrawn and move to the next one. A later session can offer it again. |
+| `!iam <your IGN>` | Tell the bot which roster row your Discord account is. A successful fix retries a session held on this poll. |
+| `!bind @user <IGN>` | Officer: identify someone else, overriding their nickname and any earlier claim on that IGN; a successful fix retries a held session. |
+| `!notaplayer @user` | Officer: record that this account has no roster row, so it stops blocking raffles; a successful fix retries a held session. Undone by `!bind`. |
 
-Members enter by answering **Yes** on the poll. When it closes, `!list` turns
-the voters into IGNs and drops anyone whose checkbox for that log is already
-ticked — that checkbox is the record of who already owns what, so nobody can
-win the same special log twice. It reports who is eligible, who already has it,
-anyone it could only identify from their last `!request` — that name may be an
-alt, so check those — and a count of anyone marked as not a roster player.
+Members enter by answering **Yes** on the poll. `!startraffle` takes every
+closed, undrawn poll in opening order and walks through them one at a time. A
+player may win only once per session.
 
-Draw the winner yourself from the eligible list, then run `!winner`. The bot
-refuses a name that is not on the frozen list, refuses a second draw for the
-same raffle, refuses a name repeated within one command, refuses a name it has
-already recorded, and refuses to draw before `!list` has been run.
+Each pool excludes anyone whose checkbox for that special log is already
+ticked — the record of who already holds it — and anyone who won earlier in
+the session. The bot shows those groups separately so an exclusion is visible.
+
+The draw is still done by hand by the officer from the eligible list. The bot
+never picks a name; it only decides who may be picked and records who was.
+
+A winner can only be recorded inside a session: run `!won <IGN>` for the
+current poll, or name several winners with `!won <IGN> - <IGN>`. The bot
+validates every name against the current pool before writing, refuses repeated
+or ineligible names, and advances to the next poll only after the draw is
+recorded.
 
 If a checkbox write fails part way through a multi-winner draw, the raffle stays
 open with the names it did record, and the bot prints the exact command to
@@ -309,9 +315,11 @@ nickname against the sheet, stripping the guild tag, so `BK | Jjew`,
 nickname does not match, it falls back to the IGN that account last used with
 `!request`, and shows you which voters it resolved that way.
 
-If it still cannot name someone, `!list` **refuses to freeze the pool** and
-names them. Nobody who voted is ever silently left out of a draw. Fix it with
-`!iam`, `!bind` or `!notaplayer`, then run `!list` again.
+If it still cannot name someone, the session **refuses to freeze the pool** and
+names them. Nobody who voted is ever silently left out of a draw. The session
+holds on that poll. Fix it with `!iam`, `!bind` or `!notaplayer`; a successful
+one automatically retries the held poll. A failed retry holds the session in
+place again, and `!startraffle` can also be used to retry it manually.
 
 ### Setup
 
