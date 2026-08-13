@@ -597,6 +597,24 @@ def raffle_item_names(state: State) -> list[str]:
     return [raffle.item for raffle in state.raffles]
 
 
+def session_candidates(state: State, now: str) -> list[Raffle]:
+    """The raffles a new sitting would walk through, oldest poll first.
+
+    Closed and not drawn. A partly drawn raffle is included because its
+    remaining names still have to be recorded, and a raffle skipped in an
+    earlier sitting is included because skipping left it undrawn on
+    purpose.
+
+    Ordered by created_at -- the order the polls were opened -- so the
+    sitting runs in the order the officer posted them rather than
+    whatever order state happens to hold.
+    """
+    return sorted(
+        (r for r in state.raffles if r.ends_at <= now and not r.drawn),
+        key=lambda raffle: raffle.created_at,
+    )
+
+
 def evict_for_new_raffle(state: State, now: str) -> bool:
     """Make room for one more raffle. False when there is none to make.
 

@@ -751,3 +751,68 @@ def test_a_pin_whose_session_is_not_an_object_decodes_as_no_session():
 
     assert shard is not None
     assert shard.state.raffle_session is None
+
+
+NOW = "2026-08-13 12:00:00"
+
+
+def test_session_candidates_are_closed_and_undrawn_oldest_first():
+    state = items_state.State(raffles=[
+        _raffle("B", created="2026-08-09 11:00:00"),
+        _raffle("A", created="2026-08-09 10:00:00"),
+    ])
+
+    assert [r.item for r in items_state.session_candidates(state, NOW)] == ["A", "B"]
+
+
+def test_session_candidates_exclude_a_poll_still_open():
+    state = items_state.State(raffles=[
+        _raffle(
+            "A",
+            created="2026-08-09 10:00:00",
+            ends="2099-01-01 00:00:00",
+        ),
+    ])
+
+    assert items_state.session_candidates(state, NOW) == []
+
+
+def test_session_candidates_exclude_a_drawn_raffle():
+    state = items_state.State(raffles=[
+        _raffle(
+            "A",
+            created="2026-08-09 10:00:00",
+            winners=("Kobe",),
+            drawn=True,
+        ),
+    ])
+
+    assert items_state.session_candidates(state, NOW) == []
+
+
+def test_session_candidates_include_a_partly_drawn_raffle():
+    """A write that failed part way through still has names to record."""
+    state = items_state.State(raffles=[
+        _raffle(
+            "A",
+            created="2026-08-09 10:00:00",
+            winners=("Kobe",),
+            drawn=False,
+        ),
+    ])
+
+    assert [r.item for r in items_state.session_candidates(state, NOW)] == ["A"]
+
+
+def test_session_candidates_include_a_frozen_but_undrawn_raffle():
+    """A poll skipped in an earlier sitting is picked up by the next one."""
+    state = items_state.State(raffles=[
+        _raffle(
+            "A",
+            created="2026-08-09 10:00:00",
+            eligible=("Jjew",),
+            listed=True,
+        ),
+    ])
+
+    assert [r.item for r in items_state.session_candidates(state, NOW)] == ["A"]
