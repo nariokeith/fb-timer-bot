@@ -3504,6 +3504,53 @@ def test_won_refuses_with_no_session(monkeypatch):
     assert "!startraffle" in ctx.sent[-1]["embed"].description
 
 
+def test_skipraffle_leaves_the_log_undrawn_and_moves_on(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Kobe",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+
+    asyncio.run(items_bot.skipraffle_cmd.callback(ctx))
+
+    session = items_bot._STATE.raffle_session
+    assert session.position == 1
+    assert session.skipped == ("Log A",)
+    assert items_state.find_raffle(items_bot._STATE, "Log A").drawn is False
+    assert "Log B" in ctx.sent[-1]["embed"].title
+
+
+def test_a_skipped_log_is_picked_up_by_the_next_session(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.skipraffle_cmd.callback(ctx))
+    assert items_bot._STATE.raffle_session is None
+
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+
+    assert items_bot._STATE.raffle_session.items == ("Log A",)
+
+
+def test_skipraffle_refuses_with_no_session(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(items_bot.skipraffle_cmd.callback(ctx))
+
+    assert "!startraffle" in ctx.sent[-1]["embed"].description
+
+
 def test_won_ticks_the_checkbox_and_advances_the_session(monkeypatch):
     _configured_raffle(monkeypatch)
     _sheet(monkeypatch, roster=("Jjew", "Kobe"))

@@ -484,7 +484,7 @@ _EXEMPT_COMMANDS = frozenset({
 })
 _OFFICER_COMMANDS = frozenset({"distribute", "setraffleroles"})
 _RAFFLE_COMMANDS = frozenset({
-    "poll", "list", "winner", "startraffle", "won", "cancelpoll", "iam", "bind", "notaplayer",
+    "poll", "list", "winner", "startraffle", "won", "skipraffle", "cancelpoll", "iam", "bind", "notaplayer",
 })
 _QUEUE_COMMANDS = frozenset({"request", "cancelrequest", "myrequests", "itemhelp"})
 
@@ -2353,6 +2353,40 @@ async def _record_winners(ctx, raffle, chosen: list[str]) -> WriteOutcome:
     await ctx.send(embed=embed)
 
     return WriteOutcome(written=written, failed=failure is not None)
+
+
+@bot.command(name="skipraffle")
+async def skipraffle_cmd(ctx):
+    """Leave the session's current poll undrawn and move to the next."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    session = _STATE.raffle_session
+    if session is None or session.finished:
+        await ctx.send(embed=error_embed(
+            "No raffle session",
+            "No raffle session is running. Run `!startraffle` first.",
+        ))
+        return
+
+    item = session.current_item
+    _STATE.raffle_session = dataclasses.replace(
+        session, position=session.position + 1, skipped=(*session.skipped, item)
+    )
+    channel = (
+        bot.get_channel(_STATE.officer_channel_id)
+        if _STATE.officer_channel_id is not None
+        else None
+    )
+    if channel is not None:
+        await save_state(channel)
+
+    await ctx.send(embed=warn_embed(
+        "Poll skipped",
+        f"**{item}** was left undrawn. It stays in the bot's state and the "
+        "next `!startraffle` will offer it again.",
+    ))
+    await _post_current_poll(ctx)
 
 
 @bot.command(name="won")
