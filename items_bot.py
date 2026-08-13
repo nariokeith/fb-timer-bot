@@ -1926,44 +1926,25 @@ def render_pool(
     return "\n".join(lines)
 
 
-@bot.command(name="list")
-async def list_cmd(ctx, *, argument: str = ""):
-    """Show who is eligible for a closed raffle."""
-    if await _refuse_raffle(ctx, raffle_access(ctx)):
-        return
+async def _freeze_raffle(ctx, raffle):
+    """Freeze this raffle's eligible pool, or refuse and return None.
 
-    item_query = argument.strip()
-    raffle = items_state.find_raffle(_STATE, item_query) if item_query else None
-    if raffle is None:
-        await ctx.send(
-            embed=error_embed(
-                "Nothing to list",
-                f"No raffle for {item_query!r}. Usage: `!list <special log name>`",
-            )
-        )
-        return
+    The pool a winner is drawn from must not be able to change between
+    the officer looking at it and drawing from it, so this runs once per
+    raffle and the result is stored.
 
-    if raffle.listed:
-        # Replayed verbatim, never recomputed: the pool a winner is drawn
-        # from must not be able to change between looking and drawing.
-        split = items_raffle.VoterSplit(eligible=list(raffle.eligible))
-        await ctx.send(
-            embed=ok_embed(
-                f"Raffle: {raffle.item}", render_pool(raffle.item, split, raffle.winners)
-            )
-        )
-        return
-
+    Takes _SHEET_LOCK. asyncio.Lock is not reentrant, so a caller must
+    not already hold it.
+    """
+    item_query = raffle.item
     now = items_rules.format_timestamp(items_rules.now_pht())
     if raffle.ends_at > now:
-        await ctx.send(
-            embed=error_embed(
-                "Poll still open",
-                f"**{raffle.item}** closes at {raffle.ends_at} PHT. "
-                "Drawing before then would leave out anyone who has not voted.",
-            )
-        )
-        return
+        await ctx.send(embed=error_embed(
+            "Poll still open",
+            f"**{raffle.item}** closes at {raffle.ends_at} PHT. "
+            "Drawing before then would leave out anyone who has not voted.",
+        ))
+        return None
 
     try:
         # The raffle's own channel, not wherever the command was typed.
@@ -1972,56 +1953,41 @@ async def list_cmd(ctx, *, argument: str = ""):
         source = bot.get_channel(raffle.channel_id) or ctx.channel
         message = await source.fetch_message(raffle.message_id)
         if poll_is_open(getattr(message, "poll", None)):
-            await ctx.send(
-                embed=error_embed(
-                    "Poll still open",
-                    f"Discord still has voting open on **{raffle.item}**. "
-                    "Try again in a moment — freezing now would leave out "
-                    "anyone who has not voted yet.",
-                )
-            )
-            return
+            await ctx.send(embed=error_embed(
+                "Poll still open",
+                f"Discord still has voting open on **{raffle.item}**. "
+                "Try again in a moment — freezing now would leave out "
+                "anyone who has not voted yet.",
+            ))
+            return None
         voters = await poll_voters(message)
     except Exception as exc:
-        await ctx.send(
-            embed=error_embed(
-                "Cannot read the poll",
-                f"The poll message for **{raffle.item}** could not be read "
-                f"({exc}). Run `!poll {raffle.item}` again to hold a new one.",
-            )
-        )
-        return
+        await ctx.send(embed=error_embed(
+            "Cannot read the poll",
+            f"The poll message for **{raffle.item}** could not be read "
+            f"({exc}). Run `!poll {raffle.item}` again to hold a new one.",
+        ))
+        return None
 
     async with _SHEET_LOCK:
         # Re-resolved under the lock. The raffle above was found before
-        # the poll fetch awaited, so a second officer running !list at the
-        # same time reaches here holding a Raffle that has already been
-        # swapped out of state -- replace_raffle would raise on it.
+        # the poll fetch awaited, so a second officer freezing the same
+        # raffle at the same time reaches here holding a Raffle that has
+        # already been swapped out of state -- replace_raffle would raise.
         raffle = items_state.find_raffle(_STATE, item_query)
-        if raffle is None or raffle.listed:
-            await ctx.send(
-                embed=(
-                    ok_embed(
-                        f"Raffle: {raffle.item}",
-                        render_pool(
-                            raffle.item,
-                            items_raffle.VoterSplit(eligible=list(raffle.eligible)),
-                            raffle.winners,
-                        ),
-                    )
-                    if raffle is not None
-                    else error_embed(
-                        "Nothing to list", f"No raffle for {item_query!r}."
-                    )
-                )
-            )
-            return
+        if raffle is None:
+            await ctx.send(embed=error_embed(
+                "Nothing to list", f"No raffle for {item_query!r}."
+            ))
+            return None
+        if raffle.listed:
+            return raffle, items_raffle.VoterSplit(eligible=list(raffle.eligible))
 
         try:
             snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
         except Exception as exc:
             await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
-            return
+            return None
 
         split = items_raffle.classify_voters(
             voters,
@@ -2035,11 +2001,11 @@ async def list_cmd(ctx, *, argument: str = ""):
         )
         if split.unidentified:
             # Freezing now would drop these voters from the pool a winner
-            # is drawn from, and nothing later would reveal that it happened.
+            # is drawn from, and nothing later would reveal it happened.
             header = f"{len(split.unidentified)} voter(s) could not be identified:\n\n"
             footer = (
                 "\n\nThey must run `!iam <IGN>`, or an officer runs "
-                "`!bind @user <IGN>` or `!notaplayer @user`. Then run `!list` again."
+                "`!bind @user <IGN>` or `!notaplayer @user`."
             )
             lines = [
                 f"<@{voter.user_id}>  nickname {voter.display_name!r}"
@@ -2049,13 +2015,11 @@ async def list_cmd(ctx, *, argument: str = ""):
             # refuses names nobody at all, which is the one thing this
             # refusal exists to do.
             budget = EMBED_DESCRIPTION_LIMIT - len(header) - len(footer) - 200
-            await ctx.send(
-                embed=error_embed(
-                    "Pool not frozen",
-                    header + _capped(lines, budget, "\n") + footer,
-                )
-            )
-            return
+            await ctx.send(embed=error_embed(
+                "Pool not frozen", header + _capped(lines, budget, "\n") + footer
+            ))
+            return None
+
         updated = items_state.replace_raffle(
             _STATE, raffle, eligible=tuple(split.eligible), listed=True
         )
@@ -2067,16 +2031,15 @@ async def list_cmd(ctx, *, argument: str = ""):
             items_state.replace_raffle(
                 _STATE, updated, eligible=raffle.eligible, listed=raffle.listed
             )
-            await ctx.send(
-                embed=error_embed(
-                    "Entry list too large",
-                    f"**{raffle.item}** drew {len(split.eligible)} eligible "
-                    "players — too large for the bot to store safely, so "
-                    "nothing was frozen. Work the request queue down and try "
-                    "again; if it still refuses, the raffle needs to be split.",
-                )
-            )
-            return
+            await ctx.send(embed=error_embed(
+                "Entry list too large",
+                f"**{raffle.item}** drew {len(split.eligible)} eligible "
+                "players — too large for the bot to store safely, so "
+                "nothing was frozen. Work the request queue down and try "
+                "again; if it still refuses, the raffle needs to be split.",
+            ))
+            return None
+
         channel = (
             bot.get_channel(_STATE.officer_channel_id)
             if _STATE.officer_channel_id is not None
@@ -2085,11 +2048,42 @@ async def list_cmd(ctx, *, argument: str = ""):
         if channel is not None:
             await save_state(channel)
 
-    await ctx.send(
-        embed=ok_embed(
-            f"Raffle: {updated.item}", render_pool(updated.item, split, updated.winners)
-        )
-    )
+    return updated, split
+
+
+@bot.command(name="list")
+async def list_cmd(ctx, *, argument: str = ""):
+    """Show who is eligible for a closed raffle."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    item_query = argument.strip()
+    raffle = items_state.find_raffle(_STATE, item_query) if item_query else None
+    if raffle is None:
+        await ctx.send(embed=error_embed(
+            "Nothing to list",
+            f"No raffle for {item_query!r}. Usage: `!list <special log name>`",
+        ))
+        return
+
+    if raffle.listed:
+        # Replayed verbatim, never recomputed: the pool a winner is drawn
+        # from must not be able to change between looking and drawing.
+        split = items_raffle.VoterSplit(eligible=list(raffle.eligible))
+        await ctx.send(embed=ok_embed(
+            f"Raffle: {raffle.item}",
+            render_pool(raffle.item, split, raffle.winners),
+        ))
+        return
+
+    frozen = await _freeze_raffle(ctx, raffle)
+    if frozen is None:
+        return
+    updated, split = frozen
+    await ctx.send(embed=ok_embed(
+        f"Raffle: {updated.item}",
+        render_pool(updated.item, split, updated.winners),
+    ))
 
 
 @bot.command(name="winner")
