@@ -172,6 +172,43 @@ def test_no_voters_gives_three_empty_groups():
     assert split.unidentified == []
 
 
+def test_remaining_pool_removes_this_sessions_winners():
+    pool, excluded = items_raffle.remaining_pool(
+        ["Jjew", "Kobe", "wile-KAMOTE"], ["Kobe"]
+    )
+
+    assert pool == ["Jjew", "wile-KAMOTE"]
+    assert excluded == ["Kobe"]
+
+
+def test_remaining_pool_keeps_the_order_of_the_frozen_list():
+    pool, _ = items_raffle.remaining_pool(["Kobe", "Jjew"], [])
+
+    assert pool == ["Kobe", "Jjew"]
+
+
+def test_remaining_pool_matches_an_alias_not_the_raw_string():
+    """A differently-spelled winner must not slip back into a later pool."""
+    pool, excluded = items_raffle.remaining_pool(["Jjew", "Kobe"], ["  jjew "])
+
+    assert pool == ["Kobe"]
+    assert excluded == ["Jjew"]
+
+
+def test_remaining_pool_with_no_winners_yet_changes_nothing():
+    pool, excluded = items_raffle.remaining_pool(["Jjew", "Kobe"], [])
+
+    assert pool == ["Jjew", "Kobe"]
+    assert excluded == []
+
+
+def test_remaining_pool_can_empty_the_pool():
+    pool, excluded = items_raffle.remaining_pool(["Jjew"], ["Jjew"])
+
+    assert pool == []
+    assert excluded == ["Jjew"]
+
+
 def test_a_poll_argument_without_a_flag_uses_the_default_duration():
     parsed = items_raffle.parse_poll_argument("Asta's Heart")
 

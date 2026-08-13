@@ -14,7 +14,7 @@ and hyphenated rows ("wile-KAMOTE"), so neither "take the last word" nor
 
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from difflib import get_close_matches
 
@@ -207,6 +207,26 @@ def classify_voters(
         skipped=skipped,
         duplicates=duplicates,
     )
+
+
+def remaining_pool(
+    eligible: Sequence[str], won: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """Split a frozen pool into who may still be drawn and who may not.
+
+    The second list is everyone already holding a win from this session.
+    They are returned rather than dropped so the officer can be shown why
+    the pool shrank: a pool that quietly gets smaller is how a wrong
+    exclusion goes unnoticed.
+
+    Compared through normalize, not as raw strings, because an alias left
+    by a roster rename would otherwise let a session winner back in.
+    """
+    taken = {normalize(name) for name in won}
+    pool = [name for name in eligible if normalize(name) not in taken]
+    excluded = [name for name in eligible if normalize(name) in taken]
+    return pool, excluded
+
 
 DEFAULT_POLL_HOURS = 24
 MIN_POLL_HOURS = 1
