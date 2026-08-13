@@ -11,6 +11,53 @@ import items_raffle
 ROSTER = ["Jjew", "Kobe", "Ryuu", "chinchong ni Mumu", "wile-KAMOTE"]
 
 
+def test_split_igns_reads_one_name():
+    assert items_raffle.split_igns("Jjew", ROSTER) == ["Jjew"]
+
+
+def test_split_igns_reads_several_names():
+    assert items_raffle.split_igns("Jjew - Kobe", ROSTER) == ["Jjew", "Kobe"]
+
+
+def test_split_igns_keeps_a_hyphenated_name_intact():
+    """A separator needs whitespace on BOTH sides; 'wile-KAMOTE' is a row."""
+    assert items_raffle.split_igns("wile-KAMOTE", ROSTER) == ["wile-KAMOTE"]
+    assert items_raffle.split_igns("wile-KAMOTE - Jjew", ROSTER) == [
+        "wile-KAMOTE",
+        "Jjew",
+    ]
+
+
+def test_split_igns_keeps_a_multi_word_name_intact():
+    assert items_raffle.split_igns("chinchong ni Mumu", ROSTER) == [
+        "chinchong ni Mumu"
+    ]
+
+
+def test_split_igns_returns_the_roster_spelling():
+    assert items_raffle.split_igns("jjew", ROSTER) == ["Jjew"]
+
+
+def test_split_igns_refuses_an_empty_argument():
+    with pytest.raises(items_raffle.RaffleArgumentError):
+        items_raffle.split_igns("   ", ROSTER)
+
+
+def test_split_igns_refuses_a_dangling_separator():
+    with pytest.raises(items_raffle.RaffleArgumentError, match="empty name"):
+        items_raffle.split_igns("Jjew - ", ROSTER)
+
+
+def test_split_igns_refuses_an_unknown_name_with_a_suggestion():
+    with pytest.raises(items_raffle.RaffleArgumentError, match="Did you mean"):
+        items_raffle.split_igns("Jjeww", ROSTER)
+
+
+def test_split_igns_refuses_the_same_player_twice():
+    with pytest.raises(items_raffle.RaffleArgumentError, match="more than once"):
+        items_raffle.split_igns("Jjew - jjew", ROSTER)
+
+
 @pytest.mark.parametrize(
     "nickname",
     ["Jjew", "BK | Jjew", "M2 | Jjew", "BK Jjew", "BK - Jjew", "  BK|Jjew  "],

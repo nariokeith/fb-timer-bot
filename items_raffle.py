@@ -393,3 +393,61 @@ def split_item_and_igns(
         )
 
     return item, igns
+
+
+WON_USAGE = (
+    "Usage: `!won <IGN>`, or `!won <IGN> - <IGN> - <IGN>` for several "
+    "winners of the same log."
+)
+
+
+def split_igns(argument: str, roster: list[str]) -> list[str]:
+    """The winners named in a `!won` argument, in roster spelling.
+
+    The session supplies the log, so this parses names only -- none of
+    the item/IGN boundary guessing `!winner` needed.
+
+    Every name is resolved before this returns, so a typo in the third
+    name is refused before any checkbox is ticked rather than half way
+    through.
+    """
+    text = argument.strip()
+    if not text:
+        raise RaffleArgumentError(f"Which player won? {WON_USAGE}")
+
+    chunks = WINNER_SPLIT.split(text)
+    # A separator needs whitespace on both sides, so only a hyphen with
+    # whitespace BEFORE it is a dangling one. Testing the last character
+    # alone would reject a roster name that simply ends in a hyphen.
+    if DANGLING_SEPARATOR.search(argument) or any(
+        not chunk.strip() for chunk in chunks
+    ):
+        raise RaffleArgumentError(
+            f"There is an empty name between two dashes. {WON_USAGE}"
+        )
+
+    igns: list[str] = []
+    for chunk in chunks:
+        chunk = chunk.strip()
+        try:
+            player = items_rules.resolve_ign(chunk, roster)
+        except items_rules.RequestParseError as exc:
+            raise RaffleArgumentError(str(exc)) from None
+        if player is None:
+            suggestions = get_close_matches(chunk, roster, n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise RaffleArgumentError(
+                f"No player named {chunk!r} in the sheet.{hint} {WON_USAGE}"
+            )
+        igns.append(player)
+
+    # Aliases mean two different chunks can name one roster row, and a
+    # repeat is always a miscount -- a player cannot win one log twice.
+    counts = Counter(normalize(ign) for ign in igns)
+    repeated = sorted({ign for ign in igns if counts[normalize(ign)] > 1})
+    if repeated:
+        raise RaffleArgumentError(
+            f"{', '.join(repeated)} is named more than once. "
+            "Each winner may only be listed once."
+        )
+    return igns
