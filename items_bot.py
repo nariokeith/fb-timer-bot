@@ -484,7 +484,7 @@ _EXEMPT_COMMANDS = frozenset({
 })
 _OFFICER_COMMANDS = frozenset({"distribute", "setraffleroles"})
 _RAFFLE_COMMANDS = frozenset({
-    "poll", "list", "winner", "startraffle", "cancelpoll", "iam", "bind", "notaplayer",
+    "poll", "list", "winner", "startraffle", "won", "cancelpoll", "iam", "bind", "notaplayer",
 })
 _QUEUE_COMMANDS = frozenset({"request", "cancelrequest", "myrequests", "itemhelp"})
 
@@ -2337,7 +2337,7 @@ async def _record_winners(ctx, raffle, chosen: list[str]) -> WriteOutcome:
             lines.append("Nothing was written to the sheet.")
         lines.append(
             f"The raffle is still open. Re-run:\n"
-            f"`!winner {updated.item} {' - '.join(remaining)}`"
+            f"`!won {' - '.join(remaining)}`"
         )
     else:
         lines.append("They are no longer eligible for this log. The raffle is closed.")
@@ -2353,6 +2353,120 @@ async def _record_winners(ctx, raffle, chosen: list[str]) -> WriteOutcome:
     await ctx.send(embed=embed)
 
     return WriteOutcome(written=written, failed=failure is not None)
+
+
+@bot.command(name="won")
+async def won_cmd(ctx, *, argument: str = ""):
+    """Record the winners of the raffle session's current poll."""
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    session = _STATE.raffle_session
+    if session is None or session.finished:
+        await ctx.send(embed=error_embed(
+            "No raffle session",
+            "No raffle session is running, and a winner can only be recorded "
+            "inside one. Run `!startraffle` first.",
+        ))
+        return
+
+    async with _SHEET_LOCK:
+        raffle = items_state.find_raffle(_STATE, session.current_item)
+        if raffle is None:
+            await ctx.send(embed=error_embed(
+                "Winner refused",
+                f"**{session.current_item}** is no longer in the bot's state. "
+                "Run `!startraffle` to move the session on.",
+            ))
+            return
+        if not raffle.listed:
+            await ctx.send(embed=error_embed(
+                "Winner refused",
+                f"The pool for **{raffle.item}** has not been frozen yet — "
+                "the session is waiting on something. Fix what it reported, "
+                "or run `!startraffle` to retry it.",
+            ))
+            return
+
+        try:
+            snapshot = await asyncio.to_thread(items_sheet.read_snapshot, _SPREADSHEET)
+        except Exception as exc:
+            await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
+            return
+
+        try:
+            igns = items_raffle.split_igns(argument, snapshot.roster)
+        except items_raffle.RaffleArgumentError as exc:
+            await ctx.send(embed=error_embed("Winner refused", str(exc)))
+            return
+
+        pool, excluded = items_raffle.remaining_pool(raffle.eligible, session.winners)
+
+        # Every name is checked before the first write, so a typo in the
+        # third name cannot leave the first two ticked.
+        blocked: list[str] = []
+        recorded_already: list[str] = []
+        missing: list[str] = []
+        chosen: list[str] = []
+        for ign in igns:
+            wanted = items_rules.normalize(ign)
+            if any(items_rules.normalize(w) == wanted for w in excluded):
+                blocked.append(ign)
+            elif any(items_rules.normalize(w) == wanted for w in raffle.winners):
+                recorded_already.append(ign)
+            elif any(items_rules.normalize(n) == wanted for n in pool):
+                chosen.append(next(n for n in pool if items_rules.normalize(n) == wanted))
+            else:
+                missing.append(ign)
+
+        if blocked:
+            await ctx.send(embed=error_embed(
+                "Winner refused",
+                f"{', '.join(blocked)} already won earlier in this session and "
+                "may not win again. Nothing was recorded.",
+            ))
+            return
+        if missing:
+            suggestions = get_close_matches(missing[0], list(pool), n=3, cutoff=0.6)
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            await ctx.send(embed=error_embed(
+                "Winner refused",
+                f"{', '.join(missing)} — not on the eligible list for "
+                f"**{raffle.item}**.{hint} Nothing was recorded.",
+            ))
+            return
+        if recorded_already:
+            await ctx.send(embed=error_embed(
+                "Winner refused",
+                f"**{', '.join(recorded_already)}** already won **{raffle.item}** "
+                "— nothing was written a second time. Re-run naming only the "
+                "players still to record.",
+            ))
+            return
+
+        outcome = await _record_winners(ctx, raffle, chosen)
+        if outcome.failed:
+            # Names are still to be recorded for this log. Leaving the
+            # session here is what lets the officer re-run !won with the
+            # rest instead of the sitting moving past an unfinished draw.
+            return
+
+        _STATE.raffle_session = dataclasses.replace(
+            session,
+            position=session.position + 1,
+            results=(*session.results, (raffle.item, tuple(outcome.written))),
+        )
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+
+    # Outside the lock: _freeze_raffle takes it, and asyncio.Lock is not
+    # reentrant -- calling this inside the block above would deadlock.
+    await _post_current_poll(ctx)
 
 
 @bot.command(name="winner")

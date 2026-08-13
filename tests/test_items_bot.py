@@ -3489,8 +3489,145 @@ def test_a_failure_part_way_keeps_the_raffle_open_for_a_retry(monkeypatch):
     description = ctx.sent[-1]["embed"].description
     assert "Sheets is down" in description
     assert "Ryuu" in description, "the un-attempted name must be named"
-    assert "!winner Asta's Heart Kobe - Ryuu" in description
+    assert "!won Kobe - Ryuu" in description
     assert ctx.sent[-1]["embed"].title == "❌ Partly recorded"
+
+
+def test_won_refuses_with_no_session(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, _ = _raffle_ctx()
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: pytest.fail("wrote"))
+
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Jjew"))
+
+    assert "!startraffle" in ctx.sent[-1]["embed"].description
+
+
+def test_won_ticks_the_checkbox_and_advances_the_session(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+    calls = {}
+    monkeypatch.setattr(items_sheet, "commit_approval",
+                        lambda s, **kw: calls.update(kw) or "C4")
+
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Kobe"))
+
+    assert calls["ign"] == "Kobe"
+    assert calls["item"] == "Log A"
+    session = items_bot._STATE.raffle_session
+    assert session.position == 1
+    assert session.results == (("Log A", ("Kobe",)),)
+    assert items_state.find_raffle(items_bot._STATE, "Log A").drawn is True
+
+
+def test_a_winner_is_excluded_from_every_later_pool(monkeypatch):
+    """The whole point: one win per player per session."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda s, **kw: "C4")
+
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Kobe"))
+
+    description = ctx.sent[-1]["embed"].description
+    assert "Log B" in ctx.sent[-1]["embed"].title
+    assert "1. Jjew" in description
+    assert "Won earlier this session" in description
+    # Kobe must not be offered again -- he appears only in the excluded group.
+    assert "2. Kobe" not in description
+
+
+def test_won_refuses_a_player_excluded_by_an_earlier_win(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=1,
+        results=(("Log A", ("Kobe",)),),
+    )
+    monkeypatch.setattr(items_sheet, "commit_approval",
+                        lambda *a, **k: pytest.fail("wrote"))
+
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Kobe"))
+
+    assert "already won" in ctx.sent[-1]["embed"].description
+    assert items_bot._STATE.raffle_session.position == 1
+
+
+def test_won_refuses_a_player_not_in_the_pool(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+    monkeypatch.setattr(items_sheet, "commit_approval",
+                        lambda *a, **k: pytest.fail("wrote"))
+
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Kobe"))
+
+    assert "not on the eligible list" in ctx.sent[-1]["embed"].description
+    assert items_bot._STATE.raffle_session.position == 0
+
+
+def test_won_records_several_winners_for_one_log(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+    written = []
+    monkeypatch.setattr(items_sheet, "commit_approval",
+                        lambda s, **kw: written.append(kw["ign"]) or "C4")
+
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Jjew - Kobe"))
+
+    assert written == ["Jjew", "Kobe"]
+    assert items_bot._STATE.raffle_session is None  # only poll, session ended
+
+
+def test_a_failed_write_leaves_the_poll_current(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+
+    def _boom(spreadsheet, **kwargs):
+        raise RuntimeError("Google said no")
+
+    monkeypatch.setattr(items_sheet, "commit_approval", _boom)
+
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Kobe"))
+
+    session = items_bot._STATE.raffle_session
+    assert session.position == 0, "a failed write must not move the session on"
+    assert session.results == ()
+    assert items_state.find_raffle(items_bot._STATE, "Log A").drawn is False
 
 
 def test_a_failure_on_the_very_first_name_says_nothing_was_recorded(monkeypatch):
@@ -3612,3 +3749,42 @@ def test_render_pool_labels_several_winners():
     assert "Winners: Jjew, Kobe" in text
     assert "Winner: Jjew" in items_bot.render_pool("Asta's Heart", split, ("Jjew",))
     assert "Winner" not in items_bot.render_pool("Asta's Heart", split)
+
+
+def test_won_freezes_the_next_poll_after_recording(monkeypatch):
+    """The production path: the next poll has never been frozen.
+
+    _record_winners runs holding _SHEET_LOCK and _post_current_poll takes
+    it again through _freeze_raffle. asyncio.Lock is not reentrant, so
+    calling the second inside the first deadlocks the bot while every
+    already-listed test still passes. The timeout is what turns that
+    deadlock into a failure instead of a hung suite.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00")
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda s, **kw: "C4")
+    monkeypatch.setattr(
+        items_bot, "poll_voters", _fake_poll_voters([(1, "Jjew"), (2, "Kobe")])
+    )
+
+    async def _run():
+        await asyncio.wait_for(
+            items_bot.won_cmd.callback(ctx, argument="Kobe"), timeout=5
+        )
+
+    asyncio.run(_run())
+
+    log_b = items_state.find_raffle(items_bot._STATE, "Log B")
+    assert log_b.listed is True, "the next poll should have been frozen"
+    assert log_b.eligible == ("Jjew", "Kobe")
+    description = ctx.sent[-1]["embed"].description
+    assert "1. Jjew" in description
+    assert "Won earlier this session" in description
+    assert "2. Kobe" not in description
