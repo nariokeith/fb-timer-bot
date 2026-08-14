@@ -2140,6 +2140,16 @@ async def _post_current_poll(ctx) -> None:
         _STATE.raffle_session = dataclasses.replace(
             session, position=session.position + 1, skipped=(*session.skipped, item)
         )
+        # Persisted like every other advance. Without this a restart puts
+        # the session back on the missing poll, and the officer has to
+        # walk past it a second time.
+        state_channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if state_channel is not None:
+            await save_state(state_channel)
         await ctx.send(embed=warn_embed(
             "Poll gone",
             f"**{item}** is no longer waiting to be drawn, so it was passed over.",
@@ -2351,25 +2361,40 @@ async def skipraffle_cmd(ctx):
     if await _refuse_raffle(ctx, raffle_access(ctx)):
         return
 
-    session = _STATE.raffle_session
-    if session is None or session.finished:
+    pending = _STATE.raffle_session
+    if pending is None or pending.finished:
         await ctx.send(embed=error_embed(
             "No raffle session",
             "No raffle session is running. Run `!startraffle` first.",
         ))
         return
 
-    item = session.current_item
-    _STATE.raffle_session = dataclasses.replace(
-        session, position=session.position + 1, skipped=(*session.skipped, item)
-    )
-    channel = (
-        bot.get_channel(_STATE.officer_channel_id)
-        if _STATE.officer_channel_id is not None
-        else None
-    )
-    if channel is not None:
-        await save_state(channel)
+    # Under the lock for the same reason !won is: save_state awaits, so
+    # without it a concurrent !won and !skipraffle each write back a
+    # session built from the state they read before waiting, and whichever
+    # lands second silently discards the other's outcome.
+    async with _SHEET_LOCK:
+        session = _STATE.raffle_session
+        if session is None or session.finished or session != pending:
+            await ctx.send(embed=error_embed(
+                "Nothing skipped",
+                "The raffle session moved on while this command was waiting. "
+                "Check the poll now on screen and run `!skipraffle` again if "
+                "you still want to pass on it.",
+            ))
+            return
+
+        item = session.current_item
+        _STATE.raffle_session = dataclasses.replace(
+            session, position=session.position + 1, skipped=(*session.skipped, item)
+        )
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
 
     await ctx.send(embed=warn_embed(
         "Poll skipped",
@@ -2385,8 +2410,8 @@ async def won_cmd(ctx, *, argument: str = ""):
     if await _refuse_raffle(ctx, raffle_access(ctx)):
         return
 
-    session = _STATE.raffle_session
-    if session is None or session.finished:
+    pending = _STATE.raffle_session
+    if pending is None or pending.finished:
         await ctx.send(embed=error_embed(
             "No raffle session",
             "No raffle session is running, and a winner can only be recorded "
@@ -2395,6 +2420,26 @@ async def won_cmd(ctx, *, argument: str = ""):
         return
 
     async with _SHEET_LOCK:
+        # Re-read under the lock and refuse if it moved. The check above
+        # ran before this await, so a second officer's !won can have drawn
+        # this poll and advanced the session in between. Writing back the
+        # snapshot taken up there would drop their winner from
+        # session.winners and make that player eligible again in every
+        # later poll -- the one thing this whole feature exists to stop.
+        #
+        # Refused rather than applied to whatever is now current: !won
+        # carries no log name, so the only poll this officer can have
+        # meant is the one that was on screen when they typed it.
+        session = _STATE.raffle_session
+        if session is None or session.finished or session != pending:
+            await ctx.send(embed=error_embed(
+                "Winner refused",
+                "The raffle session moved on while this command was waiting, "
+                "so nothing was recorded. Check the poll now on screen and "
+                "run `!won` again if it is still yours to draw.",
+            ))
+            return
+
         raffle = items_state.find_raffle(_STATE, session.current_item)
         if raffle is None:
             await ctx.send(embed=error_embed(
@@ -2409,6 +2454,18 @@ async def won_cmd(ctx, *, argument: str = ""):
                 f"The pool for **{raffle.item}** has not been frozen yet — "
                 "the session is waiting on something. Fix what it reported, "
                 "or run `!startraffle` to retry it.",
+            ))
+            return
+        # The session should never leave a drawn raffle current, so this
+        # is a second line rather than the first. It is kept because the
+        # thing it prevents -- a second set of names ticked onto a log
+        # already drawn -- is written to the sheet and cannot be undone
+        # by the bot.
+        if raffle.drawn:
+            await ctx.send(embed=error_embed(
+                "Winner refused",
+                f"**{raffle.item}** has already been drawn: "
+                f"**{', '.join(raffle.winners)}** won it. Nothing was recorded.",
             ))
             return
 
@@ -2475,10 +2532,18 @@ async def won_cmd(ctx, *, argument: str = ""):
             # rest instead of the sitting moving past an unfinished draw.
             return
 
+        # The raffle's whole winner list, not just what this command
+        # wrote. A draw that failed part way through recorded some names
+        # already, and this may be the retry that finished it -- crediting
+        # only the retry would drop the earlier names from
+        # session.winners and let a player who has already been given a
+        # log this sitting win another one.
+        drawn = items_state.find_raffle(_STATE, raffle.item)
+        recorded = drawn.winners if drawn is not None else tuple(outcome.written)
         _STATE.raffle_session = dataclasses.replace(
             session,
             position=session.position + 1,
-            results=(*session.results, (raffle.item, tuple(outcome.written))),
+            results=(*session.results, (raffle.item, recorded)),
         )
         channel = (
             bot.get_channel(_STATE.officer_channel_id)

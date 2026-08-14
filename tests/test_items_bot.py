@@ -3654,3 +3654,193 @@ def test_won_freezes_the_next_poll_after_recording(monkeypatch):
     assert "1. Jjew" in description
     assert "Won earlier this session" in description
     assert "2. Kobe" not in description
+
+
+def _interleaving_to_thread(monkeypatch):
+    """Force a suspension inside the sheet read so two commands overlap."""
+    real_to_thread = asyncio.to_thread
+
+    async def slow_to_thread(func, *args, **kwargs):
+        await asyncio.sleep(0)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(items_bot.asyncio, "to_thread", slow_to_thread)
+
+
+def test_two_officers_naming_different_winners_do_not_lose_one(monkeypatch):
+    """The second !won must be refused, not overwrite the first.
+
+    Both commands read the session before waiting on _SHEET_LOCK. If the
+    loser of that race writes back a session derived from its stale
+    snapshot, the first winner vanishes from session.winners -- and is
+    eligible again in every later poll, which is the one thing this
+    feature exists to prevent.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+    writes = []
+    monkeypatch.setattr(
+        items_sheet, "commit_approval",
+        lambda s, **kw: writes.append((kw["item"], kw["ign"])) or "B2",
+    )
+    _interleaving_to_thread(monkeypatch)
+
+    async def both():
+        await asyncio.gather(
+            items_bot.won_cmd.callback(ctx, argument="Kobe"),
+            items_bot.won_cmd.callback(ctx, argument="Jjew"),
+        )
+
+    asyncio.run(both())
+
+    assert len(writes) == 1, f"only one draw should have been written: {writes}"
+    drawn_ign = writes[0][1]
+    session = items_bot._STATE.raffle_session
+    assert session.results == (("Log A", (drawn_ign,)),)
+    assert session.winners == (drawn_ign,), "the recorded winner must survive"
+    assert items_state.find_raffle(items_bot._STATE, "Log A").winners == (drawn_ign,)
+
+
+def test_a_skip_racing_a_win_does_not_discard_the_win(monkeypatch):
+    """!skipraffle must not write back a session snapshot taken before !won."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda s, **kw: "B2")
+    _interleaving_to_thread(monkeypatch)
+
+    async def both():
+        await asyncio.gather(
+            items_bot.won_cmd.callback(ctx, argument="Kobe"),
+            items_bot.skipraffle_cmd.callback(ctx),
+        )
+
+    asyncio.run(both())
+
+    session = items_bot._STATE.raffle_session
+    recorded = () if session is None else session.results
+    assert ("Log A", ("Kobe",)) in recorded, (
+        f"the recorded draw for Log A must survive the skip: {recorded}"
+    )
+
+
+def test_skipraffle_freezes_the_next_poll_without_deadlocking(monkeypatch):
+    """!skipraffle holds _SHEET_LOCK; _post_current_poll takes it again.
+
+    The timeout is what turns a reentrant-lock mistake into a failure
+    rather than a bot that stops responding mid-session.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00")
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+    monkeypatch.setattr(
+        items_bot, "poll_voters", _fake_poll_voters([(1, "Jjew"), (2, "Kobe")])
+    )
+
+    async def _run():
+        await asyncio.wait_for(items_bot.skipraffle_cmd.callback(ctx), timeout=5)
+
+    asyncio.run(_run())
+
+    assert items_bot._STATE.raffle_session.skipped == ("Log A",)
+    assert items_state.find_raffle(items_bot._STATE, "Log B").listed is True
+
+
+def test_a_session_survives_a_restart_and_still_excludes_the_winner(monkeypatch):
+    """The reason the session lives in the pin rather than in memory.
+
+    Render's free tier restarts between commands. If the winner list did
+    not come back, the player who won poll 1 would be drawable again in
+    poll 2 and nothing would show that it happened.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda s, **kw: "B2")
+
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Kobe"))
+
+    # The restart: everything in memory is thrown away and rebuilt from
+    # the pinned shards, exactly as load_state does on boot.
+    reloaded = items_state.decode_shards(items_state.encode_state(items_bot._STATE))
+    assert reloaded is not None
+    items_bot._STATE = reloaded
+
+    session = items_bot._STATE.raffle_session
+    assert session is not None, "the session must come back from the pin"
+    assert session.current_item == "Log B"
+    assert session.winners == ("Kobe",)
+
+    # And the exclusion still bites after the restart.
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Kobe"))
+
+    assert "already won earlier in this session" in ctx.sent[-1]["embed"].description
+    assert items_state.find_raffle(items_bot._STATE, "Log B").winners == ()
+
+
+def test_a_winner_from_a_failed_attempt_still_counts_against_the_session(monkeypatch):
+    """A partial write leaves names recorded. They must still exclude.
+
+    !won Kobe - Ryuu ticks Kobe, then Sheets fails on Ryuu. The officer
+    re-runs !won Ryuu. If the session records only what the retry wrote,
+    Kobe drops out of the winner list and can win a later poll -- having
+    already been given a log in this same sitting.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe", "Ryuu"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe", "Ryuu"), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe", "Ryuu"), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+
+    def commit(spreadsheet, **kwargs):
+        if kwargs["ign"] == "Ryuu":
+            raise RuntimeError("Sheets is down")
+        return "B2"
+
+    monkeypatch.setattr(items_sheet, "commit_approval", commit)
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Kobe - Ryuu"))
+    assert items_bot._STATE.raffle_session.position == 0, "the poll stays current"
+
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda s, **kw: "B2")
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Ryuu"))
+
+    session = items_bot._STATE.raffle_session
+    assert session.results == (("Log A", ("Kobe", "Ryuu")),)
+    assert session.winners == ("Kobe", "Ryuu")
+    # Log B's pool must offer neither of them.
+    description = ctx.sent[-1]["embed"].description
+    assert "1. Jjew" in description
+    assert "Won earlier this session" in description
