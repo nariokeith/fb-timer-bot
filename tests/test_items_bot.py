@@ -955,14 +955,18 @@ def test_a_repost_delete_failure_still_posts_a_new_board_and_keeps_the_request(m
     assert ctx.sent[-1]["embed"].title == "✅ Request queued"
 
 
-def test_a_failed_repost_send_leaves_the_board_ready_for_the_next_refresh(monkeypatch):
+def test_a_failed_repost_send_leaves_the_existing_board_in_place(monkeypatch):
+    # A repost sends the replacement before removing what it replaces. The
+    # old ordering deleted first, so a send that lost to a 429 left members
+    # with no board at all -- and refresh_board swallows the error, so
+    # nobody would have been told.
     _, board_channel, old_board = _queue_board(monkeypatch, raise_on_send=True)
     items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = items_bot.BOARD_REPOST_EVERY - 1
 
     ctx = _queue_successes(monkeypatch, 1)[0]
 
-    assert old_board.deleted
-    assert items_bot._STATE.board_message_id is None
+    assert not old_board.deleted
+    assert items_bot._STATE.board_message_id == old_board.id
     assert ctx.sent[-1]["embed"].title == "✅ Request queued"
 
     board_channel.raise_on_send = False

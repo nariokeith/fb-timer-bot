@@ -292,19 +292,10 @@ async def refresh_board() -> None:
             except discord.NotFound:
                 pass
 
-        if message is not None and repost:
-            try:
-                await message.delete()
-            except Exception as exc:
-                print(
-                    f"[items] could not remove old queue board: {exc!r}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                # A replacement send may fail, so never retain an ID for a
-                # message we know Discord has already removed.
-                _STATE.board_message_id = None
+        # Delete after sending: a rate-limited replacement could otherwise leave
+        # members with no board, and refresh_board swallows its errors so nobody
+        # would be told.
+        old_message = message if message is not None and repost else None
 
         message = await channel.send(embed=embed)
         try:
@@ -313,6 +304,15 @@ async def refresh_board() -> None:
             print(f"[items] could not pin queue board: {exc!r}", file=sys.stderr, flush=True)
         _STATE.board_message_id = message.id
         _SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
+        if old_message is not None:
+            try:
+                await old_message.delete()
+            except Exception as exc:
+                print(
+                    f"[items] could not remove old queue board: {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         state_channel = (
             bot.get_channel(_STATE.officer_channel_id)
             if _STATE.officer_channel_id is not None
