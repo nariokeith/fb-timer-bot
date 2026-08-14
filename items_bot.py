@@ -1673,6 +1673,29 @@ async def poll_cmd(ctx, *, argument: str = ""):
 
         now = items_rules.now_pht()
         now_text = items_rules.format_timestamp(now)
+        # A poll the running session has still to reach would be
+        # superseded below, taking the frozen pool with it -- and the
+        # session, which holds only the item NAME, would then resolve to
+        # the replacement and sit waiting for a poll that has just opened.
+        session = _STATE.raffle_session
+        if session is not None and not session.finished:
+            wanted = items_rules.normalize(item)
+            pending = [
+                name
+                for name in session.items[session.position :]
+                if items_rules.normalize(name) == wanted
+            ]
+            if pending:
+                await ctx.send(
+                    embed=error_embed(
+                        "Poll refused",
+                        f"The running raffle session has still to draw "
+                        f"**{item}**. Draw it with `!won`, or pass on it with "
+                        "`!skipraffle`, before opening a new poll for it.",
+                    )
+                )
+                return
+
         existing = items_state.find_raffle(_STATE, item)
         # Neither superseded nor evictable, and find_raffle only ever
         # returns the newest raffle for a name -- opening a new poll here

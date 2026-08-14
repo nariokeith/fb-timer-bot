@@ -3844,3 +3844,44 @@ def test_a_winner_from_a_failed_attempt_still_counts_against_the_session(monkeyp
     description = ctx.sent[-1]["embed"].description
     assert "1. Jjew" in description
     assert "Won earlier this session" in description
+
+
+def test_poll_refuses_an_item_the_session_still_has_to_draw(monkeypatch):
+    """Re-polling a pending log would discard the pool the session froze.
+
+    poll_cmd supersedes an ended, undrawn raffle. If the session is still
+    to draw that log, the frozen pool it was going to use disappears and
+    the session stalls on a poll that has only just opened.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Asta's Heart", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart",), position=0
+    )
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert ctx.sent[-1]["embed"].title == "❌ Poll refused"
+    raffle = items_state.find_raffle(items_bot._STATE, "Asta's Heart")
+    assert raffle.listed is True, "the frozen pool must survive"
+    assert raffle.eligible == ("Jjew",)
+
+
+def test_poll_still_works_for_a_log_the_session_has_finished_with(monkeypatch):
+    """Only the polls still to be drawn are protected."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", "Amentis Foot"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Amentis Foot", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Asta's Heart", "Amentis Foot"), position=1,
+        results=(("Asta's Heart", ("Kobe",)),),
+    )
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert ctx.sent[-1]["embed"].title == "✅ Raffle open"
