@@ -140,6 +140,11 @@ class FakeChannel:
         return message
 
 
+class FakeGuild:
+    def __init__(self, text_channels):
+        self.text_channels = text_channels
+
+
 class FakePollAnswer:
     def __init__(self, text, voters=()):
         self.text = text
@@ -669,6 +674,71 @@ def test_refresh_board_is_a_noop_without_a_configured_queue_channel(monkeypatch)
     asyncio.run(items_bot.refresh_board())
 
     assert channel.sent == []
+
+
+def test_on_ready_draws_the_queue_board_when_no_special_log_requests_are_dropped(monkeypatch):
+    state_channel = FakeChannel(77)
+    queue_channel = FakeChannel(88)
+    restored_state = items_state.State(
+        officer_channel_id=state_channel.id,
+        queue_channel_id=queue_channel.id,
+        queue=[_queued("gear", "Dajz", "Asta's Belt", items_rules.GEAR)],
+    )
+    state_channel._pins = [
+        FakeMessage(content, message_id=part)
+        for part, content in enumerate(items_state.encode_state(restored_state))
+    ]
+    items_bot._STATE.officer_channel_id = state_channel.id
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {
+            state_channel.id: state_channel,
+            queue_channel.id: queue_channel,
+        }.get(channel_id),
+    )
+
+    asyncio.run(items_bot.on_ready())
+
+    assert queue_channel.sent, "on_ready did not draw the queue board"
+    assert queue_channel.sent[0].embed.title == "📦 Queue Board"
+    assert "1   Dajz" in queue_channel.sent[0].embed.description
+
+
+def test_on_ready_draws_the_queue_board_after_pin_scanning_when_no_special_log_requests_are_dropped(monkeypatch):
+    state_channel = FakeChannel(77)
+    state_channel.name = "officers"
+    queue_channel = FakeChannel(88)
+    restored_state = items_state.State(
+        officer_channel_id=state_channel.id,
+        queue_channel_id=queue_channel.id,
+        queue=[_queued("gear", "Dajz", "Asta's Belt", items_rules.GEAR)],
+    )
+    state_channel._pins = [
+        FakeMessage(content, message_id=part)
+        for part, content in enumerate(items_state.encode_state(restored_state))
+    ]
+    guild = FakeGuild([state_channel, queue_channel])
+    items_bot._STATE.officer_channel_id = None
+    monkeypatch.setattr(
+        type(items_bot.bot),
+        "guilds",
+        property(lambda _bot: [guild]),
+    )
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {
+            state_channel.id: state_channel,
+            queue_channel.id: queue_channel,
+        }.get(channel_id),
+    )
+
+    asyncio.run(items_bot.on_ready())
+
+    assert queue_channel.sent, "on_ready did not draw the queue board"
+    assert queue_channel.sent[0].embed.title == "📦 Queue Board"
+    assert "1   Dajz" in queue_channel.sent[0].embed.description
 
 
 def test_refresh_board_edits_the_existing_message_with_queue_order(monkeypatch):

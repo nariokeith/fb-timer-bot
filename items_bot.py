@@ -1576,6 +1576,7 @@ async def on_ready():
                     if await load_state(channel):
                         print(f"[items] restored state from #{channel.name}", flush=True)
                         await announce_dropped_specials(channel)
+                        await refresh_board()
                         return
                 except discord.HTTPException:
                     continue
@@ -1586,6 +1587,9 @@ async def on_ready():
     if channel is not None:
         await load_state(channel)
         await announce_dropped_specials(channel)
+        # Free-tier restarts happen often; otherwise a board lost while the
+        # bot was down stays lost until someone re-runs !setqueuechannel.
+        await refresh_board()
 
 
 @bot.event
