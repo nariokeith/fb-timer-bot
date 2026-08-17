@@ -16,8 +16,10 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Exit codes meaning "I stopped on purpose, leave me alone".
 # 78 is EX_CONFIG from sysexits.h -- the attendance bot uses it when its
@@ -45,11 +47,82 @@ RESTART_DELAY_CAP = 300.0  # 5 minutes
 RESTART_RESET_AFTER = 60.0
 
 
+DEFAULT_KEEPALIVE_PORT = 8080
+
+
 @dataclass(frozen=True)
 class ChildSpec:
     name: str
     argv: list[str]
     no_restart_codes: frozenset[int] = NO_RESTART_CODES
+
+
+def start_keepalive(supervisor, port: int | None = None):
+    """Bind $PORT and answer pings, for as long as the supervisor lives.
+
+    Render only keeps a free web service awake while something answers
+    HTTP on $PORT. This listener used to live in bot.py's setup_hook,
+    which runs only after a successful Discord login -- so the night
+    Discord became unreachable, no bot ever logged in, nothing bound the
+    port, Render found a dead service and spun it down. The bots could
+    not come back even once Discord recovered, because the instance was
+    asleep and could not be woken.
+
+    It belongs here because the supervisor is the one process that stays
+    up precisely when the children cannot: a crash-looping bot no longer
+    takes the whole service down with it.
+
+    Returns the server, or None if the port could not be bound. A failed
+    bind is deliberately not fatal -- the bots matter more than the ping,
+    and refusing to start them over a busy port would trade a service
+    that sleeps for one that never runs at all.
+    """
+    if port is None:
+        port = int(os.getenv("PORT", str(DEFAULT_KEEPALIVE_PORT)))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            running = supervisor.running_names()
+            body = (
+                "fb-timer supervisor alive\n"
+                f"running: {', '.join(running) if running else 'none'}\n"
+            ).encode()
+            # 200 even with no child running: this answers "is the service
+            # up", and the supervisor IS up and restarting them. A 503 here
+            # would let Render sleep the instance during the exact outage
+            # this endpoint exists to survive.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            # An uptime pinger hits this every few minutes; the default
+            # handler would write a line per request to stderr and bury
+            # the supervisor's own output.
+            pass
+
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as exc:
+        print(f"[supervisor] keep-alive not started (port {port}): {exc}", flush=True)
+        return None
+
+    thread = threading.Thread(
+        target=server.serve_forever, name="keepalive", daemon=True
+    )
+    thread.start()
+    print(f"[supervisor] keep-alive listening on port {port}", flush=True)
+    return server
+
+
+def stop_keepalive(server) -> None:
+    """Shut the keep-alive server down. Safe to call with None."""
+    if server is None:
+        return
+    server.shutdown()
+    server.server_close()
 
 
 def should_restart(exit_code: int, no_restart_codes: frozenset[int] = NO_RESTART_CODES) -> bool:
@@ -212,6 +285,16 @@ class Supervisor:
         signal.signal(signal.SIGTERM, handle_signal)
         signal.signal(signal.SIGINT, handle_signal)
 
+        # Before the children, not after: the port must be answering even
+        # if every bot crashes on its first attempt, which is exactly the
+        # case that used to let Render sleep the whole service.
+        keepalive = start_keepalive(self)
+        try:
+            self._supervise()
+        finally:
+            stop_keepalive(keepalive)
+
+    def _supervise(self) -> None:
         self.start_all()
         while not self._stopping:
             time.sleep(POLL_INTERVAL)

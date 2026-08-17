@@ -11,8 +11,9 @@ The bot posts a notification in the configured channel (`!setchannel`)
 Built to run on Render's free tier:
   * All times use the BOT_TZ timezone (default Asia/Manila), no matter
     where the server is located.
-  * A tiny web server binds $PORT so an uptime pinger can keep the free
-    instance awake.
+  * supervisor.py binds $PORT so an uptime pinger can keep the free
+    instance awake. It lives there, not here, so a bot that cannot reach
+    Discord no longer leaves the port dead and the service asleep.
   * State (channel + kill times) is mirrored into a pinned Discord message,
     so it survives Render wiping the disk on every restart/redeploy. That
     message lives in the notification channel by default; `!setstoragechannel`
@@ -31,7 +32,6 @@ os.environ["TZ"] = os.getenv("BOT_TZ", os.environ.get("TZ", "Asia/Manila"))
 time.tzset()
 
 import discord
-from aiohttp import web
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
@@ -432,27 +432,6 @@ def boss_embed(
 
 
 # ---------------------------------------------------------------------------
-# Keep-alive web server so an uptime pinger can stop Render from sleeping
-# ---------------------------------------------------------------------------
-
-
-async def start_keepalive() -> None:
-    async def alive(_request):
-        return web.Response(text="FB Timer bot is alive")
-
-    app = web.Application()
-    app.router.add_get("/", alive)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "8080"))
-    try:
-        await web.TCPSite(runner, "0.0.0.0", port).start()
-        print(f"Keep-alive server listening on port {port}.")
-    except OSError as exc:
-        print(f"Keep-alive server not started (port {port}): {exc}")
-
-
-# ---------------------------------------------------------------------------
 # Bot
 # ---------------------------------------------------------------------------
 
@@ -461,11 +440,6 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 _started = False
-
-
-@bot.event
-async def setup_hook():
-    await start_keepalive()
 
 
 @bot.event

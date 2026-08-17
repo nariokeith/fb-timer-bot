@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import supervisor as supervisor_mod
 from supervisor import (
     CHILDREN,
     EXIT_NOT_CONFIGURED,
@@ -516,3 +517,144 @@ def test_crash_looping_is_logged(stopper, capsys):
 
     out = capsys.readouterr().out
     assert "crash-looping" in out, out
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive server
+#
+# Render only keeps a free web service awake while something answers HTTP on
+# $PORT. That listener used to live inside bot.py's setup_hook, which runs
+# only after a successful Discord login -- so an outage that stopped the bots
+# connecting also silenced the listener, Render spun the service down, and
+# every bot went with it. The supervisor owns it now precisely because the
+# supervisor is the one thing that stays up when the children cannot.
+# ---------------------------------------------------------------------------
+
+
+def _get(port, path="/", timeout=5.0):
+    """One HTTP GET against the keep-alive server, as an uptime pinger does."""
+    import urllib.request
+
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+        return r.status, r.read().decode()
+
+
+def test_keepalive_answers_while_every_bot_is_down(stopper):
+    """The regression test for the outage: no child alive, still answering.
+
+    If this fails, Render sees a dead port, spins the service down, and the
+    bots cannot come back even once Discord is reachable again.
+    """
+    sup = Supervisor([ChildSpec("crashy", EXIT_CRASH)], restart_delay=60.0)
+    stopper.append(sup)
+    server = supervisor_mod.start_keepalive(sup, port=0)
+    assert server is not None, "keep-alive server did not bind"
+    try:
+        sup.start_all()
+        _settle()
+        sup.tick()
+        assert sup.running_names() == [], "test needs every child dead"
+
+        status, body = _get(server.server_address[1])
+        assert status == 200
+        assert body, "keep-alive answered with an empty body"
+    finally:
+        supervisor_mod.stop_keepalive(server)
+
+
+def test_keepalive_reports_which_children_are_running(stopper):
+    sup = Supervisor([ChildSpec("sleeper", SLEEP_FOREVER)])
+    stopper.append(sup)
+    server = supervisor_mod.start_keepalive(sup, port=0)
+    try:
+        sup.start_all()
+        _wait_until(lambda: sup.running_names() == ["sleeper"])
+
+        _status, body = _get(server.server_address[1])
+        assert "sleeper" in body, body
+    finally:
+        supervisor_mod.stop_keepalive(server)
+
+
+def test_keepalive_binds_the_port_env_var(stopper, monkeypatch):
+    """Render injects $PORT; binding anything else means no open port."""
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+
+    monkeypatch.setenv("PORT", str(free_port))
+    sup = Supervisor([])
+    stopper.append(sup)
+    server = supervisor_mod.start_keepalive(sup)
+    try:
+        assert server is not None
+        assert server.server_address[1] == free_port
+    finally:
+        supervisor_mod.stop_keepalive(server)
+
+
+def test_keepalive_survives_a_port_already_in_use(stopper):
+    """A taken port must not stop the bots -- they matter more than the ping."""
+    import socket
+
+    # Bound on 0.0.0.0, the same address the keep-alive server uses:
+    # holding only 127.0.0.1 is not a conflict, because SO_REUSEADDR lets
+    # a wildcard bind succeed alongside a loopback one.
+    held = socket.socket()
+    held.bind(("0.0.0.0", 0))
+    held.listen(1)
+    taken = held.getsockname()[1]
+    try:
+        sup = Supervisor([])
+        stopper.append(sup)
+        server = supervisor_mod.start_keepalive(sup, port=taken)
+        assert server is None, "expected the bind to fail without raising"
+    finally:
+        held.close()
+
+
+def test_run_binds_the_port_even_when_every_child_crashes():
+    """End to end through run(), the entry point Render actually executes.
+
+    Covers the wiring, not just start_keepalive: a keep-alive that works in
+    isolation but is never started by run() would fail in exactly the way
+    the outage did, and silently.
+    """
+    import socket
+    import urllib.request
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    script = (
+        "import supervisor\n"
+        "supervisor.CHILDREN = [supervisor.ChildSpec('crashy', "
+        f"[{sys.executable!r}, '-c', 'import sys; sys.exit(1)'])]\n"
+        "supervisor.Supervisor(supervisor.CHILDREN, restart_delay=60.0).run()\n"
+    )
+    env = {**os.environ, "PORT": str(port)}
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", script], cwd=REPO_ROOT, env=env
+    )
+    try:
+        def answers():
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/", timeout=1.0
+                ) as r:
+                    return r.status == 200
+            except Exception:
+                return False
+
+        assert _wait_until(answers, timeout=15.0), (
+            "run() never bound $PORT; Render would see a dead service and sleep it"
+        )
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
