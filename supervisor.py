@@ -74,7 +74,10 @@ DEFAULT_KEEPALIVE_PORT = 8080
 # inbound request, and a sleeping instance sends no spawn notifications.
 # 10 minutes leaves room for one ping to fail outright and the next to
 # still land inside the window.
-SELF_PING_INTERVAL = 600.0
+# Five minutes, not ten: a ping can fail outright -- the dead edge
+# address guarantees some will -- and two consecutive misses still leave
+# the next attempt inside Render's ~15-minute window.
+SELF_PING_INTERVAL = 300.0
 SELF_PING_TIMEOUT = 10.0
 
 
@@ -258,10 +261,16 @@ def start_self_ping(url: str | None = None, *, ping=ping_once):
     stop = threading.Event()
 
     def loop():
-        while not stop.wait(SELF_PING_INTERVAL):
+        # Ping immediately, then on the interval. Waiting the interval out
+        # first left the instance unguarded for that long after every
+        # deploy -- the very moment it is most likely to be idle, because
+        # the container is new and no visitor has arrived yet.
+        while True:
             started = time.monotonic()
             ok = ping(url)
             report_ping(ok, url, time.monotonic() - started)
+            if stop.wait(SELF_PING_INTERVAL):
+                return
 
     thread = threading.Thread(target=loop, name="self-ping", daemon=True)
     thread._stop_event = stop

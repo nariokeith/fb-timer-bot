@@ -2,6 +2,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -890,3 +891,34 @@ def test_a_failed_self_ping_says_so(capsys):
 
     out = capsys.readouterr().out
     assert "self-ping" in out and "failed" in out
+
+
+def test_the_first_self_ping_does_not_wait_for_the_interval():
+    """A restart must not open an unguarded window.
+
+    Waiting the full interval before the first ping left the instance
+    unprotected for that whole period after every deploy -- which is
+    exactly when it is most likely to be idle, since a deploy replaces
+    the container and no visitor has arrived yet. Observed live: a deploy
+    at 11:03 left the first ping due at 11:13, and the instance had
+    already slept by 11:08.
+    """
+    pinged = threading.Event()
+    thread = supervisor_mod.start_self_ping(
+        "https://example.onrender.com",
+        ping=lambda url: pinged.set() or True,
+    )
+    try:
+        assert pinged.wait(timeout=5.0), "no ping before the first interval elapsed"
+    finally:
+        supervisor_mod.stop_self_ping(thread)
+
+
+def test_a_single_missed_ping_cannot_reach_renders_idle_timeout():
+    """Two intervals must still fit inside the 15-minute window.
+
+    One ping can fail -- the dead edge address guarantees some will -- and
+    the gap that leaves has to stay survivable rather than sleeping the
+    instance until an external monitor happens to wake it.
+    """
+    assert supervisor_mod.SELF_PING_INTERVAL * 2 < 15 * 60
