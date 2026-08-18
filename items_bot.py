@@ -1614,6 +1614,31 @@ async def on_ready():
         await refresh_board()
 
 
+def _is_rate_limited(error: BaseException) -> bool:
+    """True if Discord turned this command away for rate limiting.
+
+    The interesting exception is wrapped: the framework hands the handler
+    a CommandInvokeError carrying the real one in .original.
+    """
+    original = getattr(error, "original", error)
+    return isinstance(original, discord.HTTPException) and original.status == 429
+
+
+async def _safe_send(ctx, embed) -> None:
+    """Report a failure without becoming one.
+
+    The error handler runs precisely when Discord is misbehaving, so its
+    own send can fail for the same reason the command did -- a rate limit,
+    a lost permission, a deleted channel. An exception escaping here is
+    reported by discord.py as a second full traceback, which is how one
+    rate-limited command turned into two tracebacks in the log.
+    """
+    try:
+        await ctx.send(embed=embed)
+    except Exception as exc:
+        print(f"[items] could not report an error: {exc!r}", file=sys.stderr, flush=True)
+
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
@@ -1623,21 +1648,40 @@ async def on_command_error(ctx, error):
         # guard is keeping quiet, and would advertise that the command exists.
         return
     if isinstance(error, commands.MissingPermissions):
-        await ctx.send(embed=error_embed("Not allowed", "That command is for administrators."))
+        await _safe_send(ctx, error_embed("Not allowed", "That command is for administrators."))
         return
     if isinstance(error, (commands.MemberNotFound, commands.MissingRequiredArgument)):
         # Arguments are converted after checks run, so a mistyped member
         # would otherwise surface as an unexplained internal error.
-        await ctx.send(
-            embed=error_embed(
+        await _safe_send(
+            ctx,
+            error_embed(
                 "Not recorded",
                 f"`!{ctx.command.name}` needs a member the bot can see. "
                 "Usage: `!bind @user <IGN>` or `!notaplayer @user`.",
-            )
+            ),
         )
         return
+
+    # Logged first and unconditionally: stderr is the one report that
+    # cannot itself fail, and the raw error is what a maintainer needs.
     print(f"[items] command error: {error!r}", flush=True)
-    await ctx.send(embed=error_embed("Something went wrong", str(error)))
+
+    if _is_rate_limited(error):
+        # Discord's own text is a paragraph of API documentation. It tells
+        # a member nothing they can act on, and this is not their fault or
+        # the bot's -- the block is on the host's shared address.
+        await _safe_send(
+            ctx,
+            error_embed(
+                "Discord is rate limiting the bot",
+                "Nothing was recorded. Please run the command again in a "
+                "minute or two.",
+            ),
+        )
+        return
+
+    await _safe_send(ctx, error_embed("Something went wrong", str(error)))
 
 
 def main() -> None:

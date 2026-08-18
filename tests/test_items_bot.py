@@ -4131,3 +4131,68 @@ def test_an_unusable_shard_is_replaced_then_deleted():
     assert len(channel.sent) == 1
     assert [m.id for m in items_bot._STATE_MESSAGES] == [channel.sent[0].id]
     assert channel.sent[0].pinned
+
+
+# -- The error handler must survive Discord being unreachable ----------------
+#
+# Observed 2026-08-18 18:28-18:31: Discord answered several commands with
+# "429 ... exceeding global rate limits" -- an IP-level block, since two
+# bots on different tokens hit it at the same moment. items_bot's handler
+# then tried to REPORT that failure with another ctx.send, which failed
+# the same way, so the handler itself raised and discord.py logged a
+# second full traceback ("Ignoring exception in on_command_error").
+
+class _RaisingCtx(FakeCtx):
+    def __init__(self, channel, error):
+        super().__init__(channel)
+        self._error = error
+
+    async def send(self, **kwargs):
+        self.sent.append(kwargs)
+        raise self._error
+
+
+def _rate_limited_error():
+    response = type("Response", (), {"status": 429, "reason": "Too Many Requests"})()
+    original = discord.HTTPException(
+        response,
+        "You are being blocked from accessing our API temporarily due to "
+        "exceeding global rate limits.",
+    )
+    return commands.CommandInvokeError(original)
+
+
+def test_the_error_handler_survives_a_failing_report(capsys):
+    """Reporting the failure must not become a second, louder failure."""
+    ctx = _RaisingCtx(FakeChannel(), _rate_limited_error().original)
+    ctx.command = type("Cmd", (), {"name": "request"})()
+
+    asyncio.run(items_bot.on_command_error(ctx, _rate_limited_error()))
+
+    captured = capsys.readouterr()
+    assert "429" in captured.out + captured.err, "the real cause must still be logged"
+
+
+def test_a_rate_limit_is_explained_rather_than_dumped():
+    """Members should not be shown Discord's raw API error text."""
+    channel = FakeChannel()
+    ctx = FakeCtx(channel)
+    ctx.command = type("Cmd", (), {"name": "request"})()
+
+    asyncio.run(items_bot.on_command_error(ctx, _rate_limited_error()))
+
+    description = ctx.sent[-1]["embed"].description
+    assert "developers/docs" not in description, "raw Discord error leaked to members"
+    assert "again" in description.lower(), "should tell the member what to do"
+
+
+def test_an_ordinary_error_is_still_reported_in_full():
+    channel = FakeChannel()
+    ctx = FakeCtx(channel)
+    ctx.command = type("Cmd", (), {"name": "request"})()
+
+    asyncio.run(
+        items_bot.on_command_error(ctx, commands.CommandInvokeError(ValueError("boom")))
+    )
+
+    assert "boom" in ctx.sent[-1]["embed"].description
