@@ -465,3 +465,108 @@ def test_snapshot_still_refuses_a_permanent_error_immediately(code):
         items_sheet.read_snapshot(spreadsheet, sleep=lambda _: None)
 
     assert spreadsheet.attempts == 1, "a permanent failure must not cost a wait"
+
+
+# -- Transient errors on the approval path -----------------------------------
+#
+# read_snapshot retries, but the reads inside record_special/record_gear,
+# find_row and _worksheet_or_refuse did not -- so a 503 failed an
+# OFFICER'S APPROVAL, which is worse than a failed !request: the member is
+# already queued and waiting on it.
+
+class FlakyReadWorksheet:
+    """Fails the first `read_failures` reads; counts writes separately."""
+
+    def __init__(self, inner, read_failures=0, error=None, write_failures=0):
+        self._inner = inner
+        self._read_remaining = read_failures
+        self._write_remaining = write_failures
+        self._error = error or _api_error_with_code(503, "unavailable")
+        self.read_attempts = 0
+        self.write_attempts = 0
+
+    def get_all_values(self):
+        self.read_attempts += 1
+        if self._read_remaining > 0:
+            self._read_remaining -= 1
+            raise self._error
+        return self._inner.get_all_values()
+
+    def batch_update(self, payload):
+        self.write_attempts += 1
+        if self._write_remaining > 0:
+            self._write_remaining -= 1
+            raise self._error
+        return self._inner.batch_update(payload)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _spreadsheet_with_flaky_special(**kwargs):
+    spreadsheet = make_spreadsheet()
+    flaky = FlakyReadWorksheet(spreadsheet._sheets[items_sheet.SPECIAL_TAB], **kwargs)
+    spreadsheet._sheets[items_sheet.SPECIAL_TAB] = flaky
+    return spreadsheet, flaky
+
+
+def test_record_special_retries_a_transient_read(monkeypatch):
+    monkeypatch.setattr(items_sheet.time, "sleep", lambda _: None)
+    spreadsheet, flaky = _spreadsheet_with_flaky_special(read_failures=2)
+
+    address = items_sheet.record_special(spreadsheet, "Dajz", "Asta's Heart")
+
+    assert address
+    assert flaky.read_attempts == 3
+    assert flaky.write_attempts == 1, "the write must still happen exactly once"
+
+
+def test_record_special_never_retries_its_write(monkeypatch):
+    """A repeated batch_update could tick a box the first attempt already set."""
+    monkeypatch.setattr(items_sheet.time, "sleep", lambda _: None)
+    spreadsheet, flaky = _spreadsheet_with_flaky_special(write_failures=1)
+
+    with pytest.raises(gspread.exceptions.APIError):
+        items_sheet.record_special(spreadsheet, "Dajz", "Asta's Heart")
+
+    assert flaky.write_attempts == 1
+
+
+def test_record_gear_retries_a_transient_read(monkeypatch):
+    monkeypatch.setattr(items_sheet.time, "sleep", lambda _: None)
+    spreadsheet = make_spreadsheet()
+    flaky = FlakyReadWorksheet(spreadsheet._sheets[items_sheet.GEAR_TAB], read_failures=2)
+    spreadsheet._sheets[items_sheet.GEAR_TAB] = flaky
+
+    items_sheet.record_gear(spreadsheet, "Kobe", "Asta's Belt")
+
+    assert flaky.read_attempts == 3
+    assert flaky.write_attempts == 1
+
+
+def test_a_tab_lookup_retries_a_transient_error(monkeypatch):
+    """spreadsheet.worksheet() is a real round trip; it can fail transiently."""
+    monkeypatch.setattr(items_sheet.time, "sleep", lambda _: None)
+    spreadsheet = make_spreadsheet()
+    real_worksheet = spreadsheet.worksheet
+    calls = {"n": 0}
+
+    def flaky_worksheet(title):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise _api_error_with_code(503, "unavailable")
+        return real_worksheet(title)
+
+    spreadsheet.worksheet = flaky_worksheet
+
+    assert items_sheet._worksheet_or_refuse(spreadsheet, items_sheet.SPECIAL_TAB)
+    assert calls["n"] == 3
+
+
+def test_a_missing_tab_still_refuses_immediately(monkeypatch):
+    """WorksheetNotFound is not transient -- no waiting for the same answer."""
+    monkeypatch.setattr(items_sheet.time, "sleep", lambda _: None)
+    spreadsheet = make_spreadsheet()
+
+    with pytest.raises(items_sheet.SheetStructureError):
+        items_sheet._worksheet_or_refuse(spreadsheet, "No Such Tab")

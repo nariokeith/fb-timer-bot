@@ -213,7 +213,7 @@ def find_row(worksheet, ign: str, grid: list[list[str]] | None = None) -> int:
     Refuses rather than creating a row: the sheet is hand-maintained and
     a bot-invented row would be invisible to the officers who curate it.
     """
-    grid = grid if grid is not None else worksheet.get_all_values()
+    grid = grid if grid is not None else _retrying_reads(worksheet.get_all_values, time.sleep)
     wanted = normalize(ign)
     matches = []
     for index, row in enumerate(grid[HEADER_ROW:], start=HEADER_ROW + 1):
@@ -300,7 +300,7 @@ class LedgerWriteError(RuntimeError):
 
 def _worksheet_or_refuse(spreadsheet, title: str):
     try:
-        return spreadsheet.worksheet(title)
+        return _retrying_reads(lambda: spreadsheet.worksheet(title), time.sleep)
     except gspread.exceptions.WorksheetNotFound:
         raise SheetStructureError(
             f"Worksheet {title!r} does not exist in this spreadsheet yet"
@@ -321,7 +321,9 @@ def record_special(spreadsheet, ign: str, item: str) -> str:
     edited by hand in between.
     """
     worksheet = _worksheet_or_refuse(spreadsheet, SPECIAL_TAB)
-    grid = worksheet.get_all_values()
+    # Read retried, write below is not: an officer's approval should
+    # survive a Sheets blip, but never write twice because of one.
+    grid = _retrying_reads(worksheet.get_all_values, time.sleep)
     row = find_row(worksheet, ign, grid)
     column = find_column(worksheet, item, grid)
 
@@ -345,7 +347,7 @@ def record_special(spreadsheet, ign: str, item: str) -> str:
 def record_gear(spreadsheet, ign: str, item: str) -> str:
     """Add one to this player's count. Returns the A1 address written."""
     worksheet = _worksheet_or_refuse(spreadsheet, GEAR_TAB)
-    grid = worksheet.get_all_values()
+    grid = _retrying_reads(worksheet.get_all_values, time.sleep)
     row = find_row(worksheet, ign, grid)
     column = find_column(worksheet, item, grid)
 
