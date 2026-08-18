@@ -922,3 +922,74 @@ def test_a_single_missed_ping_cannot_reach_renders_idle_timeout():
     instance until an external monitor happens to wake it.
     """
     assert supervisor_mod.SELF_PING_INTERVAL * 2 < 15 * 60
+
+
+# -- Two rate limits, two cooldowns ------------------------------------------
+
+EXIT_BRIEF_CHILD = _python(f"import sys; sys.exit({supervisor_mod.EXIT_RATE_LIMITED_BRIEF})")
+
+
+def test_a_brief_rate_limit_is_restartable():
+    assert should_restart(supervisor_mod.EXIT_RATE_LIMITED_BRIEF) is True
+    for spec in CHILDREN:
+        assert should_restart(
+            supervisor_mod.EXIT_RATE_LIMITED_BRIEF, spec.no_restart_codes
+        ) is True
+
+
+def test_the_brief_cooldown_is_much_shorter_than_the_edge_ban_one():
+    """Discord's global limit clears in minutes; a 1015 does not."""
+    assert supervisor_mod.BRIEF_RATE_LIMIT_COOLDOWN < RATE_LIMIT_COOLDOWN
+    assert supervisor_mod.BRIEF_RATE_LIMIT_COOLDOWN <= 600
+
+
+def test_a_brief_rate_limit_uses_the_short_cooldown(stopper):
+    sup = Supervisor(
+        [ChildSpec("brief", EXIT_BRIEF_CHILD)],
+        restart_delay=0.1,
+        rate_limit_cooldown=30.0,
+        brief_rate_limit_cooldown=0.3,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    sup.tick()
+    # The long cooldown would still be holding it; the short one lets go.
+    assert _wait_until(lambda: sup.tick() == ["brief"], timeout=3.0)
+
+
+def test_an_edge_ban_still_uses_the_long_cooldown(stopper):
+    sup = Supervisor(
+        [ChildSpec("banned", EXIT_RATE_LIMITED_CHILD)],
+        restart_delay=0.1,
+        rate_limit_cooldown=30.0,
+        brief_rate_limit_cooldown=0.3,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    sup.tick()
+    sup._due_at["banned"] = time.monotonic()
+    assert sup.tick() == [], "an edge ban must not get the short cooldown"
+
+
+def test_the_brief_cooldown_also_covers_the_siblings(stopper):
+    """The block is on the IP, so a sibling's login would extend it."""
+    sup = Supervisor(
+        [
+            ChildSpec("brief", EXIT_BRIEF_CHILD),
+            ChildSpec("sibling", EXIT_CRASH),
+        ],
+        restart_delay=0.1,
+        rate_limit_cooldown=30.0,
+        brief_rate_limit_cooldown=30.0,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    sup.tick()
+    sup._due_at["sibling"] = time.monotonic()
+    assert sup.tick() == []

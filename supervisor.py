@@ -44,6 +44,14 @@ EXIT_NOT_CONFIGURED = 78
 # therefore never appear in any no_restart_codes set.
 EXIT_RATE_LIMITED = 75
 
+# 76 is the same situation with a much shorter fuse: Discord's own
+# "exceeding global rate limits" rather than a Cloudflare edge ban. It is
+# an application-layer block measured in minutes -- one observed on
+# 2026-08-18 lasted about nine -- so holding every bot for the full
+# RATE_LIMIT_COOLDOWN spends most of the outage waiting on something that
+# has already cleared. Restartable, like 75.
+EXIT_RATE_LIMITED_BRIEF = 76
+
 NO_RESTART_CODES = frozenset({0, EXIT_NOT_CONFIGURED})
 
 POLL_INTERVAL = 2.0
@@ -66,6 +74,11 @@ RESTART_RESET_AFTER = 60.0
 # is chosen to comfortably outlast a 1015; the cost of overshooting is a
 # late restart, the cost of undershooting is a loop that never ends.
 RATE_LIMIT_COOLDOWN = 1800.0  # 30 minutes
+
+# For EXIT_RATE_LIMITED_BRIEF. Long enough that a still-active block is
+# not hammered -- three logins per attempt -- and short enough that a
+# block which has lifted costs minutes rather than half an hour.
+BRIEF_RATE_LIMIT_COOLDOWN = 300.0  # 5 minutes
 
 
 DEFAULT_KEEPALIVE_PORT = 8080
@@ -301,6 +314,7 @@ class Supervisor:
         max_restart_delay: float = RESTART_DELAY_CAP,
         restart_reset_after: float = RESTART_RESET_AFTER,
         rate_limit_cooldown: float = RATE_LIMIT_COOLDOWN,
+        brief_rate_limit_cooldown: float = BRIEF_RATE_LIMIT_COOLDOWN,
     ):
         self._specs = {spec.name: spec for spec in specs}
         self._procs: dict[str, subprocess.Popen] = {}
@@ -308,6 +322,7 @@ class Supervisor:
         self._max_restart_delay = max_restart_delay
         self._restart_reset_after = restart_reset_after
         self._rate_limit_cooldown = rate_limit_cooldown
+        self._brief_rate_limit_cooldown = brief_rate_limit_cooldown
         self._stopping = False
         # Monotonic time before which NO child may be launched, set when
         # any one of them exits with EXIT_RATE_LIMITED. Service-wide on
@@ -380,14 +395,17 @@ class Supervisor:
                 self._current_delay.pop(name, None)
                 continue
 
-            if code == EXIT_RATE_LIMITED:
-                self._cooldown_until = max(
-                    self._cooldown_until, now + self._rate_limit_cooldown
+            if code in (EXIT_RATE_LIMITED, EXIT_RATE_LIMITED_BRIEF):
+                cooldown = (
+                    self._rate_limit_cooldown
+                    if code == EXIT_RATE_LIMITED
+                    else self._brief_rate_limit_cooldown
                 )
+                self._cooldown_until = max(self._cooldown_until, now + cooldown)
                 print(
                     f"[supervisor] {name} was rate-limited by Discord; "
-                    f"holding every bot for {self._rate_limit_cooldown}s so "
-                    "the ban on this IP can lift",
+                    f"holding every bot for {cooldown}s so "
+                    "the block on this IP can lift",
                     flush=True,
                 )
 

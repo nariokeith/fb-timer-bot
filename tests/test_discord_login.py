@@ -165,3 +165,64 @@ def test_blocked_ip_of_a_page_without_one_is_none():
 
 def test_blocked_ip_reads_the_cloudflare_footer():
     assert discord_login.blocked_ip(CLOUDFLARE_PAGE_WITH_IP) == "74.220.48.29"
+
+
+# -- Two different 429s, two different waits ---------------------------------
+#
+# Cloudflare's 1015 is an edge ban on the IP: it lifts only after the
+# address goes quiet, so waiting half an hour is right. Discord's own
+# "exceeding global rate limits" is a far shorter application-layer block
+# -- observed 2026-08-18 lasting about nine minutes -- and arrives as JSON
+# rather than an HTML page. Treating it like a 1015 kept every bot down
+# for thirty minutes over something that had already cleared.
+
+DISCORD_GLOBAL_BODY = (
+    "You are being blocked from accessing our API temporarily due to "
+    "exceeding global rate limits. Refer to "
+    "https://discord.com/developers/docs/topics/rate-limits for more information."
+)
+
+
+def test_a_cloudflare_page_is_an_edge_ban():
+    assert discord_login.is_edge_ban(CLOUDFLARE_PAGE_WITH_IP)
+    assert discord_login.is_edge_ban(CLOUDFLARE_BODY)
+
+
+def test_discords_global_limit_is_not_an_edge_ban():
+    assert not discord_login.is_edge_ban(DISCORD_GLOBAL_BODY)
+
+
+def test_an_edge_ban_exits_with_the_long_cooldown_code():
+    bot = _Bot(_http_exception(429, CLOUDFLARE_PAGE_WITH_IP))
+
+    with pytest.raises(SystemExit) as exc_info:
+        discord_login.run(bot, "token")
+
+    assert exc_info.value.code == discord_login.EXIT_RATE_LIMITED
+
+
+def test_a_global_limit_exits_with_the_brief_cooldown_code():
+    bot = _Bot(_http_exception(429, DISCORD_GLOBAL_BODY))
+
+    with pytest.raises(SystemExit) as exc_info:
+        discord_login.run(bot, "token")
+
+    assert exc_info.value.code == discord_login.EXIT_RATE_LIMITED_BRIEF
+
+
+def test_a_global_limit_is_not_reported_as_cloudflare(capsys):
+    """The old message called every login 429 a Cloudflare 1015."""
+    bot = _Bot(_http_exception(429, DISCORD_GLOBAL_BODY))
+
+    with pytest.raises(SystemExit):
+        discord_login.run(bot, "token")
+
+    err = capsys.readouterr().err
+    assert "1015" not in err and "Cloudflare" not in err
+    assert "global" in err.lower()
+
+
+def test_the_brief_code_matches_the_supervisors():
+    import supervisor
+
+    assert discord_login.EXIT_RATE_LIMITED_BRIEF == supervisor.EXIT_RATE_LIMITED_BRIEF

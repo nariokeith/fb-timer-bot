@@ -22,7 +22,21 @@ import discord
 
 # Must match supervisor.EXIT_RATE_LIMITED. 75 is EX_TEMPFAIL from
 # sysexits.h -- "temporary failure, the user is invited to retry".
+#
+# Two kinds of 429 arrive here and they need very different waits:
+#
+#   75  Cloudflare's error 1015. An edge ban on the source IP that lifts
+#       only once that address goes quiet, so the wait is long.
+#   76  Discord's own "exceeding global rate limits". An application-layer
+#       block, minutes rather than half an hour -- one observed on
+#       2026-08-18 lasted about nine. Holding every bot down for thirty
+#       minutes over it wastes most of the outage on something that had
+#       already cleared.
+#
+# They are told apart by their body: Cloudflare serves an HTML block page,
+# Discord answers with JSON.
 EXIT_RATE_LIMITED = 75
+EXIT_RATE_LIMITED_BRIEF = 76
 
 
 def is_rate_limited(exc: BaseException) -> bool:
@@ -49,6 +63,18 @@ def blocked_ip(page: str) -> str | None:
     return match.group(1) if match else None
 
 
+def is_edge_ban(page: str) -> bool:
+    """True if this 429 is Cloudflare turning us away, not Discord.
+
+    Cloudflare answers with a full HTML error page; Discord's own rate
+    limiter answers with JSON. The distinction decides how long every bot
+    has to stay down, so it is made on the shape of the body rather than
+    on the status code, which is 429 either way.
+    """
+    lowered = (page or "").lower()
+    return "<html" in lowered or "cf-error" in lowered or "error 1015" in lowered
+
+
 def run(bot, token: str, **kwargs) -> None:
     """bot.run(token), converting an IP ban into EXIT_RATE_LIMITED."""
     try:
@@ -56,6 +82,18 @@ def run(bot, token: str, **kwargs) -> None:
     except discord.HTTPException as exc:
         if not is_rate_limited(exc):
             raise
+        if not is_edge_ban(exc.text):
+            # Discord's own limiter. Short-lived, and its JSON body is one
+            # readable sentence, so it is worth printing verbatim.
+            print(
+                f"Discord applied a global rate limit to this instance "
+                f"(HTTP 429): {exc.text.strip()} Exiting so the supervisor "
+                "can hold every bot off briefly.",
+                file=sys.stderr,
+                flush=True,
+            )
+            sys.exit(EXIT_RATE_LIMITED_BRIEF)
+
         # Deliberately not printing the exception: its text is the entire
         # Cloudflare error page, ~200 lines of HTML per attempt, which is
         # what buried this diagnosis in the deploy logs in the first place.
