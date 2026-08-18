@@ -870,3 +870,23 @@ def test_the_self_ping_thread_is_a_daemon(monkeypatch):
         )
     finally:
         supervisor_mod.stop_self_ping(thread)
+
+
+def test_a_successful_self_ping_is_visible(capsys):
+    """A silent success cannot be told apart from a dead thread.
+
+    The point of the self-ping is to prove the instance stayed awake, and
+    that claim is unfalsifiable if only failures are ever printed.
+    """
+    supervisor_mod.report_ping(True, "https://example.onrender.com", 0.42)
+
+    out = capsys.readouterr().out
+    assert "self-ping" in out and "ok" in out
+    assert "0.4" in out, "the round-trip time is the evidence it really left"
+
+
+def test_a_failed_self_ping_says_so(capsys):
+    supervisor_mod.report_ping(False, "https://example.onrender.com", 12.0)
+
+    out = capsys.readouterr().out
+    assert "self-ping" in out and "failed" in out

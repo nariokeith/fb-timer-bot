@@ -223,6 +223,21 @@ def ping_once(
     return False
 
 
+def report_ping(ok: bool, url: str, elapsed: float) -> None:
+    """Print the outcome of one self-ping.
+
+    Successes are printed too, not just failures. A ping that only
+    speaks up when it breaks leaves "the instance never slept" as an
+    unfalsifiable claim -- there is no way to tell a working loop from a
+    thread that died quietly. One line every SELF_PING_INTERVAL is a
+    price worth paying for that.
+    """
+    if ok:
+        print(f"[supervisor] self-ping ok ({elapsed:.1f}s) {url}", flush=True)
+    else:
+        print(f"[supervisor] self-ping failed ({elapsed:.1f}s) {url}", flush=True)
+
+
 def start_self_ping(url: str | None = None, *, ping=ping_once):
     """Keep the instance awake by requesting its own public URL.
 
@@ -244,8 +259,9 @@ def start_self_ping(url: str | None = None, *, ping=ping_once):
 
     def loop():
         while not stop.wait(SELF_PING_INTERVAL):
-            if not ping(url):
-                print(f"[supervisor] self-ping failed for {url}", flush=True)
+            started = time.monotonic()
+            ok = ping(url)
+            report_ping(ok, url, time.monotonic() - started)
 
     thread = threading.Thread(target=loop, name="self-ping", daemon=True)
     thread._stop_event = stop
