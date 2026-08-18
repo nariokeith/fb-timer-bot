@@ -91,9 +91,24 @@ def gear_cap() -> int:
         return items_rules.DEFAULT_GEAR_DAILY_CAP
 
 
+def _calling_frame_name() -> str:
+    """The coroutine that awaited us, for the save_state log line.
+
+    Frame 1 is the awaiting caller: save_state is always awaited directly
+    from a command or helper, never scheduled as a bare task, so the
+    caller really is on the stack. Falls back rather than raising -- a
+    diagnostic must never be the thing that breaks a save.
+    """
+    try:
+        return sys._getframe(2).f_code.co_name
+    except Exception:
+        return "?"
+
+
 async def save_state(channel) -> None:
     """Write _STATE into its pinned message shards."""
     global _STATE_MESSAGES
+    caller = _calling_frame_name()
     try:
         contents = items_state.encode_state(_STATE)
     except ValueError as exc:
@@ -106,6 +121,11 @@ async def save_state(channel) -> None:
             )
         )
         return
+
+    # Counted so one log line can answer "was that burst of Discord
+    # rate-limit warnings ordinary traffic or a bug?". Without it the only
+    # evidence is the warnings themselves, which name no call site.
+    unchanged = edited = posted = removed = 0
 
     messages: list[discord.Message] = []
     for index, content in enumerate(contents):
@@ -121,6 +141,7 @@ async def save_state(channel) -> None:
                 and message.content.startswith(items_state.STATE_MARKER)
                 and message.content == content
             ):
+                unchanged += 1
                 messages.append(message)
                 continue
             try:
@@ -133,6 +154,7 @@ async def save_state(channel) -> None:
                 # save against a per-message edit limit, which is how this
                 # instance earned a Cloudflare IP ban.
                 message = await message.edit(content=content)
+                edited += 1
                 messages.append(message)
                 continue
             except discord.HTTPException:
@@ -145,6 +167,7 @@ async def save_state(channel) -> None:
                 superseded = message
 
         message = await channel.send(content)
+        posted += 1
         try:
             await message.pin()
         except discord.HTTPException:
@@ -163,10 +186,22 @@ async def save_state(channel) -> None:
     for message in _STATE_MESSAGES[len(contents) :]:
         try:
             await message.delete()
+            removed += 1
         except discord.HTTPException:
             pass
     _STATE_MESSAGES = messages
     _STATE.missing_parts = ()
+
+    # Discord's edit bucket is roughly five per five seconds per channel,
+    # so a save touching several shards reliably earns a 429 on the last
+    # of them -- retried by discord.py, harmless, but indistinguishable in
+    # the log from a real problem. This line is what tells them apart.
+    tail = f", {removed} removed" if removed else ""
+    print(
+        f"[items] save_state from {caller}: {edited} edited, {posted} posted, "
+        f"{unchanged} unchanged of {len(contents)} shards{tail}",
+        flush=True,
+    )
 
 
 async def load_state(channel) -> bool:

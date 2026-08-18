@@ -4196,3 +4196,82 @@ def test_an_ordinary_error_is_still_reported_in_full():
     )
 
     assert "boom" in ctx.sent[-1]["embed"].description
+
+
+# -- Which call site is writing, and how much ---------------------------------
+#
+# The shard PATCHes show up in the logs as Discord rate-limit warnings with
+# no indication of what provoked them, so working out whether a burst was
+# ordinary traffic or a bug meant inferring from message timestamps. One
+# line per save removes the guesswork.
+
+def _save_from(channel, name="pretend_command"):
+    """Await save_state from a named coroutine, as production always does.
+
+    asyncio.run(save_state(...)) would put the event loop's internals in
+    the calling frame instead of a command, which is not how the bot ever
+    calls it.
+    """
+    # Compiled with the real name: save_state reads the code object's
+    # co_name, which assigning __name__ afterwards does not change.
+    namespace = {"items_bot": items_bot, "channel": channel}
+    exec(
+        f"async def {name}():\n    await items_bot.save_state(channel)",
+        namespace,
+    )
+    asyncio.run(namespace[name]())
+
+
+def test_a_save_names_the_call_site_that_asked_for_it(capsys):
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(officer_channel_id=channel.id)
+
+    _save_from(channel, "poll_cmd")
+
+    out = capsys.readouterr().out
+    assert "save_state" in out and "poll_cmd" in out
+
+
+def test_a_save_reports_how_many_shards_it_wrote(capsys):
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+
+    _save_from(channel)
+
+    out = capsys.readouterr().out
+    assert "3" in out, "three shards were posted; the count should say so"
+
+
+def test_a_no_op_save_reports_that_it_wrote_nothing(capsys):
+    """The line has to make 'nothing happened' visible, or it proves nothing."""
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(officer_channel_id=channel.id)
+    _save_from(channel)
+    capsys.readouterr()
+
+    _save_from(channel)
+
+    out = capsys.readouterr().out
+    assert "unchanged" in out.lower()
+    assert "0 edited" in out or "edited 0" in out
+
+
+def test_a_save_reports_edits_separately_from_posts(capsys):
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(officer_channel_id=channel.id)
+    _save_from(channel)
+    capsys.readouterr()
+
+    items_bot._STATE.queue.append(
+        _queued("new", "Newcomer", "Asta's Heart", items_rules.SPECIAL)
+    )
+    _save_from(channel)
+
+    out = capsys.readouterr().out
+    assert "edited" in out.lower()
