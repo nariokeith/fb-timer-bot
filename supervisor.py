@@ -12,18 +12,14 @@ free service -- including the timer. One service, two processes, stays
 inside the budget.
 """
 
-import http.client
 import os
 import signal
-import socket
-import ssl
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
 
 # Exit codes meaning "I stopped on purpose, leave me alone".
 # 78 is EX_CONFIG from sysexits.h -- the attendance bot uses it when its
@@ -82,14 +78,6 @@ BRIEF_RATE_LIMIT_COOLDOWN = 300.0  # 5 minutes
 
 
 DEFAULT_KEEPALIVE_PORT = 8080
-
-# Render sleeps a free instance after roughly 15 minutes without an
-# inbound request, and a sleeping instance sends no spawn notifications.
-# Five minutes, not ten: a ping can fail outright -- the dead edge
-# address guarantees some will -- and two consecutive misses still leave
-# the next attempt inside that window.
-SELF_PING_INTERVAL = 300.0
-SELF_PING_TIMEOUT = 10.0
 
 
 @dataclass(frozen=True)
@@ -165,137 +153,6 @@ def stop_keepalive(server) -> None:
         return
     server.shutdown()
     server.server_close()
-
-
-def _fetch_status(address: str, *, host: str, timeout: float) -> int:
-    """GET https://<address>/ while presenting `host` for SNI and routing.
-
-    Connecting by address rather than by name is the entire point: the
-    hostname resolves to several edge addresses and this walks them, so
-    one dead listener cannot decide the outcome. The name still has to
-    travel in SNI and in the Host header or the edge cannot route it and
-    the certificate cannot verify.
-    """
-    context = ssl.create_default_context()
-    raw = socket.create_connection((address, 443), timeout=timeout)
-    try:
-        sock = context.wrap_socket(raw, server_hostname=host)
-    except Exception:
-        raw.close()
-        raise
-
-    connection = http.client.HTTPSConnection(host, timeout=timeout)
-    connection.sock = sock
-    try:
-        connection.request("GET", "/", headers={"Host": host})
-        return connection.getresponse().status
-    finally:
-        connection.close()
-
-
-def _resolve(host: str, port: int) -> list[str]:
-    seen = []
-    for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP):
-        address = info[4][0]
-        if address not in seen:
-            seen.append(address)
-    return seen
-
-
-def ping_once(
-    url: str,
-    *,
-    timeout: float = SELF_PING_TIMEOUT,
-    addresses: list[str] | None = None,
-    resolve=_resolve,
-    fetch=_fetch_status,
-) -> bool:
-    """Fetch `url`, trying every address it resolves to. True if one answered.
-
-    Never raises: this runs on a background thread whose death would be
-    silent, and a failed ping is not worth taking anything else down for.
-    """
-    host = urlsplit(url).hostname
-    if not host:
-        return False
-
-    if addresses is None:
-        try:
-            addresses = resolve(host, 443)
-        except Exception as exc:
-            print(f"[supervisor] self-ping could not resolve {host}: {exc}", flush=True)
-            return False
-
-    for address in addresses:
-        try:
-            status = fetch(address, host=host, timeout=timeout)
-        except Exception:
-            # Expected for a dead listener; the next address is the answer.
-            continue
-        if 200 <= status < 400:
-            return True
-    return False
-
-
-def report_ping(ok: bool, url: str, elapsed: float) -> None:
-    """Print the outcome of one self-ping.
-
-    Successes are printed too, not just failures. A ping that only
-    speaks up when it breaks leaves "the instance never slept" as an
-    unfalsifiable claim -- there is no way to tell a working loop from a
-    thread that died quietly. One line every SELF_PING_INTERVAL is a
-    price worth paying for that.
-    """
-    if ok:
-        print(f"[supervisor] self-ping ok ({elapsed:.1f}s) {url}", flush=True)
-    else:
-        print(f"[supervisor] self-ping failed ({elapsed:.1f}s) {url}", flush=True)
-
-
-def start_self_ping(url: str | None = None, *, ping=ping_once):
-    """Keep the instance awake by requesting its own public URL.
-
-    Returns the thread, or None when there is no public URL -- off the
-    platform there is nothing to keep awake and nothing to request.
-
-    The traffic leaves the instance and comes back through Render's edge,
-    so it counts as the inbound activity the spin-down timer watches. It
-    exists alongside an external monitor rather than instead of one: this
-    can only PREVENT a sleep, never end one, so a monitor is still what
-    wakes the service if it ever does go down.
-    """
-    if url is None:
-        url = os.getenv("RENDER_EXTERNAL_URL")
-    if not url:
-        return None
-
-    stop = threading.Event()
-
-    def loop():
-        # Ping immediately, then on the interval. Waiting the interval out
-        # first left the instance unguarded for that long after every
-        # deploy -- the very moment it is most likely to be idle, because
-        # the container is new and no visitor has arrived yet.
-        while True:
-            started = time.monotonic()
-            ok = ping(url)
-            report_ping(ok, url, time.monotonic() - started)
-            if stop.wait(SELF_PING_INTERVAL):
-                return
-
-    thread = threading.Thread(target=loop, name="self-ping", daemon=True)
-    thread._stop_event = stop
-    thread.start()
-    print(f"[supervisor] self-ping every {SELF_PING_INTERVAL}s to {url}", flush=True)
-    return thread
-
-
-def stop_self_ping(thread) -> None:
-    """Stop the self-ping thread. Safe to call with None."""
-    if thread is None:
-        return
-    thread._stop_event.set()
-    thread.join(timeout=5.0)
 
 
 def should_restart(exit_code: int, no_restart_codes: frozenset[int] = NO_RESTART_CODES) -> bool:
@@ -491,11 +348,9 @@ class Supervisor:
         # if every bot crashes on its first attempt, which is exactly the
         # case that used to let Render sleep the whole service.
         keepalive = start_keepalive(self)
-        self_ping = start_self_ping()
         try:
             self._supervise()
         finally:
-            stop_self_ping(self_ping)
             stop_keepalive(keepalive)
 
     def _supervise(self) -> None:
