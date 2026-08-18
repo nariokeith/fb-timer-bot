@@ -416,3 +416,52 @@ def test_a_failed_ledger_append_is_reported_as_its_own_unretryable_error(monkeyp
     assert spreadsheet.worksheet(items_sheet.SPECIAL_TAB).batches, (
         "the cell write already happened; the error must carry that fact"
     )
+
+
+def _api_error_with_code(code, message):
+    error = rate_limited(message)
+    error.code = code
+    return error
+
+
+@pytest.mark.parametrize(
+    "code,message",
+    [
+        (503, "The service is currently unavailable."),
+        (500, "Internal error encountered."),
+        (502, "Bad gateway."),
+        (504, "Deadline exceeded."),
+    ],
+)
+def test_snapshot_retries_a_transient_server_error(code, message):
+    """Google's 5xx family is "try again", exactly like a 429.
+
+    A 503 is Sheets' standard transient backend refusal -- Google's own
+    guidance is to retry it with backoff. Treating it like a revoked key
+    put "APIError: [503]: The service is currently unavailable" in front
+    of a member trying to run !request, for a read that would have
+    succeeded a second later.
+    """
+    slept = []
+    spreadsheet = FlakySpreadsheet(
+        make_spreadsheet(), failures=2, error=_api_error_with_code(code, message)
+    )
+
+    snapshot = items_sheet.read_snapshot(spreadsheet, sleep=slept.append)
+
+    assert "Kobe" in snapshot.roster
+    assert spreadsheet.attempts == 3
+    assert slept == list(items_sheet.RETRY_DELAYS)
+
+
+@pytest.mark.parametrize("code", [403, 404, 400])
+def test_snapshot_still_refuses_a_permanent_error_immediately(code):
+    """The original reasoning holds for these: same answer every time."""
+    spreadsheet = FlakySpreadsheet(
+        make_spreadsheet(), failures=99, error=_api_error_with_code(code, "nope")
+    )
+
+    with pytest.raises(gspread.exceptions.APIError):
+        items_sheet.read_snapshot(spreadsheet, sleep=lambda _: None)
+
+    assert spreadsheet.attempts == 1, "a permanent failure must not cost a wait"

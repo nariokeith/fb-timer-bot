@@ -53,27 +53,40 @@ RETRY_DELAYS = (2.0, 5.0)
 # HTTP status Sheets returns when the per-minute read quota is spent.
 RATE_LIMITED = 429
 
+# Google's transient server-side refusals. A 503 ("The service is
+# currently unavailable") is Sheets' standard backend blip and their own
+# guidance is to retry it with backoff -- it says nothing about this
+# request being wrong, only that Sheets could not serve it just now.
+# Treating it as permanent put "APIError: [503]" in front of members
+# running !request, for reads that would have succeeded a second later.
+TRANSIENT_CODES = frozenset({RATE_LIMITED, 500, 502, 503, 504})
 
-def _is_rate_limited(exc: Exception) -> bool:
-    return isinstance(exc, gspread.exceptions.APIError) and exc.code == RATE_LIMITED
+
+def _is_transient(exc: Exception) -> bool:
+    """True if trying the same read again could plausibly give a different answer."""
+    return (
+        isinstance(exc, gspread.exceptions.APIError) and exc.code in TRANSIENT_CODES
+    )
 
 
 def _retrying_reads(read, sleep):
-    """Run `read`, retrying only while Sheets says "too many reads".
+    """Run `read`, retrying while Sheets says "not now" rather than "no".
 
     Reads only, and deliberately so: this must never wrap a write.
     Retrying record_gear would increment a count twice, and record_special
     would refuse the second attempt outright -- see LedgerWriteError.
 
-    Any other APIError (403 on a revoked key, 404 on a deleted sheet)
-    fails the same way every time, so it is raised immediately rather
-    than making the caller wait out the backoff for the same answer.
+    "Not now" is a 429 (the two bots share one 60-per-minute credential)
+    or one of Google's 5xx blips. A permanent APIError -- 403 on a
+    revoked key, 404 on a deleted sheet -- fails the same way every
+    time, so it is raised immediately rather than making the caller wait
+    out the backoff for the same answer.
     """
     for delay in RETRY_DELAYS:
         try:
             return read()
         except Exception as exc:
-            if not _is_rate_limited(exc):
+            if not _is_transient(exc):
                 raise
             sleep(delay)
     return read()
