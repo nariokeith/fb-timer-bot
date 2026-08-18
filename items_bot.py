@@ -121,7 +121,15 @@ async def save_state(channel) -> None:
                 messages.append(message)
                 continue
             try:
-                await message.edit(content=content)
+                # Cache what edit() RETURNS, not the message it was called
+                # on: discord.py builds a new Message from the response and
+                # leaves the original holding its pre-edit content. Caching
+                # the original froze every shard's remembered content one
+                # edit behind, so the comparison above could never match
+                # again and every save rewrote every shard -- five PATCHes a
+                # save against a per-message edit limit, which is how this
+                # instance earned a Cloudflare IP ban.
+                message = await message.edit(content=content)
                 messages.append(message)
                 continue
             except discord.HTTPException:

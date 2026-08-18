@@ -6,6 +6,7 @@ following the local-fakes style of test_attendance_bot.py.
 """
 
 import asyncio
+import copy
 import dataclasses
 import datetime
 
@@ -16,6 +17,26 @@ from discord.ext import commands
 import channel_guard
 import items_bot
 import items_state
+
+
+def current_content(message):
+    """What this message says on Discord NOW.
+
+    A handle kept from before an edit reports its pre-edit content --
+    discord.py behaves the same way -- so a test holding one from
+    channel.sent must ask for the latest edit instead.
+    """
+    return message.edits[-1] if message.edits else message.content
+
+
+# Everything about a fake message EXCEPT its content is shared between the
+# handles returned by edit(), because they all stand for one message on
+# Discord: pinning through one handle must be visible through another, and
+# a test counting edits should not care which handle it kept.
+_SHARED_FIELDS = (
+    "pinned", "deleted", "edits", "edit_calls", "end_poll_calls",
+    "pin_calls", "poll_ended", "embed", "view", "poll",
+)
 
 
 class FakeMessage:
@@ -29,40 +50,88 @@ class FakeMessage:
         raise_on_delete=False,
         raise_on_end_poll=False,
         raise_on_pin=False,
+        _shared=None,
     ):
         self.content = content
         self.id = message_id
-        self.pinned = False
-        self.deleted = False
-        self.edits: list[str] = []
-        self.edit_calls = 0
-        self.end_poll_calls = 0
-        self.pin_calls = 0
         self.raise_on_edit = raise_on_edit
         self.raise_on_delete = raise_on_delete
         self.raise_on_end_poll = raise_on_end_poll
         self.raise_on_pin = raise_on_pin
-        self.poll_ended = False
-        self.embed = None
-        self.view = None
-        self.poll = None
+        self._shared = _shared if _shared is not None else {
+            "pinned": False,
+            "deleted": False,
+            "edits": [],
+            "edit_calls": 0,
+            "end_poll_calls": 0,
+            "pin_calls": 0,
+            "poll_ended": False,
+            "embed": None,
+            "view": None,
+            "poll": None,
+        }
 
         class _Author:
             bot = author_is_bot
 
         self.author = _Author()
 
+    def __getattr__(self, name):
+        if name != "_shared" and name in _SHARED_FIELDS:
+            return self._shared[name]
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name in _SHARED_FIELDS and "_shared" in self.__dict__:
+            self._shared[name] = value
+        else:
+            object.__setattr__(self, name, value)
+
     async def edit(self, content=None, **kwargs):
+        """Mirror discord.py: `self` keeps its OLD content; a NEW handle is returned.
+
+        discord.Message.edit() builds a fresh Message from the API
+        response and never updates the object it was called on. A fake
+        that mutated in place made save_state's "skip the shards that did
+        not change" guard look like it worked -- in production that guard
+        compares against a cached message whose content is frozen at the
+        moment before its last edit, so it never matches again and every
+        save rewrites every shard.
+        """
         self.edit_calls += 1
         if self.raise_on_edit:
             raise _http_exception()
+        updated = self._clone(self.content)
         if content is not None:
-            self.content = content
+            updated.content = content
             self.edits.append(content)
         if "embed" in kwargs:
             self.embed = kwargs["embed"]
         if "view" in kwargs:
             self.view = kwargs["view"]
+        return updated
+
+    def _clone(self, content):
+        """Another handle on the same message, carrying `content`.
+
+        A shallow copy rather than a rebuilt FakeMessage: tests attach
+        their own attributes to a handle (the e2e suite sets `.guild` so
+        poll_voters really performs its nickname lookup), and a handle
+        that quietly dropped them would fake a passing test.
+        """
+        clone = copy.copy(self)
+        object.__setattr__(clone, "content", content)
+        return clone
+
+    def fresh(self):
+        """A handle carrying this message's CURRENT content.
+
+        Discord hands back current content every time it is asked, so
+        anything that reads from the channel -- pins, history,
+        fetch_message -- must go through this rather than return a handle
+        captured before some later edit.
+        """
+        return self._clone(current_content(self))
 
     async def pin(self):
         self.pin_calls += 1
@@ -111,21 +180,21 @@ class FakeChannel:
 
         async def _iterator():
             for message in [m for m in self._pins if not m.deleted][:limit]:
-                yield message
+                yield message.fresh()
 
         return _iterator()
 
     def history(self, limit=100):
         async def _iterator():
             for message in [m for m in self._history if not m.deleted][:limit]:
-                yield message
+                yield message.fresh()
 
         return _iterator()
 
     async def fetch_message(self, message_id):
         for message in self.sent + self._pins + self._history:
             if message.id == message_id and not message.deleted:
-                return message
+                return message.fresh()
         raise _not_found()
 
     async def send(self, content=None, **kwargs):
@@ -257,7 +326,7 @@ def test_load_state_recovers_an_unpinned_state_message_from_history():
 
     assert asyncio.run(items_bot.load_state(channel))
     assert [r.id for r in items_bot._STATE.queue] == ["aaa"]
-    assert items_bot._STATE_MESSAGES == [message]
+    assert [m.id for m in items_bot._STATE_MESSAGES] == [message.id]
 
 
 def test_saving_three_shards_then_one_deletes_the_surplus_messages():
@@ -318,7 +387,7 @@ def test_appending_to_a_three_shard_queue_edits_only_the_last_shard():
 
     assert len(messages) >= 3
     assert [message.edit_calls for message in messages] == [0, 0, 1]
-    assert items_bot._STATE_MESSAGES == messages
+    assert [m.id for m in items_bot._STATE_MESSAGES] == [m.id for m in messages]
 
 
 def test_appending_that_creates_a_shard_rewrites_existing_shards_and_sends_one():
@@ -496,7 +565,7 @@ def test_load_state_keeps_the_newest_duplicate_part_and_deletes_the_stale_one():
         request.id for request in fresh.queue
     ]
     assert stale.deleted
-    assert items_bot._STATE_MESSAGES == winners
+    assert [m.id for m in items_bot._STATE_MESSAGES] == [m.id for m in winners]
 
 
 def test_load_state_discards_obsolete_surplus_shards_after_a_shrink():
@@ -511,7 +580,6 @@ def test_load_state_discards_obsolete_surplus_shards_after_a_shrink():
     asyncio.run(items_bot.save_state(channel))
     assert len(channel.sent) == 3
 
-    first = items_bot._STATE_MESSAGES[0]
     obsolete = items_bot._STATE_MESSAGES[1:]
     for message in obsolete:
         message.raise_on_delete = True
@@ -521,6 +589,9 @@ def test_load_state_discards_obsolete_surplus_shards_after_a_shrink():
 
     for message in obsolete:
         message.raise_on_delete = False
+    # Re-read shard 0 AFTER the shrink: the handle from before that save
+    # still reports the 30-request content it held then.
+    first = items_bot._STATE_MESSAGES[0]
     restored_channel = FakeChannel(channel.id, pins=[first, *obsolete])
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
@@ -630,7 +701,7 @@ def test_save_state_ignores_a_surplus_shard_delete_failure():
 
     asyncio.run(items_bot.save_state(channel))
 
-    assert items_bot._STATE_MESSAGES == [first]
+    assert [m.id for m in items_bot._STATE_MESSAGES] == [first.id]
     assert not surplus[0].deleted
 
 
@@ -821,7 +892,7 @@ def test_refresh_board_reposts_and_pins_a_deleted_message_and_saves_its_id(monke
     asyncio.run(items_bot.refresh_board())
 
     board = board_channel.sent[0]
-    saved = items_state.decode_state(state_channel.sent[0].content).state
+    saved = items_state.decode_state(current_content(state_channel.sent[0])).state
     assert board.pinned
     assert items_bot._STATE.board_message_id == board.id
     assert saved.board_message_id == board.id
@@ -886,7 +957,7 @@ def test_successful_requests_repost_the_board_on_every_nth_request(monkeypatch):
     _queue_successes(monkeypatch, 1)
 
     second_board = board_channel.sent[0]
-    saved = items_state.decode_state(state_channel.sent[0].content).state
+    saved = items_state.decode_state(current_content(state_channel.sent[0])).state
     assert first_board.deleted
     assert second_board.pinned
     assert items_bot._STATE.board_message_id == second_board.id
@@ -900,7 +971,7 @@ def test_successful_requests_repost_the_board_on_every_nth_request(monkeypatch):
     _queue_successes(monkeypatch, 1)
 
     third_board = board_channel.sent[1]
-    saved = items_state.decode_state(state_channel.sent[0].content).state
+    saved = items_state.decode_state(current_content(state_channel.sent[0])).state
     assert second_board.deleted
     assert third_board.pinned
     assert saved.board_message_id == third_board.id
@@ -1061,7 +1132,7 @@ def test_setqueuechannel_posts_pins_and_saves_the_new_board_with_an_officer_chan
     asyncio.run(items_bot.setqueuechannel_cmd.callback(ctx))
 
     board = queue_channel.sent[0]
-    saved = items_state.decode_state(state_channel.sent[0].content).state
+    saved = items_state.decode_state(current_content(state_channel.sent[0])).state
     assert board.pinned
     assert items_bot._STATE.queue_channel_id == queue_channel.id
     assert items_bot._STATE.board_message_id == board.id
@@ -3959,3 +4030,66 @@ def test_poll_still_works_for_a_log_the_session_has_finished_with(monkeypatch):
     asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
 
     assert ctx.sent[-1]["embed"].title == "✅ Raffle open"
+
+
+def test_resaving_an_unchanged_state_rewrites_nothing():
+    """The skip-unchanged guard has to survive the first edit.
+
+    save_state caches the message handles it wrote. discord.py's
+    Message.edit() returns a NEW message and leaves the original holding
+    its pre-edit content, so caching the original froze every shard's
+    remembered content one edit behind: the guard never matched again and
+    every later save rewrote every shard. Five shards is five PATCHes per
+    save against a per-message edit limit -- enough to earn this
+    instance a Cloudflare IP ban.
+    """
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+    assert len(channel.sent) == 3
+
+    # One real change, so every shard has been edited at least once and a
+    # stale cache would now mismatch on all of them.
+    items_bot._STATE.queue.append(
+        _queued("appended", "Appended", "Asta's Heart", items_rules.SPECIAL)
+    )
+    asyncio.run(items_bot.save_state(channel))
+    edits_after_change = [m.edit_calls for m in channel.sent]
+
+    # Nothing changed here, so nothing may be written.
+    asyncio.run(items_bot.save_state(channel))
+    asyncio.run(items_bot.save_state(channel))
+
+    assert [m.edit_calls for m in channel.sent] == edits_after_change
+    assert len(channel.sent) == 3, "a no-op save posted a new shard"
+
+
+def test_a_changed_shard_is_still_rewritten_after_an_earlier_edit():
+    """The guard must not become so sticky that real changes stop saving."""
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(
+        officer_channel_id=channel.id,
+        queue=[
+            _queued(f"id{n:03d}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
+            for n in range(30)
+        ],
+    )
+    asyncio.run(items_bot.save_state(channel))
+
+    for round_number in range(3):
+        items_bot._STATE.queue.append(
+            _queued(f"extra{round_number}", "Extra", "Asta's Heart", items_rules.SPECIAL)
+        )
+        asyncio.run(items_bot.save_state(channel))
+
+        items_bot._STATE_MESSAGES = []
+        assert asyncio.run(
+            items_bot.load_state(FakeChannel(channel.id, pins=list(channel.sent)))
+        )
+        assert f"extra{round_number}" in [r.id for r in items_bot._STATE.queue]
