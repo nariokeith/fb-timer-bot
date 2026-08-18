@@ -1,5 +1,7 @@
 """Tests for the pinned-message state format and queue operations."""
 
+import dataclasses
+
 import items_state
 
 
@@ -435,7 +437,11 @@ def test_a_raffle_survives_an_encode_decode_round_trip():
         officer_channel_id=1,
         raffle_channel_id=2,
         raffle_role_ids=[10, 11],
-        raffles=[_raffle(eligible=("Jjew", "Kobe"), listed=True, winners=("Jjew",), drawn=True)],
+        # Partly drawn on purpose: a drawn raffle no longer stores its
+        # entry list, so this round trip checks a raffle that still does.
+        # test_a_drawn_raffle_survives_the_round_trip_without_its_pool
+        # covers the other case.
+        raffles=[_raffle(eligible=("Jjew", "Kobe"), listed=True, winners=("Jjew",), drawn=False)],
     )
 
     restored = items_state.decode_shards(items_state.encode_state(state))
@@ -816,3 +822,72 @@ def test_session_candidates_include_a_frozen_but_undrawn_raffle():
     ])
 
     assert [r.item for r in items_state.session_candidates(state, NOW)] == ["A"]
+
+
+# -- A drawn raffle stores no entry list --------------------------------------
+#
+# The entry list exists to draw a winner from. Once the draw is finished
+# nothing reads it again -- the session excludes previous winners from
+# RaffleSession.results, not from any earlier raffle's pool -- but it was
+# still being written to the pin, 246 names across 15 finished raffles on
+# the live guild, which is a whole shard of a five-shard state. Every save
+# rewrites shards, so the dead weight cost Discord requests on every write.
+
+def _pooled_raffle(**changes):
+    base = items_state.Raffle(
+        item="Asta's Heart", channel_id=1, message_id=2,
+        created_at="2026-08-18 09:00:00", ends_at="2026-08-18 10:00:00",
+        eligible=("Jjew", "Kobe", "Dajz"),
+    )
+    return dataclasses.replace(base, **changes)
+
+
+def test_a_drawn_raffle_does_not_store_its_entry_list():
+    stored = _pooled_raffle(winners=("Jjew",), drawn=True).to_dict()
+
+    assert stored.get("eligible", []) == []
+
+
+def test_an_open_raffle_keeps_its_entry_list():
+    stored = _pooled_raffle(listed=True).to_dict()
+
+    assert stored["eligible"] == ["Jjew", "Kobe", "Dajz"]
+
+
+def test_a_partly_drawn_raffle_keeps_its_entry_list():
+    """A failed sheet write leaves drawn False -- it may be drawn again.
+
+    Dropping the pool there would leave the remaining names undrawable.
+    """
+    stored = _pooled_raffle(winners=("Jjew",), drawn=False, listed=True).to_dict()
+
+    assert stored["eligible"] == ["Jjew", "Kobe", "Dajz"]
+
+
+def test_a_drawn_raffle_survives_the_round_trip_without_its_pool():
+    state = items_state.State(officer_channel_id=1)
+    state.raffles.append(_pooled_raffle(winners=("Jjew",), drawn=True))
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    raffle = restored.raffles[0]
+    assert raffle.winners == ("Jjew",)
+    assert raffle.drawn is True
+    assert raffle.eligible == ()
+
+
+def test_dropping_the_pool_shrinks_the_stored_state():
+    """The whole point: fewer shards means fewer writes per save."""
+    fat = items_state.State(officer_channel_id=1)
+    for n in range(15):
+        fat.raffles.append(
+            _pooled_raffle(
+                item=f"Log {n}", created_at=f"2026-08-{n + 1:02d} 09:00:00",
+                eligible=tuple(f"PlayerNumber{i:03d}" for i in range(16)),
+                winners=("Jjew",), drawn=True,
+            )
+        )
+
+    assert len(items_state.encode_state(fat)) < 4, (
+        "15 drawn raffles carrying 16 names each should no longer need shards"
+    )

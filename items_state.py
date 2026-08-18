@@ -102,13 +102,28 @@ class Raffle:
     drawn: bool = False
 
     def to_dict(self) -> dict:
-        return {
+        # A drawn raffle stores no entry list. The list exists to draw a
+        # winner from, and once the draw is finished nothing reads it
+        # again: a sitting excludes earlier winners from
+        # RaffleSession.results, never from a previous raffle's pool.
+        # Storing it anyway cost real Discord requests -- 246 names
+        # across 15 finished raffles on the live guild, most of a shard,
+        # and every save rewrites shards.
+        #
+        # Keyed on `drawn`, not on `winners`: a draw whose sheet write
+        # failed part-way keeps winners but stays undrawn, and it must
+        # keep its pool because the remaining names still have to be
+        # drawn from it.
+        #
+        # Omitted rather than emptied, and from_dict already defaults a
+        # missing list to (), so raffles pinned before this change shed
+        # theirs on the next save without a migration.
+        stored = {
             "item": self.item,
             "channel_id": self.channel_id,
             "message_id": self.message_id,
             "created_at": self.created_at,
             "ends_at": self.ends_at,
-            "eligible": list(self.eligible),
             "listed": self.listed,
             "winners": list(self.winners),
             "drawn": self.drawn,
@@ -117,6 +132,9 @@ class Raffle:
             # this it would read a drawn raffle as undrawn and supersede it.
             "winner": self.winners[0] if self.winners else "",
         }
+        if not self.drawn:
+            stored["eligible"] = list(self.eligible)
+        return stored
 
     @classmethod
     def from_dict(cls, raw: dict) -> "Raffle":

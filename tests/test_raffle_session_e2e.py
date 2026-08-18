@@ -433,3 +433,36 @@ def test_a_sheet_failure_part_way_leaves_the_poll_current(world, monkeypatch):
     assert not any("Jjew" in line or "Kobe" in line for line in drawable), (
         f"neither winner may be drawable in poll 2: {drawable}"
     )
+
+
+def test_a_winner_is_still_excluded_after_the_first_raffle_sheds_its_pool(world):
+    """The exclusion must not depend on the entry list we now discard.
+
+    A sitting bars a previous winner using RaffleSession.results, not the
+    earlier raffle's pool -- so dropping the pool from a drawn raffle
+    cannot let them back in. Asserted end to end, through a real
+    encode/decode round trip, because that is where the pool actually
+    disappears.
+    """
+    ctx, channel, spreadsheet, guild = world
+    open_two_polls(ctx, channel, guild)
+
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Jjew"))
+
+    # The first raffle is drawn, so the pin no longer carries its pool.
+    restored = items_state.decode_shards(
+        items_state.encode_state(items_bot._STATE)
+    )
+    first = items_state.find_raffle(restored, "Asta's Heart")
+    assert first.drawn is True
+    assert first.eligible == (), "a drawn raffle should shed its pool"
+    items_bot._STATE = restored
+
+    # The sitting moved to the second log; Jjew must not be drawable again.
+    session = items_bot._STATE.raffle_session
+    assert session.current_item == "Amentis Foot"
+    assert session.winners == ("Jjew",)
+
+    asyncio.run(items_bot.won_cmd.callback(ctx, argument="Jjew"))
+    assert "already won earlier in this session" in last_embed(ctx).description
