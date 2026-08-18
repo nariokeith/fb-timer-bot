@@ -4093,3 +4093,41 @@ def test_a_changed_shard_is_still_rewritten_after_an_earlier_edit():
             items_bot.load_state(FakeChannel(channel.id, pins=list(channel.sent)))
         )
         assert f"extra{round_number}" in [r.id for r in items_bot._STATE.queue]
+
+
+def test_a_shard_is_not_deleted_before_its_replacement_exists():
+    """The old copy must outlive a failed replacement.
+
+    save_state deleted the shard it could not edit and only then sent the
+    replacement. If that send also failed -- likeliest during exactly the
+    rate-limit storm the edit failed in -- the shard was gone from Discord
+    with its queue entries, and _STATE_MESSAGES was never reassigned, so
+    nothing noticed until a restart came back short.
+
+    This is the same decision 32d7846 already made for the queue board:
+    send the replacement before removing the old one.
+    """
+    channel = FakeChannel(raise_on_send=True)
+    items_bot._STATE = items_state.State(officer_channel_id=channel.id, queue=[])
+    stale = FakeMessage("ITEMS_STATE_V1 stale", message_id=7, raise_on_edit=True)
+    items_bot._STATE_MESSAGES = [stale]
+
+    with pytest.raises(discord.HTTPException):
+        asyncio.run(items_bot.save_state(channel))
+
+    assert not stale.deleted, "the only copy was destroyed before a replacement existed"
+
+
+def test_an_unusable_shard_is_replaced_then_deleted():
+    """When the replacement does land, the old message still goes away."""
+    channel = FakeChannel()
+    items_bot._STATE = items_state.State(officer_channel_id=channel.id, queue=[])
+    stale = FakeMessage("ITEMS_STATE_V1 stale", message_id=7, raise_on_edit=True)
+    items_bot._STATE_MESSAGES = [stale]
+
+    asyncio.run(items_bot.save_state(channel))
+
+    assert stale.deleted, "the superseded shard should not be left behind"
+    assert len(channel.sent) == 1
+    assert [m.id for m in items_bot._STATE_MESSAGES] == [channel.sent[0].id]
+    assert channel.sent[0].pinned

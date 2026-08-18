@@ -109,6 +109,9 @@ async def save_state(channel) -> None:
 
     messages: list[discord.Message] = []
     for index, content in enumerate(contents):
+        # The shard this iteration is replacing, removed only once its
+        # replacement is safely posted. None for a brand-new shard.
+        superseded = None
         if index < len(_STATE_MESSAGES):
             message = _STATE_MESSAGES[index]
             # A member request holds _SHEET_LOCK; rewriting every unchanged
@@ -133,10 +136,13 @@ async def save_state(channel) -> None:
                 messages.append(message)
                 continue
             except discord.HTTPException:
-                try:
-                    await message.delete()
-                except discord.HTTPException:
-                    pass
+                # Deliberately NOT deleted here. The send below can fail
+                # too -- likeliest during the very rate-limit storm that
+                # just failed the edit -- and deleting first would leave
+                # this shard with no copy on Discord at all, taking its
+                # queue entries with it. Same decision 32d7846 made for
+                # the queue board: replacement first, removal after.
+                superseded = message
 
         message = await channel.send(content)
         try:
@@ -145,6 +151,13 @@ async def save_state(channel) -> None:
             # Pinning needs Manage Messages. Without it the message still
             # works -- load_state scans history too -- so this is not fatal.
             pass
+        if superseded is not None:
+            try:
+                await superseded.delete()
+            except discord.HTTPException:
+                # Leaving a stale shard behind is survivable: load_state
+                # keeps the newest copy of each part and deletes the rest.
+                pass
         messages.append(message)
 
     for message in _STATE_MESSAGES[len(contents) :]:
