@@ -764,3 +764,109 @@ def test_the_cooldown_is_logged(stopper, capsys):
 def test_the_production_cooldown_outlasts_a_cloudflare_ban():
     """A 1015 lifts after the IP goes quiet -- minutes, not seconds."""
     assert RATE_LIMIT_COOLDOWN >= 900
+
+
+# -- Self-ping (Render free-tier spin-down) ----------------------------------
+#
+# Render sleeps a free instance after ~15 minutes with no inbound request,
+# and a sleeping instance fires no spawn notifications. An external pinger
+# is the usual answer, but this service's hostname resolves to two edge
+# addresses and one of them has a dead TLS listener, so roughly half of a
+# monitor's checks hang and time out. Pinging our own public URL from
+# inside removes the dependency on that monitor: traffic still arrives
+# through Render's edge and still counts as activity, and here we can walk
+# every resolved address instead of taking whichever one DNS hands over.
+
+def test_the_self_ping_interval_beats_renders_idle_timeout():
+    assert supervisor_mod.SELF_PING_INTERVAL < 15 * 60
+    # Not so eager that a stalled request cannot finish before the next.
+    assert supervisor_mod.SELF_PING_INTERVAL > supervisor_mod.SELF_PING_TIMEOUT
+
+
+def test_ping_once_tries_the_first_address_that_answers():
+    tried = []
+
+    def fetch(address, *, host, timeout):
+        tried.append(address)
+        return 200
+
+    assert supervisor_mod.ping_once(
+        "https://example.onrender.com/",
+        addresses=["1.1.1.1", "2.2.2.2"],
+        fetch=fetch,
+    )
+    assert tried == ["1.1.1.1"], "a healthy address must not be followed by more"
+
+
+def test_ping_once_falls_past_a_dead_address():
+    """The whole point: one edge address never completes its handshake."""
+    def fetch(address, *, host, timeout):
+        if address == "216.24.57.15":
+            raise TimeoutError("no TLS handshake")
+        return 200
+
+    assert supervisor_mod.ping_once(
+        "https://example.onrender.com/",
+        addresses=["216.24.57.15", "216.24.57.7"],
+        fetch=fetch,
+    )
+
+
+def test_ping_once_is_false_when_every_address_fails():
+    def fetch(address, *, host, timeout):
+        raise OSError("unreachable")
+
+    assert not supervisor_mod.ping_once(
+        "https://example.onrender.com/",
+        addresses=["1.1.1.1", "2.2.2.2"],
+        fetch=fetch,
+    )
+
+
+def test_ping_once_rejects_an_error_status():
+    """A 5xx means the edge answered but the service did not."""
+    assert not supervisor_mod.ping_once(
+        "https://example.onrender.com/",
+        addresses=["1.1.1.1"],
+        fetch=lambda address, *, host, timeout: 502,
+    )
+
+
+def test_ping_once_survives_a_resolution_failure():
+    def resolve(host, port):
+        raise OSError("DNS is down")
+
+    assert not supervisor_mod.ping_once(
+        "https://example.onrender.com/", resolve=resolve
+    )
+
+
+def test_ping_once_passes_the_hostname_for_sni():
+    """Connecting by address still has to present the real hostname."""
+    seen = {}
+
+    def fetch(address, *, host, timeout):
+        seen["host"] = host
+        return 200
+
+    supervisor_mod.ping_once(
+        "https://bk-bot-3mk6.onrender.com/", addresses=["1.1.1.1"], fetch=fetch
+    )
+    assert seen["host"] == "bk-bot-3mk6.onrender.com"
+
+
+def test_no_self_ping_without_a_public_url(monkeypatch):
+    """Off the platform there is nothing to keep awake and no URL to hit."""
+    monkeypatch.delenv("RENDER_EXTERNAL_URL", raising=False)
+    assert supervisor_mod.start_self_ping() is None
+
+
+def test_the_self_ping_thread_is_a_daemon(monkeypatch):
+    monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://example.onrender.com")
+    thread = supervisor_mod.start_self_ping(ping=lambda url: True)
+    try:
+        assert thread is not None and thread.daemon, (
+            "a non-daemon thread would keep the supervisor alive after shutdown"
+        )
+    finally:
+        supervisor_mod.stop_self_ping(thread)
