@@ -114,3 +114,54 @@ def test_every_bot_starts_through_discord_login(filename):
 
     assert "discord_login.run(bot," in source
     assert "\n    bot.run(" not in source, f"{filename} still calls bot.run() directly"
+
+
+# The Cloudflare block page names the IP it is blocking. That one line is
+# what tells a redeploy that landed on a fresh egress IP apart from one
+# that came back to the same banned address -- worth keeping when the
+# other 200 lines of the page are not.
+CLOUDFLARE_PAGE_WITH_IP = (
+    '<!doctype html><html><body>'
+    '<span class="cf-footer-item sm:block sm:mb-1">'
+    '<span>Cloudflare Ray ID: <strong>a2ccda67aa69afe8</strong></span></span>'
+    '<span id="cf-footer-item-ip" class="cf-footer-item hidden sm:block sm:mb-1">'
+    'Your IP: <button type="button" id="cf-footer-ip-reveal">Click to reveal</button>'
+    '<span class="hidden" id="cf-footer-ip">74.220.48.29</span>'
+    '</span></body></html>'
+)
+
+
+def test_the_blocked_ip_is_reported():
+    bot = _Bot(_http_exception(429, CLOUDFLARE_PAGE_WITH_IP))
+
+    with pytest.raises(SystemExit):
+        discord_login.run(bot, "token")
+
+
+def test_the_blocked_ip_appears_in_the_message(capsys):
+    bot = _Bot(_http_exception(429, CLOUDFLARE_PAGE_WITH_IP))
+
+    with pytest.raises(SystemExit):
+        discord_login.run(bot, "token")
+
+    err = capsys.readouterr().err
+    assert "74.220.48.29" in err
+    assert "<span" not in err, "the page itself must still be suppressed"
+
+
+def test_a_page_without_an_ip_still_reports_the_ban(capsys):
+    bot = _Bot(_http_exception(429, CLOUDFLARE_BODY))
+
+    with pytest.raises(SystemExit):
+        discord_login.run(bot, "token")
+
+    err = capsys.readouterr().err
+    assert "rate-limited" in err.lower()
+
+
+def test_blocked_ip_of_a_page_without_one_is_none():
+    assert discord_login.blocked_ip(CLOUDFLARE_BODY) is None
+
+
+def test_blocked_ip_reads_the_cloudflare_footer():
+    assert discord_login.blocked_ip(CLOUDFLARE_PAGE_WITH_IP) == "74.220.48.29"

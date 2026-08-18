@@ -15,6 +15,7 @@ condition and put *every* child on one service-wide cooldown, letting the
 IP go quiet long enough for Cloudflare to lift the ban.
 """
 
+import re
 import sys
 
 import discord
@@ -35,6 +36,19 @@ def is_rate_limited(exc: BaseException) -> bool:
     return isinstance(exc, discord.HTTPException) and exc.status == 429
 
 
+# Cloudflare's block page hides the visitor's address in this span. It is
+# the only part of those ~200 lines worth keeping: it says WHICH address
+# is banned, which is how a redeploy that landed on a fresh egress IP is
+# told apart from one that came back to the same blocked address.
+_BLOCKED_IP = re.compile(r'id="cf-footer-ip"[^>]*>\s*([^<\s]+)')
+
+
+def blocked_ip(page: str) -> str | None:
+    """The IP Cloudflare says it is blocking, or None if the page lacks it."""
+    match = _BLOCKED_IP.search(page or "")
+    return match.group(1) if match else None
+
+
 def run(bot, token: str, **kwargs) -> None:
     """bot.run(token), converting an IP ban into EXIT_RATE_LIMITED."""
     try:
@@ -45,10 +59,13 @@ def run(bot, token: str, **kwargs) -> None:
         # Deliberately not printing the exception: its text is the entire
         # Cloudflare error page, ~200 lines of HTML per attempt, which is
         # what buried this diagnosis in the deploy logs in the first place.
+        # Only the blocked address is lifted back out of it.
+        ip = blocked_ip(exc.text)
+        where = f" blocking {ip}" if ip else ""
         print(
-            "Discord rate-limited this instance's IP (HTTP 429, Cloudflare "
-            "error 1015). Exiting so the supervisor can hold every bot off "
-            "until the ban lifts.",
+            f"Discord rate-limited this instance's IP{where} (HTTP 429, "
+            "Cloudflare error 1015). Exiting so the supervisor can hold "
+            "every bot off until the ban lifts.",
             file=sys.stderr,
             flush=True,
         )
