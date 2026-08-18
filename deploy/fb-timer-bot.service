@@ -1,0 +1,44 @@
+# systemd unit for the Lordnine bot supervisor.
+#
+# Replaces what Render's platform did for free: start on boot, restart on
+# failure, capture stdout. supervisor.py still owns restarting the three
+# BOTS; this only keeps the supervisor itself alive.
+#
+# Install: see docs/oracle-cloud-setup.md (deploy/setup.sh does it for you).
+
+[Unit]
+Description=Lordnine field boss timer, attendance and item bots
+Documentation=https://github.com/nariokeith/fb-timer-bot
+# network-online, not just network: the bots dial Discord immediately on
+# start, and a login attempt before DNS is up fails for no good reason.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/fb-timer-bot
+# -u so stdout reaches journald line by line instead of in 8KB blocks --
+# the same reason Render's start command uses it.
+ExecStart=/opt/fb-timer-bot/.venv/bin/python -u supervisor.py
+
+# supervisor.py handles SIGTERM: it stops all three children, waits for
+# them, then exits 0. So an ordinary `systemctl stop` is a clean shutdown
+# and needs no KillMode games.
+Restart=always
+RestartSec=10s
+TimeoutStopSec=30s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fb-timer-bot
+
+# The bots need outbound network and their own directory, nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/fb-timer-bot
+
+[Install]
+WantedBy=multi-user.target
