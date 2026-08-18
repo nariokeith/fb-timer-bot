@@ -71,10 +71,19 @@ RESTART_RESET_AFTER = 60.0
 # late restart, the cost of undershooting is a loop that never ends.
 RATE_LIMIT_COOLDOWN = 1800.0  # 30 minutes
 
-# For EXIT_RATE_LIMITED_BRIEF. Long enough that a still-active block is
-# not hammered -- three logins per attempt -- and short enough that a
-# block which has lifted costs minutes rather than half an hour.
-BRIEF_RATE_LIMIT_COOLDOWN = 300.0  # 5 minutes
+# For EXIT_RATE_LIMITED_BRIEF. Started at five minutes, on the reasoning
+# that Discord's global limit clears far faster than a Cloudflare ban and
+# a short wait would cost less. The block on 2026-08-18 outlasted that
+# assumption badly -- over ninety minutes, with a retry every five --
+# which raises the possibility that the retries were themselves keeping
+# it alive, exactly as the 1015 earlier that day only lifted once the
+# address went quiet.
+#
+# So it now matches RATE_LIMIT_COOLDOWN: whichever kind of 429 arrives,
+# the address goes properly silent before knocking again. The two remain
+# separate constants, and the two exit codes still log which block was in
+# force, so this can be lowered again if a shorter wait proves safe.
+BRIEF_RATE_LIMIT_COOLDOWN = 1800.0  # 30 minutes
 
 
 DEFAULT_KEEPALIVE_PORT = 8080

@@ -780,10 +780,15 @@ def test_a_brief_rate_limit_is_restartable():
         ) is True
 
 
-def test_the_brief_cooldown_is_much_shorter_than_the_edge_ban_one():
-    """Discord's global limit clears in minutes; a 1015 does not."""
-    assert supervisor_mod.BRIEF_RATE_LIMIT_COOLDOWN < RATE_LIMIT_COOLDOWN
-    assert supervisor_mod.BRIEF_RATE_LIMIT_COOLDOWN <= 600
+def test_the_brief_cooldown_lets_the_address_go_quiet():
+    """Long enough that retrying cannot be what sustains the block.
+
+    Five minutes was the original guess. The 2026-08-18 block ran past
+    ninety with a retry every five, so the wait now has to be long enough
+    that a still-active block is not being fed by our own knocking.
+    """
+    assert supervisor_mod.BRIEF_RATE_LIMIT_COOLDOWN >= 1800
+    assert supervisor_mod.BRIEF_RATE_LIMIT_COOLDOWN <= RATE_LIMIT_COOLDOWN
 
 
 def test_a_brief_rate_limit_uses_the_short_cooldown(stopper):
