@@ -1,6 +1,8 @@
+import gspread
 import gspread.utils
 import pytest
 
+import attendance_sheet
 from attendance_sheet import (
     SheetStructureError,
     apply_writes,
@@ -9,7 +11,7 @@ from attendance_sheet import (
     read_headers,
     read_players,
 )
-from conftest import SAMPLE_GRID, FakeWorksheet
+from conftest import SAMPLE_GRID, FakeSpreadsheet, FakeWorksheet
 
 
 @pytest.fixture
@@ -785,3 +787,113 @@ def test_a_cleared_row_of_all_blank_cells_is_skipped_not_returned_as_an_entry():
     row_number, entry = last_unreversed_entry(sh)
     assert entry["boss"] == "Lucus"
     assert row_number == 2
+
+
+# -- Transient Sheets errors -------------------------------------------------
+#
+# Google answers a momentary backend problem with 503 "The service is
+# currently unavailable" (and 500/502/504), and answers a shared-quota
+# burst with 429. Neither says the request was wrong. attendance_sheet had
+# no retry at all, so every one of those blips failed a member's command
+# outright -- the same defect items_sheet had for 503 specifically.
+
+def _api_error(code, message="boom"):
+    response = type(
+        "Response",
+        (),
+        {
+            "status_code": code,
+            "json": lambda self: {"error": {"code": code, "message": message}},
+            "text": message,
+        },
+    )()
+    error = gspread.exceptions.APIError(response)
+    error.code = code
+    return error
+
+
+class FlakyWorksheet:
+    """Fails `failures` times with `error`, then delegates to `inner`."""
+
+    def __init__(self, inner, failures=0, error=None, append_failures=0):
+        self._inner = inner
+        self._remaining = failures
+        # Counted separately from reads: a write path reads the header
+        # first, so a shared budget would let that read swallow the
+        # failure meant for the write.
+        self._append_remaining = append_failures
+        self._error = error or _api_error(503)
+        self.read_attempts = 0
+        self.append_attempts = 0
+
+    def get_all_values(self):
+        self.read_attempts += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise self._error
+        return self._inner.get_all_values()
+
+    def append_row(self, row):
+        self.append_attempts += 1
+        if self._append_remaining > 0:
+            self._append_remaining -= 1
+            raise self._error
+        return self._inner.append_row(row)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize("code", [429, 500, 502, 503, 504])
+def test_a_read_retries_a_transient_error(code, monkeypatch):
+    slept = []
+    monkeypatch.setattr(attendance_sheet.time, "sleep", slept.append)
+    inner = FakeWorksheet([["Player", "Points", "Venatus"], ["Kobe", "1", ""]])
+    worksheet = FlakyWorksheet(inner, failures=2, error=_api_error(code))
+
+    players = attendance_sheet.read_players(worksheet)
+
+    assert players == ["Kobe"]
+    assert worksheet.read_attempts == 3
+    assert slept == list(attendance_sheet.RETRY_DELAYS)
+
+
+@pytest.mark.parametrize("code", [403, 404, 400])
+def test_a_read_does_not_retry_a_permanent_error(code, monkeypatch):
+    """A revoked key or deleted sheet answers the same way every time."""
+    monkeypatch.setattr(attendance_sheet.time, "sleep", lambda _: None)
+    inner = FakeWorksheet([["Player", "Points"], ["Kobe", "1"]])
+    worksheet = FlakyWorksheet(inner, failures=99, error=_api_error(code))
+
+    with pytest.raises(gspread.exceptions.APIError):
+        attendance_sheet.read_players(worksheet)
+
+    assert worksheet.read_attempts == 1
+
+
+def test_a_read_gives_up_after_the_last_retry(monkeypatch):
+    monkeypatch.setattr(attendance_sheet.time, "sleep", lambda _: None)
+    inner = FakeWorksheet([["Player", "Points"], ["Kobe", "1"]])
+    worksheet = FlakyWorksheet(inner, failures=99)
+
+    with pytest.raises(gspread.exceptions.APIError):
+        attendance_sheet.read_players(worksheet)
+
+    assert worksheet.read_attempts == len(attendance_sheet.RETRY_DELAYS) + 1
+
+
+def test_a_write_is_never_retried(monkeypatch):
+    """The safety rule items_sheet already follows, kept here too.
+
+    A retried append would add the log row twice -- and unlike a read,
+    the first attempt may well have succeeded before the error came back.
+    """
+    monkeypatch.setattr(attendance_sheet.time, "sleep", lambda _: None)
+    inner = FakeWorksheet([attendance_sheet.LOG_HEADER])
+    worksheet = FlakyWorksheet(inner, append_failures=1)
+    spreadsheet = FakeSpreadsheet({attendance_sheet.LOG_TAB: worksheet})
+
+    with pytest.raises(gspread.exceptions.APIError):
+        attendance_sheet.append_log_entry(spreadsheet, {"Image SHA256": "abc"})
+
+    assert worksheet.append_attempts == 1, "a write must not be repeated"

@@ -21,10 +21,12 @@ from attendance_sheet import (
     SheetStructureError,
     find_column,
     get_or_create_tab,
+    is_transient,
     open_spreadsheet,
     read_headers,
     read_players,
 )
+from attendance_sheet import TRANSIENT_CODES as attendance_transient_codes
 import items_rules
 
 SPECIAL_TAB = "Special Logs"
@@ -53,20 +55,12 @@ RETRY_DELAYS = (2.0, 5.0)
 # HTTP status Sheets returns when the per-minute read quota is spent.
 RATE_LIMITED = 429
 
-# Google's transient server-side refusals. A 503 ("The service is
-# currently unavailable") is Sheets' standard backend blip and their own
-# guidance is to retry it with backoff -- it says nothing about this
-# request being wrong, only that Sheets could not serve it just now.
-# Treating it as permanent put "APIError: [503]" in front of members
-# running !request, for reads that would have succeeded a second later.
-TRANSIENT_CODES = frozenset({RATE_LIMITED, 500, 502, 503, 504})
-
-
-def _is_transient(exc: Exception) -> bool:
-    """True if trying the same read again could plausibly give a different answer."""
-    return (
-        isinstance(exc, gspread.exceptions.APIError) and exc.code in TRANSIENT_CODES
-    )
+# Which failures are worth retrying is one decision, not two: it lives in
+# attendance_sheet (the lower-level module this one already builds on) so
+# the two sheets cannot drift apart on it. items_sheet had 503 missing
+# from its list for months while attendance_sheet had no retry at all.
+TRANSIENT_CODES = attendance_transient_codes
+_is_transient = is_transient
 
 
 def _retrying_reads(read, sleep):

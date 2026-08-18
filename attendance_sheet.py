@@ -7,6 +7,7 @@ matches the boss. Reordering columns therefore breaks nothing.
 
 import json
 import math
+import time
 
 import gspread
 import gspread.utils
@@ -34,6 +35,45 @@ class SheetStructureError(RuntimeError):
     """The sheet does not look the way the bot needs it to."""
 
 
+RETRY_DELAYS = (2.0, 5.0)
+
+# Sheets answers a momentary backend problem with 500/502/503/504 -- 503
+# is "The service is currently unavailable" -- and a shared-quota burst
+# with 429. None of them says the request was wrong, only that Sheets
+# could not serve it just now, and Google's own guidance is to retry them
+# with backoff. Anything else (403 on a revoked key, 404 on a deleted
+# sheet) answers identically every time and is raised at once, so a
+# genuinely broken setup costs nobody a wait.
+TRANSIENT_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def is_transient(exc: Exception) -> bool:
+    """True if repeating the same call could plausibly give a different answer."""
+    return isinstance(exc, gspread.exceptions.APIError) and exc.code in TRANSIENT_CODES
+
+
+def retrying_read(call, sleep=None):
+    """Run `call`, retrying it while Sheets says "not now" rather than "no".
+
+    READS ONLY. A write must never be routed through here: a repeated
+    append_row adds the row twice, and the first attempt may well have
+    succeeded before the error came back -- an attendance entry logged
+    twice is worse than one that visibly failed. The write paths in this
+    module (apply_writes, append_log_entry, write_config, add_worksheet)
+    deliberately call gspread directly.
+    """
+    if sleep is None:
+        sleep = time.sleep
+    for delay in RETRY_DELAYS:
+        try:
+            return call()
+        except Exception as exc:
+            if not is_transient(exc):
+                raise
+            sleep(delay)
+    return call()
+
+
 def open_spreadsheet(sheet_id: str, service_account_json: str):
     """Authorise with a service account and open the spreadsheet by ID."""
     try:
@@ -52,7 +92,19 @@ def open_spreadsheet(sheet_id: str, service_account_json: str):
 
 
 def _grid(worksheet) -> list[list[str]]:
-    return worksheet.get_all_values()
+    """The one read primitive; every read path in this module goes through it."""
+    return retrying_read(worksheet.get_all_values)
+
+
+def _worksheet(spreadsheet, title):
+    """Look a tab up, retrying a transient refusal.
+
+    gspread refetches the spreadsheet metadata on every worksheet() call,
+    so this is a real HTTP round trip and can fail the same way a read of
+    the cells can. WorksheetNotFound is not an APIError, so it still
+    propagates immediately for the callers that branch on it.
+    """
+    return retrying_read(lambda: spreadsheet.worksheet(title))
 
 
 def read_headers(worksheet, grid: list[list[str]] | None = None) -> list[str]:
@@ -314,7 +366,7 @@ def _expect_header(
     consistent with this module's refuse-rather-than-guess convention for
     duplicate player rows, duplicate boss columns, and non-numeric cells.
     """
-    grid = grid if grid is not None else worksheet.get_all_values()
+    grid = grid if grid is not None else _grid(worksheet)
     if not grid:
         raise SheetStructureError(f"Worksheet {worksheet.title!r} is empty")
     actual = list(grid[0])
@@ -341,7 +393,7 @@ def get_or_create_tab(spreadsheet, title: str, header: list[str]):
     caller's responsibility, same as plan_point_writes/apply_writes.
     """
     try:
-        worksheet = spreadsheet.worksheet(title)
+        worksheet = _worksheet(spreadsheet, title)
     except gspread.exceptions.WorksheetNotFound:
         try:
             worksheet = spreadsheet.add_worksheet(title, rows=1000, cols=len(header))
@@ -349,7 +401,7 @@ def get_or_create_tab(spreadsheet, title: str, header: list[str]):
             return worksheet
         except gspread.exceptions.APIError as exc:
             try:
-                worksheet = spreadsheet.worksheet(title)
+                worksheet = _worksheet(spreadsheet, title)
             except gspread.exceptions.WorksheetNotFound:
                 raise SheetStructureError(
                     f"Could not create or find worksheet {title!r}: {exc}"
@@ -372,13 +424,13 @@ def read_config(spreadsheet) -> dict[str, str]:
     exists to prevent, and it is what write_config now refuses too.
     """
     try:
-        worksheet = spreadsheet.worksheet(CONFIG_TAB)
+        worksheet = _worksheet(spreadsheet, CONFIG_TAB)
     except gspread.exceptions.WorksheetNotFound:
         return {}
 
     seen: dict[str, int] = {}
     result: dict[str, str] = {}
-    for number, row in enumerate(worksheet.get_all_values(), start=1):
+    for number, row in enumerate(_grid(worksheet), start=1):
         if number == 1 or not row:
             continue
         key = row[0].strip()
@@ -410,7 +462,7 @@ def write_config(spreadsheet, key: str, value: str) -> None:
 
     seen: dict[str, int] = {}
     match_row = None
-    for number, row in enumerate(worksheet.get_all_values(), start=1):
+    for number, row in enumerate(_grid(worksheet), start=1):
         if number == 1 or not row:
             continue
         row_key = row[0].strip()
@@ -440,14 +492,14 @@ def append_log_entry(spreadsheet, entry: dict) -> None:
 
 def _log_rows(spreadsheet) -> list[tuple[int, dict]]:
     try:
-        worksheet = spreadsheet.worksheet(LOG_TAB)
+        worksheet = _worksheet(spreadsheet, LOG_TAB)
     except gspread.exceptions.WorksheetNotFound:
         return []
 
     # One read, reused for both the header check and the rows -- the
     # previous version called get_all_values() twice for every single
     # duplicate-detection or undo lookup.
-    grid = worksheet.get_all_values()
+    grid = _grid(worksheet)
     _expect_header(worksheet, LOG_HEADER, grid)
 
     rows = []
@@ -578,8 +630,8 @@ def mark_entry_reversed(
     the caller is still responsible for treating read-plan-write as one
     unit against other undo attempts, same as plan_point_writes/apply_writes.
     """
-    worksheet = spreadsheet.worksheet(LOG_TAB)
-    grid = worksheet.get_all_values()
+    worksheet = _worksheet(spreadsheet, LOG_TAB)
+    grid = _grid(worksheet)
     if row_number - 1 >= len(grid):
         raise SheetStructureError(
             f"Row {row_number} no longer exists in worksheet {LOG_TAB!r}; "
