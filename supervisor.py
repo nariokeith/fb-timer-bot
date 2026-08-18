@@ -32,6 +32,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # never relaunched. The timer's ChildSpec below overrides this with an
 # empty set -- it always restarts, no matter the exit code.
 EXIT_NOT_CONFIGURED = 78
+
+# 75 is EX_TEMPFAIL: the bot could not reach Discord because Discord's
+# edge is rate-limiting this instance's IP (Cloudflare error 1015). It is
+# a restartable code -- the ban lifts on its own -- but not until the IP
+# goes quiet, which is what RATE_LIMIT_COOLDOWN below is for. It must
+# therefore never appear in any no_restart_codes set.
+EXIT_RATE_LIMITED = 75
+
 NO_RESTART_CODES = frozenset({0, EXIT_NOT_CONFIGURED})
 
 POLL_INTERVAL = 2.0
@@ -45,6 +53,15 @@ POLL_INTERVAL = 2.0
 # resets to the base.
 RESTART_DELAY_CAP = 300.0  # 5 minutes
 RESTART_RESET_AFTER = 60.0
+
+# How long every child stays down after any one of them reports
+# EXIT_RATE_LIMITED. Cloudflare's 1015 ban is keyed on the source IP and
+# lifts once that IP stops knocking, so the wait has to be service-wide:
+# the three bots share one egress IP, and a sibling logging in every few
+# seconds refreshes a ban that none of them can then get past. 30 minutes
+# is chosen to comfortably outlast a 1015; the cost of overshooting is a
+# late restart, the cost of undershooting is a loop that never ends.
+RATE_LIMIT_COOLDOWN = 1800.0  # 30 minutes
 
 
 DEFAULT_KEEPALIVE_PORT = 8080
@@ -140,13 +157,20 @@ class Supervisor:
         restart_delay: float = 5.0,
         max_restart_delay: float = RESTART_DELAY_CAP,
         restart_reset_after: float = RESTART_RESET_AFTER,
+        rate_limit_cooldown: float = RATE_LIMIT_COOLDOWN,
     ):
         self._specs = {spec.name: spec for spec in specs}
         self._procs: dict[str, subprocess.Popen] = {}
         self._restart_delay = restart_delay
         self._max_restart_delay = max_restart_delay
         self._restart_reset_after = restart_reset_after
+        self._rate_limit_cooldown = rate_limit_cooldown
         self._stopping = False
+        # Monotonic time before which NO child may be launched, set when
+        # any one of them exits with EXIT_RATE_LIMITED. Service-wide on
+        # purpose: the ban is on the shared egress IP, not on the bot
+        # that happened to notice it.
+        self._cooldown_until = 0.0
         # name -> monotonic time it becomes eligible for relaunch. A dead
         # child lives here (not in self._procs) while its restart delay
         # elapses, so waiting it out never blocks tick() from noticing a
@@ -213,6 +237,17 @@ class Supervisor:
                 self._current_delay.pop(name, None)
                 continue
 
+            if code == EXIT_RATE_LIMITED:
+                self._cooldown_until = max(
+                    self._cooldown_until, now + self._rate_limit_cooldown
+                )
+                print(
+                    f"[supervisor] {name} was rate-limited by Discord; "
+                    f"holding every bot for {self._rate_limit_cooldown}s so "
+                    "the ban on this IP can lift",
+                    flush=True,
+                )
+
             uptime = now - self._launched_at.get(name, now)
             if uptime >= self._restart_reset_after:
                 # It stayed up long enough to count as healthy; forget any
@@ -236,6 +271,11 @@ class Supervisor:
             self._current_delay[name] = min(delay * 2, self._max_restart_delay)
 
         restarted = []
+        if now < self._cooldown_until:
+            # Every child stays queued in self._due_at. Children already
+            # running are deliberately left alone: the ban bites on login,
+            # so a bot that is connected is still doing its job.
+            return restarted
         for name, due in list(self._due_at.items()):
             if now >= due:
                 del self._due_at[name]
@@ -260,6 +300,7 @@ class Supervisor:
         self._procs.clear()
         self._due_at.clear()
         self._current_delay.clear()
+        self._cooldown_until = 0.0
 
     def run(self) -> None:
         """Start everything and supervise until told to stop."""

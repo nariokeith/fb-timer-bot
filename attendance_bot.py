@@ -22,6 +22,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import channel_guard
+import discord_login
 from attendance_bosses import BossAmbiguous, BossNotFound, boss_points, resolve_boss
 from attendance_roster import DuplicatePlayerName, match_names
 from attendance_sheet import (
@@ -1518,4 +1519,4 @@ if __name__ == "__main__":
         )
         sys.exit(EXIT_NOT_CONFIGURED)
 
-    bot.run(TOKEN)
+    discord_login.run(bot, TOKEN)

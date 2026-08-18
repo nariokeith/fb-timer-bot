@@ -36,6 +36,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 import channel_guard
+import discord_login
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -834,4 +835,4 @@ if __name__ == "__main__":
             "DISCORD_TOKEN is not set. Put your bot token in the .env file "
             "(DISCORD_TOKEN=...) — see README.md."
         )
-    bot.run(TOKEN)
+    discord_login.run(bot, TOKEN)

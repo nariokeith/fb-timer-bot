@@ -25,6 +25,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import channel_guard
+import discord_login
 import items_rules
 import items_raffle
 import items_board
@@ -1632,7 +1633,7 @@ def main() -> None:
     _SPREADSHEET = items_sheet.open_logs_tracker(
         os.environ["ITEMS_SHEET_ID"], os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     )
-    bot.run(os.environ["ITEMS_DISCORD_TOKEN"])
+    discord_login.run(bot, os.environ["ITEMS_DISCORD_TOKEN"])
 
 
 

@@ -11,7 +11,9 @@ import supervisor as supervisor_mod
 from supervisor import (
     CHILDREN,
     EXIT_NOT_CONFIGURED,
+    EXIT_RATE_LIMITED,
     NO_RESTART_CODES,
+    RATE_LIMIT_COOLDOWN,
     ChildSpec,
     Supervisor,
     should_restart,
@@ -658,3 +660,107 @@ def test_run_binds_the_port_even_when_every_child_crashes():
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+# -- Cloudflare IP ban (exit 75) ---------------------------------------------
+#
+# Discord rate-limits by IP, and all three bots share this instance's one
+# egress IP. So the cooldown after a ban has to be service-wide: holding
+# back only the child that reported it leaves its two siblings logging in
+# every few seconds, refreshing the ban none of them can then get past.
+
+EXIT_RATE_LIMITED_CHILD = _python(f"import sys; sys.exit({EXIT_RATE_LIMITED})")
+
+
+def test_a_rate_limited_child_is_restarted_eventually():
+    """75 means "come back later", not "stay stopped"."""
+    assert should_restart(EXIT_RATE_LIMITED) is True
+    for spec in CHILDREN:
+        assert should_restart(EXIT_RATE_LIMITED, spec.no_restart_codes) is True
+
+
+def test_a_rate_limited_child_waits_out_the_cooldown(stopper):
+    sup = Supervisor(
+        [ChildSpec("banned", EXIT_RATE_LIMITED_CHILD)],
+        restart_delay=0.1,
+        rate_limit_cooldown=30.0,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    assert sup.tick() == []
+    # Its own short backoff has elapsed, but the cooldown has not.
+    sup._due_at["banned"] = time.monotonic()
+    assert sup.tick() == [], "relaunched during the rate-limit cooldown"
+
+
+def test_the_cooldown_holds_back_the_siblings_too(stopper):
+    """The ban is on the IP, so a sibling's login would refresh it."""
+    sup = Supervisor(
+        [
+            ChildSpec("banned", EXIT_RATE_LIMITED_CHILD),
+            ChildSpec("sibling", EXIT_CRASH),
+        ],
+        restart_delay=0.1,
+        rate_limit_cooldown=30.0,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    assert sup.tick() == []
+    sup._due_at["sibling"] = time.monotonic()
+    assert sup.tick() == [], "a sibling relaunched during the cooldown"
+
+
+def test_a_healthy_sibling_is_left_running_during_the_cooldown(stopper):
+    """The ban bites on login. A bot already logged in is still working."""
+    sup = Supervisor(
+        [
+            ChildSpec("banned", EXIT_RATE_LIMITED_CHILD),
+            ChildSpec("healthy", SLEEP_FOREVER),
+        ],
+        restart_delay=0.1,
+        rate_limit_cooldown=30.0,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    sup.tick()
+    assert "healthy" in sup.running_names()
+
+
+def test_children_restart_once_the_cooldown_expires(stopper):
+    sup = Supervisor(
+        [ChildSpec("banned", EXIT_RATE_LIMITED_CHILD)],
+        restart_delay=0.1,
+        rate_limit_cooldown=0.3,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+
+    sup.tick()
+    assert _wait_until(lambda: sup.tick() == ["banned"], timeout=3.0)
+
+
+def test_the_cooldown_is_logged(stopper, capsys):
+    sup = Supervisor(
+        [ChildSpec("banned", EXIT_RATE_LIMITED_CHILD)],
+        restart_delay=0.1,
+        rate_limit_cooldown=30.0,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _settle()
+    sup.tick()
+
+    out = capsys.readouterr().out
+    assert "rate-limited" in out.lower()
+
+
+def test_the_production_cooldown_outlasts_a_cloudflare_ban():
+    """A 1015 lifts after the IP goes quiet -- minutes, not seconds."""
+    assert RATE_LIMIT_COOLDOWN >= 900
