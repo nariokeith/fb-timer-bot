@@ -132,6 +132,36 @@ There is no auto-deploy. Pushing to `main` changes nothing until you run
 auto-deploy landing in the middle of a rate limit and restarting all three
 bots into it.
 
+## Running it on a Mac instead
+
+Every VPS worth using -- Oracle's free tier included -- asks for a credit
+card to verify the account. Without one, the remaining option that solves
+the shared-IP problem is your own hardware, and it is the option with the
+best evidence: on 2026-08-18 the bots ran on a home Mac for fifteen
+minutes without a single block, while Render was being refused outright.
+
+```bash
+bash deploy/install-macos.sh          # install and start
+tail -f logs/supervisor.log           # watch it
+bash deploy/install-macos.sh --stop   # uninstall
+```
+
+That installs a launchd agent which starts at login and restarts the
+supervisor if it exits. It runs under `caffeinate -i`, so the Mac will not
+doze off between boss spawns.
+
+What it cannot do:
+
+- **A closed laptop lid still sleeps.** `caffeinate -i` holds off *idle*
+  sleep only. For genuine 24/7 the Mac needs its lid open, or an external
+  display, or to be a desktop.
+- **It stops when the machine does.** Power cuts and reboots need someone
+  to log back in, since a launchd *agent* starts at login rather than at
+  boot.
+
+Suspend the Render service before starting this, or both copies will post
+every boss warning twice and fight over the same pinned state messages.
+
 ## What this does not fix
 
 Discord treats datacentre address ranges more harshly than residential

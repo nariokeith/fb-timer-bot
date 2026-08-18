@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for running the bots on a Mac.
+
+  The macOS counterpart of deploy/fb-timer-bot.service: start at login,
+  restart on crash, log to disk. supervisor.py still owns restarting the
+  three bots; launchd only keeps the supervisor itself alive.
+
+  __APP_DIR__ is substituted by deploy/install-macos.sh. Do not install
+  this file directly.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fbtimer.supervisor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- caffeinate -i holds off IDLE sleep for as long as the bots run,
+         so an unattended Mac does not doze off between boss spawns. It
+         cannot stop a laptop sleeping when the lid shuts; see the docs. -->
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>__APP_DIR__/.venv/bin/python</string>
+    <string>-u</string>
+    <string>supervisor.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__APP_DIR__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart the supervisor if it ever exits. ThrottleInterval keeps a
+       genuinely broken build from respawning in a tight loop. -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__APP_DIR__/logs/supervisor.log</string>
+  <key>StandardErrorPath</key>
+  <string>__APP_DIR__/logs/supervisor.log</string>
+
+  <!-- PORT is unset on purpose: the keep-alive falls back to 8080 on
+       localhost, which nothing outside this Mac can reach and nothing
+       needs to. A machine that never sleeps needs no uptime pinger. -->
+</dict>
+</plist>

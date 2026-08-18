@@ -101,3 +101,67 @@ def test_the_self_ping_stays_off_without_renders_url(monkeypatch):
 
     monkeypatch.delenv("RENDER_EXTERNAL_URL", raising=False)
     assert supervisor.start_self_ping() is None
+
+
+# -- macOS launchd agent -----------------------------------------------------
+
+PLIST = REPO / "deploy" / "com.fbtimer.supervisor.plist"
+MACOS = REPO / "deploy" / "install-macos.sh"
+
+
+@pytest.fixture
+def plist():
+    return PLIST.read_text()
+
+
+def test_the_agent_is_valid_xml(plist):
+    """A malformed plist is rejected by launchctl with a useless error."""
+    import plistlib
+
+    parsed = plistlib.loads(plist.replace("__APP_DIR__", "/tmp/app").encode())
+    assert parsed["Label"] == "com.fbtimer.supervisor"
+
+
+def test_the_agent_starts_the_supervisor_unbuffered(plist):
+    import plistlib
+
+    parsed = plistlib.loads(plist.replace("__APP_DIR__", "/tmp/app").encode())
+    argv = parsed["ProgramArguments"]
+    assert argv[-1] == "supervisor.py"
+    assert "-u" in argv
+    assert argv[-3].endswith("/.venv/bin/python")
+
+
+def test_the_agent_holds_off_idle_sleep(plist):
+    """A Mac that dozes off sends no spawn notifications."""
+    import plistlib
+
+    parsed = plistlib.loads(plist.replace("__APP_DIR__", "/tmp/app").encode())
+    assert parsed["ProgramArguments"][0] == "/usr/bin/caffeinate"
+
+
+def test_the_agent_restarts_the_supervisor(plist):
+    import plistlib
+
+    parsed = plistlib.loads(plist.replace("__APP_DIR__", "/tmp/app").encode())
+    assert parsed["KeepAlive"] is True
+    assert parsed["ThrottleInterval"] >= 10, "a broken build would respawn in a loop"
+
+
+def test_the_installer_and_the_agent_agree_on_the_label(plist):
+    label = re.search(r"^LABEL=(\S+)", MACOS.read_text(), re.MULTILINE).group(1)
+    assert f"<string>{label}</string>" in plist
+
+
+def test_the_installer_refuses_without_credentials():
+    """Installing credential-less would look like a crash loop."""
+    text = MACOS.read_text()
+    assert ".env" in text and "exit 1" in text
+
+
+def test_the_installer_can_uninstall():
+    assert "--stop" in MACOS.read_text()
+
+
+def test_the_macos_installer_fails_loudly():
+    assert "set -euo pipefail" in MACOS.read_text()
