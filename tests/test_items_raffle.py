@@ -236,14 +236,14 @@ def test_remaining_pool_can_empty_the_pool():
 def test_a_poll_argument_without_a_flag_uses_the_default_duration():
     parsed = items_raffle.parse_poll_argument("Asta's Heart")
 
-    assert parsed.item_query == "Asta's Heart"
+    assert parsed.item_queries == ("Asta's Heart",)
     assert parsed.hours == items_raffle.DEFAULT_POLL_HOURS
 
 
 def test_the_hours_flag_overrides_the_duration_and_is_stripped():
     parsed = items_raffle.parse_poll_argument("Asta's Heart --hours 48")
 
-    assert parsed.item_query == "Asta's Heart"
+    assert parsed.item_queries == ("Asta's Heart",)
     assert parsed.hours == 48
 
 
@@ -413,3 +413,83 @@ def test_a_duplicate_across_two_accounts_is_still_collapsed():
     )
 
     assert split.eligible == ["Jjew"]
+
+
+# -- Several special logs in one !poll ---------------------------------------
+#
+# Opening ten raffles meant running !poll ten times: ten poll messages,
+# ten confirmations and ten state saves, each save rewriting up to five
+# pinned shards. One command collapses the saves to one.
+#
+# " - " is the separator, matching !attendance and the winner split in
+# this module. No special-log header in the live sheet contains it, or a
+# bare hyphen at all -- checked against all 68 of them.
+
+def test_one_item_still_parses_as_a_single_poll():
+    parsed = items_raffle.parse_poll_argument("Asta's Heart")
+
+    assert parsed.item_queries == ("Asta's Heart",)
+    assert parsed.hours == items_raffle.DEFAULT_POLL_HOURS
+
+
+def test_several_items_split_on_the_separator():
+    parsed = items_raffle.parse_poll_argument(
+        "Asta's Heart - Ego's Tail - Livera's Heart"
+    )
+
+    assert parsed.item_queries == ("Asta's Heart", "Ego's Tail", "Livera's Heart")
+
+
+def test_the_hours_flag_applies_to_every_item():
+    parsed = items_raffle.parse_poll_argument(
+        "Asta's Heart - Ego's Tail --hours 6"
+    )
+
+    assert parsed.item_queries == ("Asta's Heart", "Ego's Tail")
+    assert parsed.hours == 6
+
+
+def test_an_apostrophe_in_a_name_survives_the_split():
+    """Every special log is possessive; splitting must not touch them."""
+    parsed = items_raffle.parse_poll_argument("Baron Braudmore's Magic Sword")
+
+    assert parsed.item_queries == ("Baron Braudmore's Magic Sword",)
+
+
+def test_a_repeated_item_is_only_polled_once():
+    parsed = items_raffle.parse_poll_argument("Asta's Heart - asta's heart")
+
+    assert parsed.item_queries == ("Asta's Heart",)
+
+
+def test_a_doubled_separator_leaves_a_fragment_for_resolution_to_reject():
+    """Not silently dropped -- carried through so the officer is told.
+
+    A separator needs whitespace on both sides, so "A - - B" splits into
+    "A" and "- B" rather than producing an empty fragment. "- B" then
+    fails to resolve and is named in the refusal summary, which is the
+    same way !attendance and !won handle their own odd fragments.
+    """
+    parsed = items_raffle.parse_poll_argument("Asta's Heart - - Ego's Tail")
+
+    assert parsed.item_queries == ("Asta's Heart", "- Ego's Tail")
+
+
+def test_a_trailing_separator_refuses_the_whole_command():
+    """A dash with nothing after it is a typo, not a request."""
+    with pytest.raises(items_raffle.RaffleArgumentError) as exc:
+        items_raffle.parse_poll_argument("Asta's Heart - ")
+
+    assert "dash" in str(exc.value).lower() or "empty" in str(exc.value).lower()
+
+
+def test_a_trailing_separator_is_caught_before_the_hours_flag_is_stripped():
+    with pytest.raises(items_raffle.RaffleArgumentError):
+        items_raffle.parse_poll_argument("Asta's Heart - --hours 6")
+
+
+def test_a_hyphen_without_spaces_is_part_of_the_name():
+    """Only " - " separates. A bare hyphen belongs to whatever it is in."""
+    parsed = items_raffle.parse_poll_argument("Some-Item")
+
+    assert parsed.item_queries == ("Some-Item",)

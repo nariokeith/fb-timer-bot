@@ -236,7 +236,10 @@ MAX_POLL_HOURS = 168
 
 HOURS_FLAG = "--hours"
 
-POLL_USAGE = "Usage: `!poll <special log name> [--hours N]`"
+POLL_USAGE = (
+    "Usage: `!poll <special log name> [--hours N]`, or "
+    "`!poll <log> - <log> - <log>` to open several at once."
+)
 
 
 class RaffleArgumentError(RuntimeError):
@@ -245,8 +248,50 @@ class RaffleArgumentError(RuntimeError):
 
 @dataclass(frozen=True)
 class PollArgument:
-    item_query: str
+    # A tuple even for one item: !poll opens as many raffles as were
+    # named, and a single-item command is just the one-element case.
+    item_queries: tuple[str, ...]
     hours: int
+
+
+# One rally's worth of drops is often raffled together, so one command
+# opens them all: "!poll Asta's Heart - Ego's Tail - Livera's Heart".
+#
+# " - " (space dash space) is the separator, the same one !attendance and
+# the winner split below use. It cannot be a bare hyphen: that would have
+# to be excluded from every special-log name, and while none of the live
+# sheet's 68 headers contains one today, nothing stops one appearing.
+ITEM_SPLIT = re.compile(r"\s+-\s+")
+
+
+def _split_items(item_query: str) -> tuple[str, ...]:
+    """The special logs named in one !poll, in the order they were typed.
+
+    A query with no separator is a single item, exactly as before.
+
+    An empty fragment -- a doubled or trailing dash -- refuses the whole
+    command rather than being dropped. Unlike an unknown item, which only
+    skips itself, a malformed argument means the officer did not type
+    what they meant, and this command posts publicly.
+    """
+    fragments = [fragment.strip() for fragment in ITEM_SPLIT.split(item_query)]
+
+    # A separator needs whitespace on both sides, so only a dash with
+    # whitespace BEFORE it is a dangling one -- testing the last character
+    # alone would reject an item name that simply ends in a hyphen. Same
+    # check split_igns makes for !won, for the same reason.
+    if DANGLING_SEPARATOR.search(item_query) or any(not f for f in fragments):
+        raise RaffleArgumentError(
+            f"`{item_query.strip()}` ends with a dash and no item after it. "
+            f"{POLL_USAGE}"
+        )
+
+    # Deduplicated on what was typed; resolution deduplicates again, so
+    # "Asta's Heart - asta's heart" collapses either way.
+    seen: dict[str, str] = {}
+    for fragment in fragments:
+        seen.setdefault(fragment.casefold(), fragment)
+    return tuple(seen.values())
 
 
 def parse_poll_argument(argument: str) -> PollArgument:
@@ -283,7 +328,7 @@ def parse_poll_argument(argument: str) -> PollArgument:
     item_query = " ".join(words)
     if not item_query:
         raise RaffleArgumentError(f"Which special log? {POLL_USAGE}")
-    return PollArgument(item_query=item_query, hours=hours)
+    return PollArgument(item_queries=_split_items(item_query), hours=hours)
 
 
 # A hyphen only separates winners when it has whitespace on BOTH sides.

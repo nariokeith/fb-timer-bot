@@ -1595,6 +1595,8 @@ async def itemhelp_cmd(ctx):
             "_Raffle roles only:_\n"
             "**`!poll <special log> [--hours N]`** — open a poll "
             f"({items_raffle.DEFAULT_POLL_HOURS}h by default)\n"
+            "**`!poll <log> - <log> - <log>`** — open several at once, "
+            "one duration for all\n"
             "**`!startraffle`** — draw every closed poll, one at a time\n"
             "**`!won <IGN>`** — record the current poll's winner\n"
             "**`!won <IGN> - <IGN>`** — several winners for one log\n"
@@ -1749,9 +1751,140 @@ def build_poll(item: str, hours: int) -> discord.Poll:
     return poll
 
 
+async def _open_one_poll(ctx, item_query: str, hours: int, snapshot, replaced: list[str]):
+    """Post one raffle poll and record it. Returns (item, refusal).
+
+    Exactly one of the two is None. Split out of poll_cmd so a command
+    naming several logs can carry on past a refusal instead of returning
+    at the first one -- every check below used to `return`, which is why
+    one bad name would have abandoned the rest of the batch.
+
+    Deliberately does NOT save: the caller saves once for the whole
+    command, which is the point of batching. Ten separate !poll commands
+    meant ten saves, and a save rewrites up to five pinned shards.
+
+    Appends to `replaced` when this poll supersedes an earlier raffle,
+    so the caller can say so. Success is otherwise silent, and quietly
+    discarding an entry list is not a silence anyone should have to
+    infer -- it is recorded here rather than returned because it
+    accompanies a SUCCESS, not a refusal.
+    """
+    try:
+        item = items_rules.resolve_special(
+            item_query, snapshot.special_headers, snapshot.gear_headers
+        )
+    except items_rules.ItemLookupError as exc:
+        return None, f"**{item_query}** — {exc}"
+
+    now = items_rules.now_pht()
+    now_text = items_rules.format_timestamp(now)
+    # A poll the running session has still to reach would be superseded
+    # below, taking the frozen pool with it -- and the session, which
+    # holds only the item NAME, would then resolve to the replacement and
+    # sit waiting for a poll that has just opened.
+    session = _STATE.raffle_session
+    if session is not None and not session.finished:
+        wanted = items_rules.normalize(item)
+        pending = [
+            name
+            for name in session.items[session.position :]
+            if items_rules.normalize(name) == wanted
+        ]
+        if pending:
+            return None, (
+                f"**{item}** — the running raffle session has still to draw "
+                "it. Draw it with `!won`, or pass on it with `!skipraffle`, "
+                "before opening a new poll for it."
+            )
+
+    existing = items_state.find_raffle(_STATE, item)
+    # Neither superseded nor evictable, and find_raffle only ever returns
+    # the newest raffle for a name -- opening a new poll here would leave
+    # the unfinished draw unreachable by the raffle session.
+    if existing is not None and existing.winners and not existing.drawn:
+        return None, (
+            f"**{item}** — has an unfinished draw, "
+            f"**{', '.join(existing.winners)}** already recorded. Finish it "
+            "with `!startraffle` and `!won` before opening a new poll."
+        )
+    if existing is not None and existing.ends_at > now_text and not existing.winners:
+        return None, (
+            f"**{item}** — a raffle is already open. It closes at "
+            f"{existing.ends_at} PHT."
+        )
+
+    # An earlier raffle for this item that ended without a winner is
+    # superseded, not kept. find_raffle only ever returns the newest
+    # raffle for a name, so leaving the old one behind would make it
+    # unreachable by the raffle session AND unevictable (eviction takes
+    # only drawn raffles) -- a slot leaked until someone edited the
+    # pinned state by hand. A drawn raffle is real history and stays.
+    superseded = existing if existing is not None and not existing.winners else None
+    if superseded is not None:
+        _STATE.raffles.remove(superseded)
+
+    allowed, victim = items_state.raffle_to_evict(_STATE)
+    if not allowed:
+        if superseded is not None:
+            _STATE.raffles.append(superseded)
+        return None, (
+            f"**{item}** — all {items_state.MAX_RAFFLES} tracked raffles are "
+            "still waiting for a winner. Draw one with `!startraffle` first — "
+            "the bot will not discard a raffle you have not drawn yet."
+        )
+
+    try:
+        message = await ctx.channel.send(poll=build_poll(item, hours))
+    except Exception as exc:
+        # Nothing has been given up yet: the victim is still in state and
+        # the superseded raffle goes back, because no replacement poll
+        # exists to supersede it.
+        if superseded is not None:
+            _STATE.raffles.append(superseded)
+        return None, f"**{item}** — could not post the poll: {exc}"
+
+    # Paid for only now that Discord has accepted the poll.
+    if victim is not None:
+        _STATE.raffles.remove(victim)
+
+    # Recorded only once Discord has confirmed the message, so a failed
+    # post can never leave a raffle pointing at nothing.
+    raffle = items_state.Raffle(
+        item=item,
+        channel_id=ctx.channel.id,
+        message_id=message.id,
+        created_at=now_text,
+        ends_at=items_rules.format_timestamp(
+            now + datetime.timedelta(hours=hours)
+        ),
+    )
+    _STATE.raffles.append(raffle)
+
+    if not items_state.fits(_STATE):
+        # Put back everything the attempt spent. The victim was removed to
+        # pay for a raffle that is not being kept, and losing a drawn
+        # raffle's record is not an acceptable price for a poll that was
+        # never recorded.
+        _STATE.raffles.remove(raffle)
+        if victim is not None:
+            _STATE.raffles.append(victim)
+        if superseded is not None:
+            _STATE.raffles.append(superseded)
+        _STATE.raffles.sort(key=lambda r: r.created_at)
+        return None, (
+            f"**{item}** — the bot's storage is full, so this raffle could "
+            "not be saved. The poll above will not be tracked; delete it, "
+            "clear the request queue, and try again."
+        )
+
+    if superseded is not None:
+        replaced.append(item)
+    return item, None
+
+
 @bot.command(name="poll")
 async def poll_cmd(ctx, *, argument: str = ""):
-    """Open a raffle for one special log."""
+    """Open a raffle for one special log, or several: `a - b - c`."""
     if await _refuse_raffle(ctx, raffle_access(ctx)):
         return
 
@@ -1768,160 +1901,46 @@ async def poll_cmd(ctx, *, argument: str = ""):
             await ctx.send(embed=error_embed("Sheet unreachable", str(exc)))
             return
 
-        try:
-            item = items_rules.resolve_special(
-                parsed.item_query, snapshot.special_headers, snapshot.gear_headers
+        opened: list[str] = []
+        refusals: list[str] = []
+        replaced: list[str] = []
+        for item_query in parsed.item_queries:
+            item, refusal = await _open_one_poll(
+                ctx, item_query, parsed.hours, snapshot, replaced
             )
-        except items_rules.ItemLookupError as exc:
-            await ctx.send(embed=error_embed("Poll refused", str(exc)))
-            return
+            if refusal is not None:
+                refusals.append(refusal)
+            else:
+                opened.append(item)
 
-        now = items_rules.now_pht()
-        now_text = items_rules.format_timestamp(now)
-        # A poll the running session has still to reach would be
-        # superseded below, taking the frozen pool with it -- and the
-        # session, which holds only the item NAME, would then resolve to
-        # the replacement and sit waiting for a poll that has just opened.
-        session = _STATE.raffle_session
-        if session is not None and not session.finished:
-            wanted = items_rules.normalize(item)
-            pending = [
-                name
-                for name in session.items[session.position :]
-                if items_rules.normalize(name) == wanted
-            ]
-            if pending:
-                await ctx.send(
-                    embed=error_embed(
-                        "Poll refused",
-                        f"The running raffle session has still to draw "
-                        f"**{item}**. Draw it with `!won`, or pass on it with "
-                        "`!skipraffle`, before opening a new poll for it.",
-                    )
-                )
-                return
-
-        existing = items_state.find_raffle(_STATE, item)
-        # Neither superseded nor evictable, and find_raffle only ever
-        # returns the newest raffle for a name -- opening a new poll here
-        # would leave the unfinished draw unreachable by the raffle session.
-        if existing is not None and existing.winners and not existing.drawn:
-            await ctx.send(
-                embed=error_embed(
-                    "Poll refused",
-                    f"**{item}** has an unfinished draw — "
-                    f"**{', '.join(existing.winners)}** already recorded. "
-                    f"Finish it with `!startraffle` and `!won` before opening a new poll.",
-                )
+        # Once, not once per item. This is what the batch buys.
+        if opened:
+            channel = (
+                bot.get_channel(_STATE.officer_channel_id)
+                if _STATE.officer_channel_id is not None
+                else None
             )
-            return
-        if existing is not None and existing.ends_at > now_text and not existing.winners:
-            await ctx.send(
-                embed=error_embed(
-                    "Poll refused",
-                    f"A raffle for **{item}** is already open. It closes at "
-                    f"{existing.ends_at} PHT.",
-                )
-            )
-            return
+            if channel is not None:
+                await save_state(channel)
 
-        # An earlier raffle for this item that ended without a winner is
-        # superseded, not kept. find_raffle only ever returns the newest
-        # raffle for a name, so leaving the old one behind would make it
-        # unreachable by the raffle session AND unevictable (eviction takes
-        # only drawn raffles) -- a slot leaked until someone edited the
-        # pinned state by hand. A drawn raffle is real history and stays.
-        superseded = existing if existing is not None and not existing.winners else None
-        if superseded is not None:
-            _STATE.raffles.remove(superseded)
-
-        allowed, victim = items_state.raffle_to_evict(_STATE)
-        if not allowed:
-            if superseded is not None:
-                _STATE.raffles.append(superseded)
-            await ctx.send(
-                embed=error_embed(
-                    "Poll refused",
-                    f"All {items_state.MAX_RAFFLES} tracked raffles are still "
-                    "waiting for a winner. Draw one with `!startraffle` "
-                    "first — the bot will not discard a raffle you have not "
-                    "drawn yet.",
-                )
-            )
-            return
-
-        try:
-            message = await ctx.channel.send(poll=build_poll(item, parsed.hours))
-        except Exception as exc:
-            # Nothing has been given up yet: the victim is still in state
-            # and the superseded raffle goes back, because no replacement
-            # poll exists to supersede it.
-            if superseded is not None:
-                _STATE.raffles.append(superseded)
-            await ctx.send(embed=error_embed("Could not post the poll", str(exc)))
-            return
-
-        # Paid for only now that Discord has accepted the poll.
-        if victim is not None:
-            _STATE.raffles.remove(victim)
-
-        # Recorded only once Discord has confirmed the message, so a
-        # failed post can never leave a raffle pointing at nothing.
-        raffle = items_state.Raffle(
-            item=item,
-            channel_id=ctx.channel.id,
-            message_id=message.id,
-            created_at=now_text,
-            ends_at=items_rules.format_timestamp(
-                now + datetime.timedelta(hours=parsed.hours)
-            ),
+    # Silence means every poll opened: the poll messages are themselves the
+    # confirmation, and a batch of ten used to post ten more embeds saying
+    # so. The bot speaks up only when something did not open -- and always
+    # when NOTHING did, so silence can never mean "did that work?".
+    notes = list(refusals)
+    for item in replaced:
+        notes.append(
+            f"⚠️ **{item}** replaces an earlier raffle that closed without a "
+            "winner. Its entry list is gone."
         )
-        _STATE.raffles.append(raffle)
-
-        if not items_state.fits(_STATE):
-            # Put back everything the attempt spent. The victim was
-            # removed to pay for a raffle that is not being kept, and
-            # losing a drawn raffle's record is not an acceptable price
-            # for a poll that was never recorded.
-            _STATE.raffles.remove(raffle)
-            if victim is not None:
-                _STATE.raffles.append(victim)
-            if superseded is not None:
-                _STATE.raffles.append(superseded)
-            _STATE.raffles.sort(key=lambda r: r.created_at)
-            await ctx.send(
-                embed=error_embed(
-                    "Poll not recorded",
-                    "The bot's storage is full, so this raffle could not be "
-                    "saved. The poll above will not be tracked -- delete it, "
-                    "clear the request queue, and try again.",
-                )
+    if notes:
+        await ctx.send(
+            embed=(
+                error_embed("Poll refused", "\n".join(notes))
+                if not opened
+                else warn_embed("Poll opened, with notes", "\n".join(notes))
             )
-            return
-
-        channel = (
-            bot.get_channel(_STATE.officer_channel_id)
-            if _STATE.officer_channel_id is not None
-            else None
         )
-        if channel is not None:
-            await save_state(channel)
-
-    note = ""
-    if superseded is not None:
-        note = (
-            f"\n\n⚠️ This **replaces** the earlier raffle for **{item}** that "
-            "closed without a winner. Its entry list is gone."
-        )
-    await ctx.send(
-        embed=ok_embed(
-            "Raffle open",
-            f"**{item}** — answer **{POLL_ANSWER}** above to enter. Closes at "
-            f"{raffle.ends_at} PHT. Run `!startraffle` after it closes.{note}",
-        )
-    )
-
-
 def poll_is_open(poll) -> bool:
     """Whether Discord itself still considers this poll open.
 

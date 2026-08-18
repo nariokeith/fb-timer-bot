@@ -2946,7 +2946,10 @@ def test_a_failed_poll_post_does_not_consume_the_evicted_slot(monkeypatch):
     asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
 
     assert [r.item for r in items_bot._STATE.raffles] == before
-    assert ctx.sent[-1]["embed"].title == "❌ Could not post the poll"
+    # One refusal summary now, rather than a per-poll error embed; the
+    # cause still has to be named in it.
+    assert ctx.sent[-1]["embed"].title == "❌ Poll refused"
+    assert "could not post the poll" in ctx.sent[-1]["embed"].description.casefold()
 
 
 def test_startraffle_refuses_to_freeze_a_pool_it_could_never_save(monkeypatch):
@@ -4029,7 +4032,10 @@ def test_poll_still_works_for_a_log_the_session_has_finished_with(monkeypatch):
 
     asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
 
-    assert ctx.sent[-1]["embed"].title == "✅ Raffle open"
+    # A successful poll is silent now -- the poll message is the
+    # confirmation -- so the poll itself is what proves it was allowed.
+    assert [m.poll.question for m in _polls_posted(channel)] == ["Asta's Heart"]
+    assert ctx.sent == []
 
 
 def test_resaving_an_unchanged_state_rewrites_nothing():
@@ -4275,3 +4281,157 @@ def test_a_save_reports_edits_separately_from_posts(capsys):
 
     out = capsys.readouterr().out
     assert "edited" in out.lower()
+
+
+# -- One !poll, several special logs -----------------------------------------
+#
+# Ten separate !poll commands cost ten poll messages, ten confirmations
+# and ten state saves -- and a save rewrites up to five pinned shards, so
+# roughly seventy Discord requests. Batching collapses the saves to one.
+
+def _polls_posted(channel):
+    return [m for m in channel.sent if getattr(m, "poll", None) is not None]
+
+
+def test_one_command_opens_a_poll_for_every_item(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", "Amentis' Foot"))
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.poll_cmd.callback(ctx, argument="Asta's Heart - Amentis' Foot")
+    )
+
+    assert [m.poll.question for m in _polls_posted(channel)] == [
+        "Asta's Heart",
+        "Amentis' Foot",
+    ]
+    for item in ("Asta's Heart", "Amentis' Foot"):
+        assert items_state.find_raffle(items_bot._STATE, item) is not None
+
+
+def test_a_batch_saves_the_state_once(monkeypatch, capsys):
+    """The whole point: ten saves became one.
+
+    save_state logs a line per call, so counting those counts the saves
+    without reaching into the state-writing internals.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", "Amentis' Foot"))
+    ctx, channel = _raffle_ctx()
+    capsys.readouterr()
+
+    asyncio.run(
+        items_bot.poll_cmd.callback(ctx, argument="Asta's Heart - Amentis' Foot")
+    )
+
+    saves = capsys.readouterr().out.count("save_state from")
+    assert saves == 1, f"expected one save for the batch, got {saves}"
+
+
+def test_a_successful_batch_says_nothing(monkeypatch):
+    """The poll messages are the confirmation; silence means it worked."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", "Amentis' Foot"))
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.poll_cmd.callback(ctx, argument="Asta's Heart - Amentis' Foot")
+    )
+
+    assert ctx.sent == [], f"expected no embeds, got {ctx.sent}"
+
+
+def test_a_single_poll_also_says_nothing(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", "Amentis' Foot"))
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert len(_polls_posted(channel)) == 1
+    assert ctx.sent == []
+
+
+def test_a_bad_item_does_not_stop_the_good_ones(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", "Amentis' Foot"))
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.poll_cmd.callback(
+            ctx, argument="Asta's Heart - Not A Real Log - Amentis' Foot"
+        )
+    )
+
+    assert [m.poll.question for m in _polls_posted(channel)] == [
+        "Asta's Heart",
+        "Amentis' Foot",
+    ]
+
+
+def test_refusals_are_reported_once_and_name_the_item(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", "Amentis' Foot"))
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.poll_cmd.callback(
+            ctx, argument="Asta's Heart - Not A Real Log"
+        )
+    )
+
+    assert len(ctx.sent) == 1, "one summary, not one message per refusal"
+    description = ctx.sent[-1]["embed"].description
+    assert "Not A Real Log" in description
+    assert "Asta's Heart" not in description, "only the refusals need naming"
+
+
+def test_a_batch_where_nothing_opens_still_reports(monkeypatch):
+    """Silence must never mean 'did that work?'."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", "Amentis' Foot"))
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(
+        items_bot.poll_cmd.callback(ctx, argument="Nope One - Nope Two")
+    )
+
+    assert _polls_posted(channel) == []
+    assert len(ctx.sent) == 1
+
+
+def test_a_malformed_argument_opens_nothing(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, special=("Player Name", "Asta's Heart", "Amentis' Foot"))
+    ctx, channel = _raffle_ctx()
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart - "))
+
+    assert _polls_posted(channel) == []
+    assert len(ctx.sent) == 1
+
+
+def test_replacing_an_earlier_raffle_is_still_announced(monkeypatch):
+    """Going quiet must not swallow a destructive side effect.
+
+    Re-polling a log whose earlier raffle closed with no winner discards
+    that raffle and its entry list. Success is otherwise silent now, but
+    this is not the kind of success anyone should have to infer.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, channel = _raffle_ctx()
+    items_bot._STATE.raffles.append(
+        items_state.Raffle(
+            item="Asta's Heart", channel_id=channel.id, message_id=1,
+            created_at="2026-08-01 00:00:00", ends_at="2026-08-01 01:00:00",
+        )
+    )
+
+    asyncio.run(items_bot.poll_cmd.callback(ctx, argument="Asta's Heart"))
+
+    assert len(ctx.sent) == 1
+    description = ctx.sent[-1]["embed"].description.casefold()
+    assert "replace" in description
+    assert "asta's heart" in description
