@@ -11,6 +11,7 @@ import time
 
 import gspread
 import gspread.utils
+import requests.exceptions
 from google.oauth2.service_account import Credentials
 
 from attendance_bosses import header_base
@@ -49,7 +50,28 @@ TRANSIENT_CODES = frozenset({429, 500, 502, 503, 504})
 
 def is_transient(exc: Exception) -> bool:
     """True if repeating the same call could plausibly give a different answer."""
-    return isinstance(exc, gspread.exceptions.APIError) and exc.code in TRANSIENT_CODES
+    # A connection reset or read timeout never reached Sheets at all, so
+    # for a read it says nothing except "try again". These are raised by
+    # requests, under gspread, and are not APIError.
+    if isinstance(
+        exc,
+        (requests.exceptions.ConnectionError, requests.exceptions.Timeout),
+    ):
+        return True
+
+    if not isinstance(exc, gspread.exceptions.APIError):
+        return False
+
+    # The HTTP status, not exc.code. gspread fills exc.code from
+    # response.json()["error"]["code"] and falls back to -1 when the body
+    # will not parse -- and Google's front end answers some 5xx with an
+    # HTML error page. Reading exc.code alone therefore misses exactly the
+    # blip this function exists to catch. Falling back to it keeps working
+    # for any response object that has no status_code.
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None:
+        status = exc.code
+    return status in TRANSIENT_CODES
 
 
 def retrying_read(call, sleep=None):

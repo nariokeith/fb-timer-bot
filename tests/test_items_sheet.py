@@ -96,20 +96,30 @@ def test_snapshot_pads_ragged_rows_from_the_api():
     assert items_sheet.holds_special(snapshot, "Dajz", "Amentis' Foot") is False
 
 
-def rate_limited(message="Quota exceeded for quota metric 'Read requests'"):
-    """A gspread APIError shaped exactly like a real Sheets 429.
+def rate_limited(
+    message="Quota exceeded for quota metric 'Read requests'", code=429
+):
+    """A gspread APIError shaped exactly like a real Sheets response.
 
     Built through APIError's own constructor rather than a stub, so the
-    .code the retry logic branches on is the one gspread would really
-    populate.
+    attributes the retry logic branches on are the ones gspread would
+    really populate.
+
+    `code` sets BOTH the HTTP status and the code in the JSON body,
+    because a real response never disagrees with itself. An earlier
+    version of this helper hardcoded status_code=429 and let callers
+    override only .code, which quietly made every "403" fixture still
+    look like a 429 to anything reading the status.
     """
 
     class _Response:
-        status_code = 429
+        status_code = code
         text = message
 
         def json(self):
-            return {"error": {"code": 429, "message": message, "status": "RESOURCE_EXHAUSTED"}}
+            return {
+                "error": {"code": code, "message": message, "status": "ERROR"}
+            }
 
     return gspread.exceptions.APIError(_Response())
 
@@ -164,8 +174,7 @@ def test_snapshot_does_not_retry_a_non_quota_error():
     so retrying would just make the member wait seconds for the same
     refusal.
     """
-    denied = rate_limited("caller does not have permission")
-    denied.code = 403
+    denied = rate_limited("caller does not have permission", code=403)
     spreadsheet = FlakySpreadsheet(make_spreadsheet(), failures=99, error=denied)
     with pytest.raises(gspread.exceptions.APIError):
         items_sheet.read_snapshot(spreadsheet, sleep=lambda _: None)
@@ -419,9 +428,7 @@ def test_a_failed_ledger_append_is_reported_as_its_own_unretryable_error(monkeyp
 
 
 def _api_error_with_code(code, message):
-    error = rate_limited(message)
-    error.code = code
-    return error
+    return rate_limited(message, code=code)
 
 
 @pytest.mark.parametrize(

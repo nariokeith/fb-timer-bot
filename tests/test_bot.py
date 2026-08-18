@@ -4,6 +4,8 @@ Never call bot.save_local() or bot.persist() here -- data.json is a real
 tracked file holding the live guild's channel ids.
 """
 
+import os
+
 import channel_guard
 import bot as timer_bot
 
@@ -97,3 +99,32 @@ def test_a_state_message_written_before_this_change_still_decodes():
     assert decoded is not None
     assert decoded["tod_channel_id"] is None
     assert decoded["channel_id"] == 100
+
+
+def test_the_timer_reports_a_missing_token_with_the_not_configured_code():
+    """sys.exit(str) exits 1, and the timer is set to ALWAYS restart.
+
+    bot.py's ChildSpec carries no_restart_codes=frozenset() so that an
+    ordinary bot.run() return is relaunched. That makes exit 1 a permanent
+    crash-loop: without a token the timer can never start, so the
+    supervisor would respawn it every few seconds forever, backing off to
+    the 300s cap and burying the log. 78 is the code the supervisor reads
+    as "stopped on purpose, leave it alone" -- what the other two bots
+    already use for the same situation.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["DISCORD_TOKEN"] = ""
+    result = subprocess.run(
+        [sys.executable, "bot.py"],
+        cwd=str(repo), env=env, capture_output=True, text=True, timeout=60,
+    )
+
+    assert result.returncode == 78, (
+        f"exited {result.returncode}; stderr: {result.stderr[-300:]}"
+    )
+    assert "DISCORD_TOKEN" in (result.stderr + result.stdout)

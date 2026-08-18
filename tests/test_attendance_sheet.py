@@ -897,3 +897,57 @@ def test_a_write_is_never_retried(monkeypatch):
         attendance_sheet.append_log_entry(spreadsheet, {"Image SHA256": "abc"})
 
     assert worksheet.append_attempts == 1, "a write must not be repeated"
+
+
+def _api_error_without_json(status_code, body="<html>503 Service Unavailable</html>"):
+    """An APIError built from a non-JSON response, as Google's front end sends.
+
+    gspread's APIError sets self.code from response.json()["error"]["code"],
+    and falls back to -1 when the body will not parse. Google answers some
+    5xx with an HTML error page, so the very blip the retry exists for can
+    arrive carrying code == -1.
+    """
+    response = type(
+        "Response",
+        (),
+        {
+            "status_code": status_code,
+            "json": lambda self: (_ for _ in ()).throw(ValueError("not JSON")),
+            "text": body,
+        },
+    )()
+    return gspread.exceptions.APIError(response)
+
+
+def test_a_5xx_with_a_non_json_body_is_transient():
+    error = _api_error_without_json(503)
+
+    assert error.code == -1, "precondition: gspread could not parse a code"
+    assert attendance_sheet.is_transient(error), (
+        "an HTML 503 page is the same blip as a JSON 503"
+    )
+
+
+def test_a_4xx_with_a_non_json_body_is_not_transient():
+    assert not attendance_sheet.is_transient(_api_error_without_json(403))
+
+
+def test_a_read_retries_an_html_503(monkeypatch):
+    monkeypatch.setattr(attendance_sheet.time, "sleep", lambda _: None)
+    inner = FakeWorksheet([["Player", "Points"], ["Kobe", "1"]])
+    worksheet = FlakyWorksheet(inner, failures=2, error=_api_error_without_json(503))
+
+    assert attendance_sheet.read_players(worksheet) == ["Kobe"]
+    assert worksheet.read_attempts == 3
+
+
+def test_a_dropped_connection_is_transient():
+    """gspread surfaces these from requests; they are not APIError at all."""
+    import requests
+
+    assert attendance_sheet.is_transient(requests.exceptions.ConnectionError("reset"))
+    assert attendance_sheet.is_transient(requests.exceptions.Timeout("slow"))
+
+
+def test_an_unrelated_exception_is_not_transient():
+    assert not attendance_sheet.is_transient(ValueError("bad data"))

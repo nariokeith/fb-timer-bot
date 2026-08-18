@@ -72,11 +72,9 @@ DEFAULT_KEEPALIVE_PORT = 8080
 
 # Render sleeps a free instance after roughly 15 minutes without an
 # inbound request, and a sleeping instance sends no spawn notifications.
-# 10 minutes leaves room for one ping to fail outright and the next to
-# still land inside the window.
 # Five minutes, not ten: a ping can fail outright -- the dead edge
 # address guarantees some will -- and two consecutive misses still leave
-# the next attempt inside Render's ~15-minute window.
+# the next attempt inside that window.
 SELF_PING_INTERVAL = 300.0
 SELF_PING_TIMEOUT = 10.0
 

@@ -829,10 +829,22 @@ async def timer(ctx: commands.Context, seconds: str):
         print(f"Timer for {ctx.author} aborted: {exc}")
 
 
+# Must match supervisor.EXIT_NOT_CONFIGURED. The timer's ChildSpec sets
+# no_restart_codes=frozenset() so an ordinary bot.run() return is always
+# relaunched -- which makes a plain sys.exit(message), status 1, a
+# permanent crash-loop when the token is missing: it can never start, so
+# the supervisor respawns it forever and buries the log. 78 is the one
+# code that policy still honours as "stopped on purpose".
+EXIT_NOT_CONFIGURED = 78
+
+
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "your-bot-token-here":
-        sys.exit(
+        print(
             "DISCORD_TOKEN is not set. Put your bot token in the .env file "
-            "(DISCORD_TOKEN=...) — see README.md."
+            "(DISCORD_TOKEN=...) — see README.md.",
+            file=sys.stderr,
+            flush=True,
         )
+        sys.exit(EXIT_NOT_CONFIGURED)
     discord_login.run(bot, TOKEN)
