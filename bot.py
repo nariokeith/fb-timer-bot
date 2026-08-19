@@ -810,16 +810,18 @@ async def timer(ctx: commands.Context, seconds: str):
         )
         return
 
-    def countdown_embed(secs: int) -> discord.Embed:
-        return make_embed("⏳ Timer", f"Time remaining: **{secs}s**")
-
-    msg = await ctx.send(embed=countdown_embed(remaining))
+    ends_at = datetime.now() + timedelta(seconds=remaining)
+    msg = await ctx.send(
+        embed=make_embed("⏳ Timer", f"Time remaining: {ts(ends_at, 'R')}")
+    )
     try:
-        while remaining > 0:
-            await asyncio.sleep(1)
-            remaining -= 1
-            if remaining > 0:
-                await msg.edit(embed=countdown_embed(remaining))
+        # One sleep and one edit, where this used to PATCH the message every
+        # second for up to an hour -- 3600 requests, silent on success, and
+        # by far the heaviest thing this instance asked of Discord. The <t:R>
+        # markup above is retimed by every Discord client on its own, so the
+        # visible countdown now costs nothing and the only reason left to
+        # touch the message is the ping at the end.
+        await asyncio.sleep(remaining)
         await msg.edit(
             embed=make_embed("⏰ Time's Up!", f"Your timer is done, {ctx.author.mention}!")
         )

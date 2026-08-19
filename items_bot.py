@@ -105,6 +105,62 @@ def _calling_frame_name() -> str:
         return "?"
 
 
+# Key under which the officers' channel id is kept in the sheet's
+# _BotConfig tab, the same tab and mechanism attendance_bot uses for its
+# own channel. The sheet is the store because Render wipes the disk on
+# every restart, so a local file would never survive to be read.
+OFFICER_CHANNEL_KEY = "officer_channel_id"
+
+
+async def _remembered_officer_channel() -> int | None:
+    """The officers' channel id recorded in the sheet, or None.
+
+    This exists to skip on_ready's channel scan, which costs a pins() and
+    a history() call for EVERY text channel in the guild. _STATE is built
+    fresh at import, so officer_channel_id was always None at startup and
+    that scan ran on every one of the free tier's frequent restarts --
+    the bot's own largest contribution to the rate limits that have twice
+    blocked this instance's shared egress address.
+    """
+    if _SPREADSHEET is None:
+        return None
+    try:
+        config = await asyncio.to_thread(items_sheet.read_config, _SPREADSHEET)
+    except Exception as exc:
+        # Deliberately never fatal: the scan below still recovers the
+        # queue, so an unreachable sheet costs Discord calls, not state.
+        print(
+            f"[items] could not read the remembered officer channel: {exc!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    value = config.get(OFFICER_CHANNEL_KEY, "").strip()
+    return int(value) if value.isdigit() else None
+
+
+async def _remember_officer_channel(channel_id: int) -> None:
+    """Record the officers' channel so the next restart can skip the scan."""
+    if _SPREADSHEET is None:
+        return
+    try:
+        await asyncio.to_thread(
+            items_sheet.write_config,
+            _SPREADSHEET,
+            OFFICER_CHANNEL_KEY,
+            str(channel_id),
+        )
+    except Exception as exc:
+        # The queue lives in this channel's pins either way and the scan
+        # can still find it, so a failed write costs a slow restart at
+        # worst -- never the command the officer just ran.
+        print(
+            f"[items] could not remember the officer channel: {exc!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 async def save_state(channel) -> None:
     """Write _STATE into its pinned message shards."""
     global _STATE_MESSAGES
@@ -395,6 +451,7 @@ async def setofficerchannel_cmd(ctx):
         _STATE_MESSAGES = []
     _STATE.officer_channel_id = ctx.channel.id
     await save_state(ctx.channel)
+    await _remember_officer_channel(ctx.channel.id)
     await ctx.send(
         embed=ok_embed(
             "Officer channel set",
@@ -1626,14 +1683,40 @@ async def itemhelp_cmd(ctx):
 async def on_ready():
     print(f"[items] logged in as {bot.user}", flush=True)
     if _STATE.officer_channel_id is None:
-        # Nothing to restore from until an admin has named the channel.
-        # Scan every readable text channel's pins once, so a redeploy
-        # recovers without anyone re-running !setofficerchannel.
+        # Ask the sheet where the queue lives before asking Discord. One
+        # Google read replaces two Discord calls per text channel, and it
+        # is the whole point of recording the id in !setofficerchannel.
+        remembered = await _remembered_officer_channel()
+        channel = bot.get_channel(remembered) if remembered is not None else None
+        if channel is not None:
+            try:
+                if await load_state(channel):
+                    print(
+                        f"[items] restored state from remembered #{channel.name}",
+                        flush=True,
+                    )
+                    await announce_dropped_specials(channel)
+                    await refresh_board()
+                    return
+            except discord.HTTPException:
+                # Fall through to the scan rather than giving up: a
+                # channel the bot can no longer read is exactly the case
+                # the scan exists to recover from.
+                pass
+
+        # Nothing remembered, or what was remembered no longer holds the
+        # state. Scan every readable text channel's pins once, so a
+        # redeploy recovers without anyone re-running !setofficerchannel.
         for guild in bot.guilds:
             for channel in guild.text_channels:
                 try:
                     if await load_state(channel):
                         print(f"[items] restored state from #{channel.name}", flush=True)
+                        # Record what the scan cost us to learn, so this is
+                        # the LAST restart that pays for it. Waiting for an
+                        # admin to re-run !setofficerchannel would mean
+                        # waiting forever: nothing prompts them to.
+                        await _remember_officer_channel(_STATE.officer_channel_id)
                         await announce_dropped_specials(channel)
                         await refresh_board()
                         return

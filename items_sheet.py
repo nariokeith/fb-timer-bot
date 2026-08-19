@@ -23,8 +23,10 @@ from attendance_sheet import (
     get_or_create_tab,
     is_transient,
     open_spreadsheet,
+    read_config,
     read_headers,
     read_players,
+    write_config,
 )
 from attendance_sheet import TRANSIENT_CODES as attendance_transient_codes
 import items_rules

@@ -128,3 +128,81 @@ def test_the_timer_reports_a_missing_token_with_the_not_configured_code():
         f"exited {result.returncode}; stderr: {result.stderr[-300:]}"
     )
     assert "DISCORD_TOKEN" in (result.stderr + result.stdout)
+
+
+# ---------------------------------------------------------------------------
+# !timer — the countdown must not edit its message once per second.
+#
+# The old loop issued one PATCH per second for up to 3600 seconds, which
+# made it by far the highest-volume path in the codebase and put it hard
+# against the per-channel edit bucket items_bot.py:193 measures at roughly
+# five per five seconds. It also logged nothing on success, so an hour of
+# that traffic was invisible in Render's logs.
+# ---------------------------------------------------------------------------
+
+
+class FakeTimerMessage:
+    def __init__(self):
+        self.edits = []
+
+    async def edit(self, **kwargs):
+        self.edits.append(kwargs)
+        return self
+
+
+class FakeTimerCtx:
+    def __init__(self):
+        self.sent = []
+        self.author = type("Author", (), {"mention": "@keith"})()
+        self.message = FakeTimerMessage()
+
+    async def send(self, **kwargs):
+        self.sent.append(kwargs)
+        return self.message
+
+
+def _run_timer(monkeypatch, seconds):
+    """Run !timer with sleeping stubbed out, returning (ctx, sleep durations)."""
+    import asyncio
+
+    slept = []
+
+    async def fake_sleep(duration):
+        slept.append(duration)
+
+    monkeypatch.setattr(timer_bot.asyncio, "sleep", fake_sleep)
+    ctx = FakeTimerCtx()
+    asyncio.run(timer_bot.timer.callback(ctx, str(seconds)))
+    return ctx, slept
+
+
+def test_the_countdown_edits_its_message_once_not_once_per_second(monkeypatch):
+    ctx, _ = _run_timer(monkeypatch, 300)
+
+    assert len(ctx.message.edits) == 1, (
+        f"{len(ctx.message.edits)} edits for a 300s timer; the countdown "
+        "should be rendered by Discord, not by repeated PATCHes"
+    )
+
+
+def test_the_countdown_is_a_discord_timestamp_so_it_ticks_without_api_calls(monkeypatch):
+    ctx, _ = _run_timer(monkeypatch, 300)
+
+    description = ctx.sent[0]["embed"].description
+    assert ":R>" in description, (
+        f"countdown body is {description!r}; it should use <t:...:R> markup, "
+        "which every Discord client updates on its own"
+    )
+
+
+def test_the_countdown_sleeps_once_for_the_whole_duration(monkeypatch):
+    _, slept = _run_timer(monkeypatch, 300)
+
+    assert slept == [300]
+
+
+def test_the_finished_timer_still_pings_the_author(monkeypatch):
+    """Regression guard: the rewrite must not drop the notification."""
+    ctx, _ = _run_timer(monkeypatch, 300)
+
+    assert "@keith" in ctx.message.edits[-1]["embed"].description

@@ -4435,3 +4435,163 @@ def test_replacing_an_earlier_raffle_is_still_announced(monkeypatch):
     description = ctx.sent[-1]["embed"].description.casefold()
     assert "replace" in description
     assert "asta's heart" in description
+
+
+# ---------------------------------------------------------------------------
+# Remembering the officer channel outside Discord.
+#
+# _STATE is rebuilt from scratch on every process start, so
+# officer_channel_id was always None at on_ready and the bot fell back to
+# scanning every text channel in the guild -- channel.pins() plus
+# channel.history() apiece, two Discord calls per channel, on every one of
+# the free tier's frequent restarts. Recording the id in the sheet (the
+# same place attendance_bot keeps its channel, attendance_sheet.py:436)
+# replaces that whole burst with one Google read and one pin fetch.
+# ---------------------------------------------------------------------------
+
+
+class ScannedChannel(FakeChannel):
+    """A channel that fails the test if on_ready reads it."""
+
+    def pins(self, limit=50):
+        raise AssertionError(
+            "on_ready scanned channel pins even though the officer channel "
+            "was remembered"
+        )
+
+    def history(self, limit=100):
+        raise AssertionError(
+            "on_ready scanned channel history even though the officer "
+            "channel was remembered"
+        )
+
+
+def _remembering_guild(monkeypatch, config):
+    """A guild whose officer channel holds state, plus a channel that must not be scanned.
+
+    `config` is what items_sheet.read_config returns, or an Exception to
+    raise instead.
+    """
+    officer_channel = FakeChannel(77)
+    queue_channel = FakeChannel(88)
+    restored = items_state.State(
+        officer_channel_id=officer_channel.id,
+        queue_channel_id=queue_channel.id,
+        queue=[_queued("gear", "Dajz", "Asta's Belt", items_rules.GEAR)],
+    )
+    officer_channel._pins = [
+        FakeMessage(content, message_id=part)
+        for part, content in enumerate(items_state.encode_state(restored))
+    ]
+    decoy = ScannedChannel(11)
+    officer_channel.name = "officers"
+    queue_channel.name = "queue"
+    decoy.name = "general"
+    guild = FakeGuild([decoy, officer_channel, queue_channel])
+
+    items_bot._STATE.officer_channel_id = None
+    monkeypatch.setattr(items_bot, "_SPREADSHEET", object())
+    monkeypatch.setattr(type(items_bot.bot), "guilds", property(lambda _bot: [guild]))
+    monkeypatch.setattr(
+        items_bot.bot,
+        "get_channel",
+        lambda channel_id: {
+            officer_channel.id: officer_channel,
+            queue_channel.id: queue_channel,
+            decoy.id: decoy,
+        }.get(channel_id),
+    )
+
+    def read_config(_spreadsheet):
+        if isinstance(config, Exception):
+            raise config
+        return config
+
+    monkeypatch.setattr(items_sheet, "read_config", read_config)
+    return officer_channel, queue_channel, decoy
+
+
+def test_on_ready_restores_from_the_remembered_channel_without_scanning(monkeypatch):
+    _, queue_channel, _ = _remembering_guild(
+        monkeypatch, {items_bot.OFFICER_CHANNEL_KEY: "77"}
+    )
+
+    asyncio.run(items_bot.on_ready())
+
+    assert items_bot._STATE.officer_channel_id == 77
+    assert queue_channel.sent, "on_ready did not draw the queue board"
+
+
+def test_on_ready_falls_back_to_scanning_when_the_sheet_remembers_nothing(monkeypatch):
+    officer_channel, queue_channel, decoy = _remembering_guild(monkeypatch, {})
+    # With nothing remembered the scan is the only way back, so the decoy
+    # must not refuse it.
+    monkeypatch.setattr(type(decoy), "pins", FakeChannel.pins)
+    monkeypatch.setattr(type(decoy), "history", FakeChannel.history)
+
+    asyncio.run(items_bot.on_ready())
+
+    assert items_bot._STATE.officer_channel_id == officer_channel.id
+    assert queue_channel.sent, "on_ready did not draw the queue board"
+
+
+def test_on_ready_falls_back_to_scanning_when_the_sheet_cannot_be_read(monkeypatch):
+    officer_channel, queue_channel, decoy = _remembering_guild(
+        monkeypatch, RuntimeError("sheet unreachable")
+    )
+    monkeypatch.setattr(type(decoy), "pins", FakeChannel.pins)
+    monkeypatch.setattr(type(decoy), "history", FakeChannel.history)
+
+    asyncio.run(items_bot.on_ready())
+
+    assert items_bot._STATE.officer_channel_id == officer_channel.id
+    assert queue_channel.sent, "an unreadable sheet must not cost the queue board"
+
+
+def test_setofficerchannel_records_the_channel_in_the_sheet(monkeypatch):
+    written = []
+    monkeypatch.setattr(items_bot, "_SPREADSHEET", object())
+    monkeypatch.setattr(
+        items_sheet,
+        "write_config",
+        lambda _spreadsheet, key, value: written.append((key, value)),
+    )
+    channel = FakeChannel(42)
+
+    asyncio.run(items_bot.setofficerchannel_cmd.callback(FakeCtx(channel)))
+
+    assert written == [(items_bot.OFFICER_CHANNEL_KEY, "42")]
+
+
+def test_setofficerchannel_still_works_when_the_sheet_refuses_the_write(monkeypatch):
+    """The queue lives on Discord; the sheet is only a shortcut back to it."""
+    def explode(_spreadsheet, key, value):
+        raise RuntimeError("sheet unreachable")
+
+    monkeypatch.setattr(items_bot, "_SPREADSHEET", object())
+    monkeypatch.setattr(items_sheet, "write_config", explode)
+    channel = FakeChannel(42)
+    ctx = FakeCtx(channel)
+
+    asyncio.run(items_bot.setofficerchannel_cmd.callback(ctx))
+
+    assert items_bot._STATE.officer_channel_id == 42
+    assert ctx.sent[-1]["embed"].title == "✅ Officer channel set"
+
+
+def test_on_ready_remembers_the_channel_it_had_to_scan_for(monkeypatch):
+    """Otherwise the scan repeats on every restart until an admin re-runs
+    !setofficerchannel -- and nobody has a reason to."""
+    officer_channel, _, decoy = _remembering_guild(monkeypatch, {})
+    monkeypatch.setattr(type(decoy), "pins", FakeChannel.pins)
+    monkeypatch.setattr(type(decoy), "history", FakeChannel.history)
+    written = []
+    monkeypatch.setattr(
+        items_sheet,
+        "write_config",
+        lambda _spreadsheet, key, value: written.append((key, value)),
+    )
+
+    asyncio.run(items_bot.on_ready())
+
+    assert written == [(items_bot.OFFICER_CHANNEL_KEY, str(officer_channel.id))]
