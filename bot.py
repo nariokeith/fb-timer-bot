@@ -27,9 +27,40 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-os.environ["TZ"] = os.getenv("BOT_TZ", os.environ.get("TZ", "Asia/Manila"))
-time.tzset()
+# The guild's timezone, and the anchor for every naive datetime here.
+#
+# This used to be enforced process-wide with os.environ["TZ"] plus
+# time.tzset(). tzset is Unix-only -- it does not exist on Windows -- so
+# on a PC there was no process zone to set and every naive <-> epoch
+# conversion silently fell back to whatever the machine was set to. For
+# `deaths` that is not cosmetic: state written on one host and read on
+# another moved every boss kill time by the offset between them.
+#
+# ZoneInfo works everywhere, so BOT_TZ is now applied at each conversion
+# (now(), _epoch()) instead of globally. tzset is still called where it
+# exists, so log and file timestamps keep matching the bots' own clock.
+BOT_TZ = os.getenv("BOT_TZ", os.environ.get("TZ", "Asia/Manila"))
+_TZ = ZoneInfo(BOT_TZ)
+if hasattr(time, "tzset"):
+    os.environ["TZ"] = BOT_TZ
+    time.tzset()
+
+
+def now() -> datetime:
+    """The current time in BOT_TZ, naive.
+
+    Naive rather than aware because every comparison in this module --
+    spawn schedules, kill times, the state file -- is against naive
+    datetimes, and Python refuses to compare the two.
+    """
+    return datetime.now(_TZ).replace(tzinfo=None)
+
+
+def _epoch(dt: datetime) -> int:
+    """A naive BOT_TZ datetime as a Unix timestamp, on any host."""
+    return int(dt.replace(tzinfo=_TZ).timestamp())
 
 import discord
 from discord.ext import commands, tasks
@@ -154,7 +185,7 @@ def prune_state(now: datetime) -> None:
 
 
 def _unix_map(section: str) -> dict:
-    return {b: int(datetime.fromisoformat(v).timestamp())
+    return {b: _epoch(datetime.fromisoformat(v))
             for b, v in data[section].items()}
 
 
@@ -190,7 +221,7 @@ def encode_state() -> str:
 
 def decode_state(content: str) -> dict | None:
     def from_unix(section: dict) -> dict:
-        return {b: datetime.fromtimestamp(t).isoformat()
+        return {b: datetime.fromtimestamp(t, _TZ).replace(tzinfo=None).isoformat()
                 for b, t in section.items() if b.lower() in ALL_BOSSES}
 
     try:
@@ -240,7 +271,7 @@ async def state_msg_is_recent() -> bool:
 async def persist() -> None:
     """Save state locally and mirror it into a pinned/recent Discord message."""
     global state_msg
-    prune_state(datetime.now())
+    prune_state(now())
     save_local()
     target_id = storage_channel_id()
     if not target_id:
@@ -403,7 +434,7 @@ def parse_death_time(text: str, now: datetime) -> datetime | None:
 
 def ts(dt: datetime, style: str = "f") -> str:
     """Discord timestamp markup — renders in each viewer's own timezone."""
-    return f"<t:{int(dt.timestamp())}:{style}>"
+    return f"<t:{_epoch(dt)}:{style}>"
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +500,7 @@ async def spawn_watcher():
     if channel is None:
         return
 
-    now = datetime.now()
+    now = now()
     changed = False
     for boss in ALL_BOSSES.values():
         # 10-minute warning for the upcoming spawn.
@@ -650,7 +681,7 @@ async def killed(ctx: commands.Context, boss_name: str, *, when: str = ""):
     if boss is None:
         await ctx.send(embed=unknown_boss_embed(boss_name))
         return
-    now = datetime.now()
+    now = now()
     if boss in SCHEDULED_BOSSES:
         slots = ", ".join(
             f"{WEEKDAYS[d]} {t}" for d, t in SCHEDULED_BOSSES[boss]
@@ -716,7 +747,7 @@ async def boss_info(ctx: commands.Context, boss_name: str):
         footer = f"Fixed weekly schedule: {slots}"
     await ctx.send(
         embed=boss_embed(
-            "📋 Boss Timer", boss, boss_field(boss, datetime.now()), footer=footer
+            "📋 Boss Timer", boss, boss_field(boss, now()), footer=footer
         )
     )
 
@@ -772,7 +803,7 @@ def build_boss_embeds(now: datetime, limit: int | None = None) -> list[discord.E
 async def bosses(ctx: commands.Context, scope: str = ""):
     """Next 20 spawns: !bosses — or the full list: !bosses all"""
     limit = None if scope.lower() == "all" else 20
-    await ctx.send(embeds=build_boss_embeds(datetime.now(), limit=limit))
+    await ctx.send(embeds=build_boss_embeds(now(), limit=limit))
 
 
 @killed.error
@@ -819,7 +850,7 @@ async def timer(ctx: commands.Context, seconds: str):
         )
         return
 
-    ends_at = datetime.now() + timedelta(seconds=remaining)
+    ends_at = now() + timedelta(seconds=remaining)
     msg = await ctx.send(
         embed=make_embed("⏳ Timer", f"Time remaining: {ts(ends_at, 'R')}")
     )

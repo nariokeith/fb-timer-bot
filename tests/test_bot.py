@@ -6,6 +6,8 @@ tracked file holding the live guild's channel ids.
 
 import os
 
+import pytest
+
 import channel_guard
 import bot as timer_bot
 
@@ -266,3 +268,71 @@ def test_a_sustained_block_closes_the_timer_bot(monkeypatch):
 
     assert closed == [True]
     assert timer_bot._QUIET.exit_code == 76
+
+
+# ---------------------------------------------------------------------------
+# Times must not depend on the host's clock.
+#
+# bot.py forced Asia/Manila with os.environ["TZ"] + time.tzset(), which
+# Python documents as Unix-only -- tzset does not exist on Windows. On a
+# PC there is therefore no process-wide zone to set, and every naive
+# datetime <-> epoch conversion silently falls back to whatever the
+# machine is set to. That is cosmetic for a rendered timestamp and not at
+# all cosmetic for `deaths`, which is the persisted kill time of every
+# boss.
+# ---------------------------------------------------------------------------
+
+import time as _time
+from datetime import datetime as _datetime
+from zoneinfo import ZoneInfo
+
+
+@pytest.fixture
+def host_clock_elsewhere(monkeypatch):
+    """Run the body as if this machine's clock were UTC, not Manila."""
+    monkeypatch.setenv("TZ", "UTC")
+    _time.tzset()
+    yield
+    monkeypatch.undo()
+    _time.tzset()
+
+
+def test_discord_timestamps_anchor_to_bot_tz_not_the_host_clock(host_clock_elsewhere):
+    noon_in_manila = _datetime(2026, 8, 20, 12, 0)
+    expected = int(
+        _datetime(2026, 8, 20, 12, 0, tzinfo=ZoneInfo("Asia/Manila")).timestamp()
+    )
+
+    assert timer_bot.ts(noon_in_manila) == f"<t:{expected}:f>"
+
+
+def test_the_bots_clock_reads_bot_tz_on_a_host_set_to_something_else(
+    host_clock_elsewhere,
+):
+    expected = _datetime.now(ZoneInfo("Asia/Manila")).replace(tzinfo=None)
+
+    drift = abs((timer_bot.now() - expected).total_seconds())
+    assert drift < 5, f"bot clock is {drift}s from Manila time"
+
+
+def test_kill_times_survive_a_move_to_a_host_in_another_timezone(monkeypatch):
+    """State written on Render (a UTC host) is read back on a Windows PC.
+
+    Both sides go through naive local time, so if that is the host's zone
+    rather than BOT_TZ, every stored timer shifts by the offset between
+    them -- silently, and by hours.
+    """
+    killed_at = "2026-08-20T21:30:00"
+    _configured(monkeypatch, deaths={"Venatus": killed_at})
+
+    written_here = timer_bot.encode_state()
+
+    monkeypatch.setenv("TZ", "UTC")
+    _time.tzset()
+    try:
+        read_there = timer_bot.decode_state(written_here)
+    finally:
+        monkeypatch.undo()
+        _time.tzset()
+
+    assert read_there["deaths"]["Venatus"] == killed_at

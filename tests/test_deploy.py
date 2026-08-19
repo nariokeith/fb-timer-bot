@@ -117,15 +117,14 @@ def test_setup_derives_the_service_user_from_whoever_ran_it(setup):
 
 
 # ---------------------------------------------------------------------------
-# The Windows host runs the bots inside WSL2, not natively.
-#
-# bot.py:32 calls time.tzset(), which Python documents as Unix-only, so a
-# native Windows run crashes the timer on import. WSL2 also means
-# deploy/setup.sh and the systemd unit apply unchanged instead of needing
-# a second, separately-rotting deployment path.
+# Windows runs the bots natively, so a non-technical host can install
+# them by running one file. WSL would have meant admin PowerShell, a
+# reboot and a second run -- more than the person doing it can be asked
+# to carry, and they cannot be talked through it remotely either.
 # ---------------------------------------------------------------------------
 
 WINDOWS = REPO / "deploy" / "install-windows.ps1"
+WINDOWS_BAT = REPO / "deploy" / "INSTALL.bat"
 WINDOWS_DOC = REPO / "docs" / "running-on-windows.md"
 
 
@@ -134,30 +133,55 @@ def windows():
     return WINDOWS.read_text()
 
 
-def test_the_timer_still_depends_on_the_unix_only_call_that_forces_wsl():
-    """If tzset ever goes, the WSL requirement should be revisited, not
-    left as folklore in a guide nobody rereads."""
-    assert "time.tzset()" in (REPO / "bot.py").read_text()
+def test_tzset_is_guarded_because_windows_does_not_have_it():
+    """Unguarded, bot.py crashes on import under native Windows -- which
+    is now the supported way to run it there."""
+    src = (REPO / "bot.py").read_text()
+    assert 'hasattr(time, "tzset")' in src
 
 
-def test_the_windows_installer_starts_wsl_rather_than_a_bot(windows):
-    """systemd inside the distro owns starting the supervisor; Windows
-    only has to bring the distro up."""
-    assert "wsl" in windows.lower()
-    assert "supervisor.py" not in windows
+def test_times_are_anchored_to_bot_tz_rather_than_the_process_zone():
+    """The corollary: with no process-wide TZ on Windows, every naive
+    <-> epoch conversion has to name the zone itself."""
+    src = (REPO / "bot.py").read_text()
+    assert "def _epoch(" in src
+    assert "ZoneInfo" in src
 
 
-def test_the_windows_installer_and_its_guide_agree_on_the_distro(windows):
-    distro = re.search(r"\$Distro\s*=\s*['\"]([^'\"]+)['\"]", windows)
-    assert distro, "install-windows.ps1 must name the distro in one place"
-    assert distro.group(1) in WINDOWS_DOC.read_text()
+def test_a_double_clickable_entry_point_exists():
+    """Double-clicking a .ps1 opens Notepad; the host needs a .bat."""
+    assert WINDOWS_BAT.exists()
+    assert "install-windows.ps1" in WINDOWS_BAT.read_text()
 
 
-def test_the_windows_installer_registers_an_autostart_task(windows):
+def test_the_batch_wrapper_bypasses_the_execution_policy():
+    """Default policy blocks unsigned scripts, and the failure message
+    reads like a virus warning to anyone who has not seen it before."""
+    assert "Bypass" in WINDOWS_BAT.read_text()
+
+
+def test_the_installer_registers_an_autostart_task(windows):
     """A PC that reboots overnight must come back without a human."""
     assert "ScheduledTask" in windows
 
 
-def test_the_windows_guide_warns_about_sleep(windows):
-    """A sleeping host is the one failure mode WSL cannot paper over."""
+def test_the_installer_starts_the_supervisor_not_a_single_bot(windows):
+    """supervisor.py owns the three bots; starting bot.py runs one."""
+    assert "supervisor.py" in windows
+
+
+def test_the_installer_writes_a_log_someone_can_send_back(windows):
+    """Nobody here can see this machine, and the person running it cannot
+    be asked to read a stack trace."""
+    assert "Start-Transcript" in windows
+
+
+def test_the_installer_refuses_without_credentials(windows):
+    """A credential-less start exits 78 and the supervisor leaves the
+    bots stopped, which reads as a crash rather than a missing step."""
+    assert ".env" in windows
+
+
+def test_the_guide_warns_about_sleep():
+    """A sleeping host is the one failure mode nothing here can paper over."""
     assert "sleep" in WINDOWS_DOC.read_text().lower()

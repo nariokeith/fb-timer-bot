@@ -1,89 +1,31 @@
-# Running the bots on a Windows PC
+# Running the bots on someone else's Windows PC
 
 **Why here:** Render's free tier routes every service in a region through
 an address shared with every other customer there, and Discord refused it
-from Oregon, Singapore and Ohio in turn. Oracle's signup rejected the
-account; Google Cloud's requires tax information. A machine at home is
-what is left — and it is the option with the best evidence: on 2026-08-18
-all three bots ran on a home machine without a single block while Render
-was being refused outright. Discord treats residential addresses far more
+from Oregon, Singapore and Ohio in turn. Oracle's signup was rejected;
+Google Cloud's billing needs tax information. A machine at home is what
+is left — and it is the option with the best evidence: on 2026-08-18 all
+three bots ran on a home machine without a single block while Render was
+being refused outright. Discord treats residential addresses far more
 gently than datacentre ranges.
 
-## The bots run inside WSL2, not on Windows directly
+This is written for the case where the PC belongs to someone else, who
+is not technical and will not hand over remote access. **They run one
+file. That is the whole of their involvement.**
 
-`bot.py` calls `time.tzset()`, which Python documents as Unix-only. On
-native Windows the timer bot crashes on import, and forcing Asia/Manila
-would instead depend silently on the PC's own clock being set to it.
+## What you send them
 
-WSL2 gives a real Ubuntu, so `deploy/setup.sh` and the systemd unit apply
-unchanged. That means one deployment path to keep working rather than a
-second Windows-only one that nobody would ever run and nobody would
-notice rotting.
+A zip with exactly two things in it:
 
-## Before you start
-
-The `.env` you are about to copy onto someone else's PC holds three
-Discord bot tokens, a Google service account key with **write access to
-the Logs Tracker and Point System sheets**, and a **billable** Gemini API
-key. File permissions do not protect it from the machine's owner.
-
-Give it only to someone you would trust with the guild's records. Discord
-tokens can be regenerated at any time if that changes; put a quota cap on
-the Gemini key, because that one can cost real money.
-
-## 1. Install WSL2
-
-In PowerShell **as Administrator**:
-
-```powershell
-wsl --install -d Ubuntu-24.04
+```
+fb-timer-bot-setup.zip
+├── INSTALL.bat
+└── .env
 ```
 
-Reboot. On first launch Ubuntu asks for a username and password — any are
-fine, but remember them; `setup.sh` installs the service under that user.
-
-## 2. Turn on systemd
-
-WSL2 ships with systemd off, and without it `setup.sh` has nothing to
-enable. Inside Ubuntu:
-
-```bash
-printf '[boot]\nsystemd=true\n' | sudo tee /etc/wsl.conf
-```
-
-Then back in PowerShell:
-
-```powershell
-wsl --shutdown
-```
-
-Reopen Ubuntu and confirm with `systemctl is-system-running` — `running`
-or `degraded` both mean systemd is up.
-
-## 3. Install the bots
-
-Inside Ubuntu, exactly as on any VPS:
-
-```bash
-sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/nariokeith/fb-timer-bot.git /tmp/fb
-sudo bash /tmp/fb/deploy/setup.sh
-```
-
-Run it with `sudo` from your own shell, not as root directly — that is
-how the script learns which user to run the service as.
-
-## 4. Credentials
-
-`setup.sh` stops before starting, because a credential-less start exits 78
-and reads as a crash rather than a remaining step.
-
-```bash
-sudo nano /opt/fb-timer-bot/.env
-sudo chmod 600 /opt/fb-timer-bot/.env
-```
-
-Nine values, copied from Render → Environment:
+`INSTALL.bat` is in `deploy/` in this repo, together with the
+`install-windows.ps1` it calls — send all three files, or just point them
+at the folder. `.env` you write yourself, from Render → Environment:
 
 ```
 DISCORD_TOKEN=...
@@ -101,80 +43,86 @@ ITEMS_GEAR_DAILY_CAP=3
 pasted multi-line key is not valid JSON and fails with "Service account
 JSON is not valid JSON" — this cost an hour on 2026-08-18.
 
-## 5. Autostart
+**Before you send it:** that file grants three Discord bot tokens, write
+access to the Logs Tracker and the Point System sheets, and a *billable*
+Gemini key. Put a quota cap on the Gemini key first — it is the only one
+of the three that can cost money rather than cause damage you can undo.
+The tokens can be regenerated at any time if you need to revoke access.
 
-WSL2 does not boot on its own, so nothing would come back after a
-restart. In PowerShell, from the repo:
+## What they do
 
-```powershell
-powershell -ExecutionPolicy Bypass -File deploy\install-windows.ps1
-```
+1. Unzip the folder anywhere
+2. Double-click `INSTALL.bat`
+3. Wait — a few minutes the first time, mostly Python and dependencies
 
-That registers a logon task which starts the distro; systemd inside it
-starts the supervisor, which starts the three bots. To undo it:
+That is it. No administrator, no reboot, no PowerShell, no typing.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File deploy\install-windows.ps1 -Stop
-```
+The installer downloads the code, installs Python 3.13 if it is missing,
+builds the environment, copies the credentials in, registers the bots to
+start at every logon, and turns off sleep-while-plugged-in. It finishes
+by saying either that the bots are running or that they are not.
 
-## 6. Cut over
+If anything fails it writes **`install-log.txt`** next to the .bat and
+asks them to send it back. Nobody can see their screen, so that file is
+the only diagnostic there is — it is worth telling them to send it
+without being asked.
 
-Suspend the Render service **first**. Two live copies double-post every
-boss warning and both write the same pinned state messages.
+## Why native, not WSL
 
-```bash
-sudo systemctl start fb-timer-bot
-journalctl -u fb-timer-bot -f
-```
+`bot.py` used to force Asia/Manila with `os.environ["TZ"]` plus
+`time.tzset()`. tzset is Unix-only, so the timer crashed on import under
+Windows and WSL2 looked mandatory — which would have meant an elevated
+PowerShell, a reboot and a second run, none of which someone can be
+talked through blind.
 
-Success looks like:
+Times are now anchored to `BOT_TZ` at each conversion with `ZoneInfo`
+(`bot.py`: `now()` and `_epoch()`), so the host's clock no longer decides
+anything. That mattered beyond Windows: `deaths` is persisted as Unix
+timestamps, and state written on Render (a UTC host) and read back on a
+PC set to another zone silently moved every boss kill time by the offset
+between them. `tests/test_bot.py` pins that.
 
-```
-[supervisor] keep-alive listening on port 8080
-[supervisor] starting timer: /opt/fb-timer-bot/.venv/bin/python -u bot.py
-Logged in as M2 TIMER#9367
-[items] logged in as Ukay-Ukay sa Bahay ni Talong#6513
-Attendance bot logged in as BK Attendance#8249
-[items] restored state from remembered #item-distribution
-State restored from Discord: True
-```
+## Cut over
 
-No data migration. All state lives in pinned Discord messages, so the
-queue, the timers and any raffle session restore on first login.
+**Suspend the Render service before they run the installer.** Two live
+copies double-post every boss warning and both write the same pinned
+state messages.
 
-Then delete the Render service, the HetrixTools monitor and the DuckDNS
-domain — all three existed only to stop Render sleeping.
+There is no data migration. All three bots keep their state in pinned
+Discord messages, so the queue, the timers and any raffle session restore
+on the first successful login. Once you can see the bots online and
+answering, delete the Render service, the HetrixTools monitor and the
+DuckDNS domain — all three existed only to stop Render sleeping.
 
-## Day-to-day
+## What to tell them, in plain words
 
-From PowerShell:
+Four things, none technical:
 
-```powershell
-wsl -d Ubuntu-24.04 -- journalctl -u fb-timer-bot -f
-wsl -d Ubuntu-24.04 -- sudo systemctl restart fb-timer-bot
-wsl -d Ubuntu-24.04 -- sudo bash /opt/fb-timer-bot/deploy/update.sh
-```
+- **Leave the PC on and plugged in.**
+- **Tell me if you turn it off for a while** — the guild has no other way
+  to know the bots are down.
+- **After a Windows Update restart, sign back in.** The bots start when
+  you log in, so a PC sitting at the lock screen is not running them.
+- **If anything looks wrong, send me `install-log.txt`.**
 
-There is no auto-deploy. Pushing to `main` changes nothing until
-`update.sh` runs — a deliberate trade: the 2026-08-18 outage was made
-worse by an auto-deploy landing mid-rate-limit and restarting all three
-bots into it.
+## Updating later
+
+Pushing to `main` changes nothing on their PC. They re-run `INSTALL.bat`,
+which reinstalls from the latest `main` and restarts the bots. It is
+idempotent — re-running repairs an install rather than duplicating it.
+
+This is deliberate rather than a missing feature: the 2026-08-18 outage
+was made worse by an auto-deploy landing mid-rate-limit and restarting
+all three bots into it.
 
 ## The honest limits
 
-**Sleep is the one thing WSL cannot paper over.** A sleeping PC runs no
-bots, and Windows sleeps by default. Set Power & battery → Screen and
-sleep → **When plugged in, put my device to sleep after: Never**. The
-screen may sleep; the machine may not.
-
-**Fast Startup can leave WSL down after a shutdown.** If the bots do not
-come back after a full power-off, turn off Fast Startup in Control Panel
-→ Power Options → Choose what the power buttons do.
-
-**It stops when the machine does.** No power, no bot — and the guild has
-no visibility into that, so agree with whoever owns the PC that they will
-say something if they take it offline for a while.
-
-**Windows Update reboots.** The logon task covers reboots that reach the
-login screen and get logged into. A PC left at the lock screen after an
-overnight update will not start the bots until someone signs in.
+- **No power, no bot.** The guild has no visibility into that machine.
+- **Sleep.** The installer disables sleep on AC. If they run on battery,
+  or change it back, the bots stop with the machine.
+- **Logon, not boot.** The task starts at logon so it never needs an
+  administrator. A PC left at the lock screen after an overnight update
+  will not start the bots until someone signs in.
+- **The installer is untested.** It was written on a Mac, where no
+  PowerShell exists to run it. `install-log.txt` is how the first run
+  gets debugged.
