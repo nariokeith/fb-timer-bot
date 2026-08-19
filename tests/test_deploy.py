@@ -185,3 +185,51 @@ def test_the_installer_refuses_without_credentials(windows):
 def test_the_guide_warns_about_sleep():
     """A sleeping host is the one failure mode nothing here can paper over."""
     assert "sleep" in WINDOWS_DOC.read_text().lower()
+
+
+def _required_credentials() -> set[str]:
+    """What the three bots actually refuse to start without.
+
+    Read out of the bots rather than restated here, so adding a required
+    variable to one of them fails in this file instead of at 3am on a PC
+    nobody can see.
+    """
+    attendance = (REPO / "attendance_bot.py").read_text()
+    block = attendance[
+        attendance.index("    missing = [") : attendance.index("        if not value")
+    ]
+    names = set(re.findall(r'\("([A-Z_]+)",', block))
+
+    items = (REPO / "items_bot.py").read_text()
+    declared = re.search(r"REQUIRED_ENV = \(([^)]*)\)", items).group(1)
+    names |= {n.strip().strip('"') for n in declared.split(",") if n.strip()}
+
+    names.add("DISCORD_TOKEN")  # bot.py, checked inline at its entry point
+    return names
+
+
+def test_the_installer_checks_every_credential_the_bots_require(windows):
+    """A missing one means exit 78 and three bots left stopped, which the
+    person who ran the installer would see as 'it just did nothing'."""
+    missing = sorted(n for n in _required_credentials() if n not in windows)
+
+    assert not missing, f"installer never validates: {missing}"
+
+
+def test_the_installer_rejects_a_multiline_service_account_key(windows):
+    """A pasted key spanning lines is not valid JSON and fails at runtime
+    with a message nobody on that PC can act on. It cost an hour once."""
+    assert "GOOGLE_SERVICE_ACCOUNT_JSON" in windows
+    assert "ConvertFrom-Json" in windows
+
+
+def test_the_installer_never_slices_an_argument_array_by_range(windows):
+    """`$a[1..($a.Count-1)]` looks like "everything after the first" and
+    is not: for a one-element array 1..0 counts DOWN, so it yields $null
+    and then the element itself. That turned `python --version` into
+    `python python --version` and made Python detection fail silently.
+    """
+    code = "\n".join(
+        line for line in windows.splitlines() if not line.strip().startswith("#")
+    )
+    assert ".Count-1)]" not in code.replace(" ", "")

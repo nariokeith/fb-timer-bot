@@ -598,15 +598,17 @@ def test_keepalive_binds_the_port_env_var(stopper, monkeypatch):
         supervisor_mod.stop_keepalive(server)
 
 
-def test_keepalive_survives_a_port_already_in_use(stopper):
+def test_keepalive_survives_a_port_already_in_use(stopper, monkeypatch):
     """A taken port must not stop the bots -- they matter more than the ping."""
     import socket
 
-    # Bound on 0.0.0.0, the same address the keep-alive server uses:
-    # holding only 127.0.0.1 is not a conflict, because SO_REUSEADDR lets
-    # a wildcard bind succeed alongside a loopback one.
+    # The port has to be held on the address the server will actually
+    # pick, and without $PORT that is now loopback. A mismatched pair is
+    # no conflict at all: SO_REUSEADDR lets a wildcard bind and a
+    # loopback one coexist, so holding the wrong one tests nothing.
+    monkeypatch.delenv("PORT", raising=False)
     held = socket.socket()
-    held.bind(("0.0.0.0", 0))
+    held.bind(("127.0.0.1", 0))
     held.listen(1)
     taken = held.getsockname()[1]
     try:
@@ -841,3 +843,37 @@ def test_the_brief_cooldown_also_covers_the_siblings(stopper):
     sup.tick()
     sup._due_at["sibling"] = time.monotonic()
     assert sup.tick() == []
+
+
+def test_keepalive_stays_on_localhost_without_renders_port(stopper, monkeypatch):
+    """Binding 0.0.0.0 pops Windows Defender's firewall dialog on first
+    run -- during an install nobody can watch, in front of someone who
+    cannot tell it apart from a virus warning, and who has to be an
+    administrator to allow it.
+
+    Nothing off Render reaches this port from another machine: it exists
+    so Render's spin-down timer sees an answer, and Render is the only
+    place that sets $PORT.
+    """
+    monkeypatch.delenv("PORT", raising=False)
+    sup = Supervisor([])
+    stopper.append(sup)
+    server = supervisor_mod.start_keepalive(sup, port=0)
+    try:
+        assert server is not None
+        assert server.server_address[0] == "127.0.0.1"
+    finally:
+        supervisor_mod.stop_keepalive(server)
+
+
+def test_keepalive_still_listens_everywhere_on_render(stopper, monkeypatch):
+    """Render's health check comes from off-box, so $PORT means 0.0.0.0."""
+    monkeypatch.setenv("PORT", "0")
+    sup = Supervisor([])
+    stopper.append(sup)
+    server = supervisor_mod.start_keepalive(sup)
+    try:
+        assert server is not None
+        assert server.server_address[0] == "0.0.0.0"
+    finally:
+        supervisor_mod.stop_keepalive(server)

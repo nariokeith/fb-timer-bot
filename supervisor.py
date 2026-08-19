@@ -142,8 +142,15 @@ def start_keepalive(supervisor, port: int | None = None):
             # the supervisor's own output.
             pass
 
+    # Only Render sets $PORT, and only Render's health check reaches this
+    # from off-box. Everywhere else -- a VPS, a guildmate's PC -- binding
+    # every interface buys nothing and costs a Windows Defender firewall
+    # prompt on first run: an administrator dialog, during an unattended
+    # install, in front of someone who cannot tell it from a virus
+    # warning. Localhost keeps the endpoint for debugging without it.
+    host = "0.0.0.0" if os.getenv("PORT") else "127.0.0.1"
     try:
-        server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+        server = ThreadingHTTPServer((host, port), Handler)
     except OSError as exc:
         print(f"[supervisor] keep-alive not started (port {port}): {exc}", flush=True)
         return None
@@ -152,7 +159,7 @@ def start_keepalive(supervisor, port: int | None = None):
         target=server.serve_forever, name="keepalive", daemon=True
     )
     thread.start()
-    print(f"[supervisor] keep-alive listening on port {port}", flush=True)
+    print(f"[supervisor] keep-alive listening on {host}:{port}", flush=True)
     return server
 
 
