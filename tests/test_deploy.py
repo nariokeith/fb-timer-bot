@@ -114,3 +114,50 @@ def test_setup_derives_the_service_user_from_whoever_ran_it(setup):
     """`sudo bash setup.sh` must land on the invoking account, not a guess."""
     app_user = re.search(r"^APP_USER=(.+)$", setup, re.MULTILINE).group(1)
     assert "SUDO_USER" in app_user, f"APP_USER={app_user} cannot adapt to the host"
+
+
+# ---------------------------------------------------------------------------
+# The Windows host runs the bots inside WSL2, not natively.
+#
+# bot.py:32 calls time.tzset(), which Python documents as Unix-only, so a
+# native Windows run crashes the timer on import. WSL2 also means
+# deploy/setup.sh and the systemd unit apply unchanged instead of needing
+# a second, separately-rotting deployment path.
+# ---------------------------------------------------------------------------
+
+WINDOWS = REPO / "deploy" / "install-windows.ps1"
+WINDOWS_DOC = REPO / "docs" / "running-on-windows.md"
+
+
+@pytest.fixture
+def windows():
+    return WINDOWS.read_text()
+
+
+def test_the_timer_still_depends_on_the_unix_only_call_that_forces_wsl():
+    """If tzset ever goes, the WSL requirement should be revisited, not
+    left as folklore in a guide nobody rereads."""
+    assert "time.tzset()" in (REPO / "bot.py").read_text()
+
+
+def test_the_windows_installer_starts_wsl_rather_than_a_bot(windows):
+    """systemd inside the distro owns starting the supervisor; Windows
+    only has to bring the distro up."""
+    assert "wsl" in windows.lower()
+    assert "supervisor.py" not in windows
+
+
+def test_the_windows_installer_and_its_guide_agree_on_the_distro(windows):
+    distro = re.search(r"\$Distro\s*=\s*['\"]([^'\"]+)['\"]", windows)
+    assert distro, "install-windows.ps1 must name the distro in one place"
+    assert distro.group(1) in WINDOWS_DOC.read_text()
+
+
+def test_the_windows_installer_registers_an_autostart_task(windows):
+    """A PC that reboots overnight must come back without a human."""
+    assert "ScheduledTask" in windows
+
+
+def test_the_windows_guide_warns_about_sleep(windows):
+    """A sleeping host is the one failure mode WSL cannot paper over."""
+    assert "sleep" in WINDOWS_DOC.read_text().lower()
