@@ -1944,3 +1944,71 @@ def test_wrong_channel_is_swallowed_but_other_check_failures_still_reply():
 
     asyncio.run(attendance_bot.on_command_error(ctx, dpy_commands.CheckFailure("nope")))
     assert ctx.sent, "a plain CheckFailure must still be reported"
+
+
+# ---------------------------------------------------------------------------
+# Going quiet when a block starts after login.
+# ---------------------------------------------------------------------------
+
+
+def _rate_limited_command_error():
+    import discord
+
+    response = type("Response", (), {"status": 429, "reason": "Too Many Requests"})()
+    inner = discord.HTTPException(response, {"message": "blocked", "retry_after": 1.0})
+    return type("CommandInvokeError", (Exception,), {"original": inner})()
+
+
+def _attendance_quiet_guard(monkeypatch, clock):
+    import discord_login
+
+    closed = []
+
+    class _ClosableBot:
+        async def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(
+        attendance_bot,
+        "_QUIET",
+        discord_login.QuietOnBlock(
+            _ClosableBot(),
+            "[attendance]",
+            watch=discord_login.RuntimeRateLimit(clock=clock),
+        ),
+    )
+    return closed
+
+
+def _attendance_error_ctx():
+    ctx = FakeCtx(SimpleNamespace(id=1, display_name="Keith", roles=[]))
+    ctx.command = SimpleNamespace(name="attendance")
+    return ctx
+
+
+def test_one_rate_limited_attendance_command_does_not_close_the_bot(monkeypatch):
+    closed = _attendance_quiet_guard(monkeypatch, lambda: 0.0)
+
+    asyncio.run(
+        attendance_bot.on_command_error(
+            _attendance_error_ctx(), _rate_limited_command_error()
+        )
+    )
+
+    assert closed == []
+
+
+def test_a_sustained_block_closes_the_attendance_bot(monkeypatch):
+    now = [0.0]
+    closed = _attendance_quiet_guard(monkeypatch, lambda: now[0])
+
+    for moment in (0.0, 10.0, 20.0):
+        now[0] = moment
+        asyncio.run(
+            attendance_bot.on_command_error(
+                _attendance_error_ctx(), _rate_limited_command_error()
+            )
+        )
+
+    assert closed == [True]
+    assert attendance_bot._QUIET.exit_code == 76

@@ -4595,3 +4595,112 @@ def test_on_ready_remembers_the_channel_it_had_to_scan_for(monkeypatch):
     asyncio.run(items_bot.on_ready())
 
     assert written == [(items_bot.OFFICER_CHANNEL_KEY, str(officer_channel.id))]
+
+
+# ---------------------------------------------------------------------------
+# Going quiet when a block starts mid-session.
+#
+# discord_login only converts a 429 into an exit code at LOGIN. A block
+# that begins once the bot is connected surfaces here instead, so nothing
+# exited, the supervisor's cooldown never fired, and the bot kept issuing
+# requests at an address supervisor.py concluded only recovers when the
+# requests stop.
+# ---------------------------------------------------------------------------
+
+import discord_login
+
+
+def _rate_limited_ctx():
+    ctx = FakeCtx(FakeChannel())
+    ctx.command = type("Cmd", (), {"name": "request"})()
+    return ctx
+
+
+def _watching_rate_limits(monkeypatch, clock):
+    """Give items_bot a fresh guard over a bot whose close() is observable."""
+    closed = []
+
+    class _ClosableBot:
+        async def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(
+        items_bot,
+        "_QUIET",
+        discord_login.QuietOnBlock(
+            _ClosableBot(), "[items]", watch=discord_login.RuntimeRateLimit(clock=clock)
+        ),
+    )
+    return closed
+
+
+def test_one_rate_limited_command_does_not_take_the_bot_offline(monkeypatch):
+    """30 minutes offline is far too much to pay for a single unlucky request."""
+    closed = _watching_rate_limits(monkeypatch, lambda: 0.0)
+
+    asyncio.run(items_bot.on_command_error(_rate_limited_ctx(), _rate_limited_error()))
+
+    assert closed == []
+    assert items_bot._QUIET.going_quiet is False
+
+
+def test_a_sustained_block_closes_the_bot_so_the_supervisor_can_hold_it(monkeypatch):
+    now = [0.0]
+    closed = _watching_rate_limits(monkeypatch, lambda: now[0])
+
+    for moment in (0.0, 10.0, 20.0):
+        now[0] = moment
+        asyncio.run(
+            items_bot.on_command_error(_rate_limited_ctx(), _rate_limited_error())
+        )
+
+    assert closed == [True]
+    assert items_bot._QUIET.going_quiet is True
+
+
+def test_going_quiet_happens_only_once_however_many_commands_fail(monkeypatch):
+    """close() is not idempotent in discord.py, and a second one would run
+    against a loop that is already shutting down."""
+    now = [0.0]
+    closed = _watching_rate_limits(monkeypatch, lambda: now[0])
+
+    for moment in (0.0, 10.0, 20.0, 30.0, 40.0):
+        now[0] = moment
+        asyncio.run(
+            items_bot.on_command_error(_rate_limited_ctx(), _rate_limited_error())
+        )
+
+    assert closed == [True]
+
+
+def test_the_member_is_still_told_when_the_bot_goes_quiet(monkeypatch):
+    """Going quiet must not swallow the one explanation the member gets."""
+    now = [0.0]
+    _watching_rate_limits(monkeypatch, lambda: now[0])
+    last = None
+
+    for moment in (0.0, 10.0, 20.0):
+        now[0] = moment
+        last = _rate_limited_ctx()
+        asyncio.run(items_bot.on_command_error(last, _rate_limited_error()))
+
+    assert "again" in last.sent[-1]["embed"].description.lower()
+
+
+def test_the_process_reports_the_brief_rate_limit_code_after_going_quiet(monkeypatch):
+    now = [0.0]
+    _watching_rate_limits(monkeypatch, lambda: now[0])
+
+    for moment in (0.0, 10.0, 20.0):
+        now[0] = moment
+        asyncio.run(
+            items_bot.on_command_error(_rate_limited_ctx(), _rate_limited_error())
+        )
+
+    assert items_bot._QUIET.exit_code == discord_login.EXIT_RATE_LIMITED_BRIEF
+
+
+def test_the_process_exits_normally_when_no_block_was_hit(monkeypatch):
+    _watching_rate_limits(monkeypatch, lambda: 0.0)
+
+    assert items_bot._QUIET.exit_code == 0

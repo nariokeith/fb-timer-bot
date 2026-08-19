@@ -17,6 +17,7 @@ IP go quiet long enough for Cloudflare to lift the ban.
 
 import re
 import sys
+import time
 
 import discord
 
@@ -73,6 +74,110 @@ def is_edge_ban(page: str) -> bool:
     """
     lowered = (page or "").lower()
     return "<html" in lowered or "cf-error" in lowered or "error 1015" in lowered
+
+
+# A 429 that arrives after a successful login never reaches run(), so it
+# never becomes an exit code and the supervisor never hears about it.
+# These decide when enough of them have arrived to call it a sustained
+# block rather than one unlucky request.
+#
+# Three inside two minutes: a member retrying a dead command produces
+# roughly that (the 2026-08-19 log shows three in 86 seconds), while
+# ordinary traffic on a healthy address produces none.
+RUNTIME_THRESHOLD = 3
+RUNTIME_WINDOW = 120.0
+
+
+class RuntimeRateLimit:
+    """Decides when post-login 429s mean the bot should stop knocking.
+
+    supervisor.py's cooldowns rest on the conclusion that this block only
+    lifts once the address goes quiet -- and that retrying through it
+    keeps it alive. That reasoning does not stop applying just because the
+    bot happened to be logged in when the block started, but until this
+    existed there was no way to act on it: the bot stayed up and kept
+    issuing requests for as long as members kept typing.
+
+    Deliberately a plain counter with an injected clock rather than
+    anything time-aware of its own, so the window can be tested without
+    sleeping through it.
+    """
+
+    def __init__(
+        self,
+        threshold: int = RUNTIME_THRESHOLD,
+        window: float = RUNTIME_WINDOW,
+        clock=time.monotonic,
+    ):
+        self._threshold = threshold
+        self._window = window
+        self._clock = clock
+        self._hits: list[float] = []
+
+    def record(self) -> bool:
+        """Note one post-login 429. True when the bot should go quiet.
+
+        The window slides rather than resetting: a block does not restart
+        its clock politely, so what matters is how many hits are inside
+        the last `window` seconds, not when the first of them landed.
+        """
+        now = self._clock()
+        self._hits = [hit for hit in self._hits if now - hit < self._window]
+        self._hits.append(now)
+        return len(self._hits) >= self._threshold
+
+
+def is_command_rate_limited(error: BaseException) -> bool:
+    """True if this failure is Discord rate limiting us.
+
+    Accepts the wrapped form too: discord.py hands an error handler a
+    CommandInvokeError carrying the real exception in .original.
+    """
+    return is_rate_limited(getattr(error, "original", error))
+
+
+class QuietOnBlock:
+    """Closes a bot once post-login 429s stop looking like bad luck.
+
+    Closing rather than sleeping in place, because the supervisor already
+    owns the "hold every child off this address" policy and only learns of
+    a block through an exit code. Routing both kinds of block through the
+    same door keeps one policy instead of two that can drift apart.
+
+    One instance per bot; `exit_code` is what the process should exit with
+    once run() returns.
+    """
+
+    def __init__(self, bot, tag: str, watch: "RuntimeRateLimit | None" = None):
+        self._bot = bot
+        self._tag = tag
+        self._watch = watch if watch is not None else RuntimeRateLimit()
+        self.going_quiet = False
+
+    @property
+    def exit_code(self) -> int:
+        return EXIT_RATE_LIMITED_BRIEF if self.going_quiet else 0
+
+    async def note(self, error: BaseException) -> None:
+        """Record one command failure, closing the bot if it is time to stop.
+
+        The going_quiet guard matters: discord.py's close() is not
+        idempotent, and every command still queued behind the block would
+        otherwise call it again against a loop already shutting down.
+        """
+        if self.going_quiet or not is_command_rate_limited(error):
+            return
+        if not self._watch.record():
+            return
+        self.going_quiet = True
+        print(
+            f"{self._tag} Discord is still rate limiting this instance after "
+            "login. Closing so the supervisor can hold every bot off until "
+            "the block on this address lifts.",
+            file=sys.stderr,
+            flush=True,
+        )
+        await self._bot.close()
 
 
 def run(bot, token: str, **kwargs) -> None:

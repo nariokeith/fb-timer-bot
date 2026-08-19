@@ -489,6 +489,7 @@ async def spawn_watcher():
                     changed = True
                 except discord.HTTPException as exc:
                     print(f"Failed to send warning for {boss}: {exc}")
+                    await _QUIET.note(exc)
 
         # "Has spawned!" message right when the spawn moment passes.
         if boss in SCHEDULED_BOSSES:
@@ -518,6 +519,7 @@ async def spawn_watcher():
             changed = True
         except discord.HTTPException as exc:
             print(f"Failed to send spawn message for {boss}: {exc}")
+            await _QUIET.note(exc)
     if changed:
         await persist()
 
@@ -549,6 +551,12 @@ def command_channels(ctx):
 bot.add_check(channel_guard.make_check(command_channels))
 
 
+# Closes this bot when 429s keep arriving after login, so the supervisor
+# can hold every child off an address Discord is refusing. discord_login
+# only catches the login-time case.
+_QUIET = discord_login.QuietOnBlock(bot, "[timer]")
+
+
 @bot.event
 async def on_command_error(ctx, error):
     """Keep the log readable; this bot has no user-facing error replies.
@@ -562,6 +570,7 @@ async def on_command_error(ctx, error):
     if isinstance(error, (commands.CommandNotFound, channel_guard.WrongChannel)):
         return
     print(f"Command {ctx.command} failed: {error!r}", file=sys.stderr, flush=True)
+    await _QUIET.note(error)
 
 
 @bot.command(name="setchannel")
@@ -850,3 +859,4 @@ if __name__ == "__main__":
         )
         sys.exit(EXIT_NOT_CONFIGURED)
     discord_login.run(bot, TOKEN)
+    sys.exit(_QUIET.exit_code)

@@ -922,6 +922,11 @@ async def on_ready():
     print(f"Attendance bot logged in as {bot.user} (ID: {bot.user.id}).", flush=True)
 
 
+# Closes this bot when 429s keep arriving after login; see
+# discord_login.QuietOnBlock.
+_QUIET = discord_login.QuietOnBlock(bot, "[attendance]")
+
+
 @bot.event
 async def on_command_error(ctx, error):
     """Turn command-framework errors into something an officer can read.
@@ -953,6 +958,7 @@ async def on_command_error(ctx, error):
         return
 
     await _safe_reject(ctx, "❌ Something Went Wrong", error_text(error))
+    await _QUIET.note(error)
 
 
 @bot.command(name="attendance")
@@ -1520,3 +1526,4 @@ if __name__ == "__main__":
         sys.exit(EXIT_NOT_CONFIGURED)
 
     discord_login.run(bot, TOKEN)
+    sys.exit(_QUIET.exit_code)

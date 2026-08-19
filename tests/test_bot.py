@@ -206,3 +206,63 @@ def test_the_finished_timer_still_pings_the_author(monkeypatch):
     ctx, _ = _run_timer(monkeypatch, 300)
 
     assert "@keith" in ctx.message.edits[-1]["embed"].description
+
+
+# ---------------------------------------------------------------------------
+# Going quiet when a block starts after login.
+# ---------------------------------------------------------------------------
+
+
+def _rate_limited_error():
+    import discord
+
+    response = type("Response", (), {"status": 429, "reason": "Too Many Requests"})()
+    inner = discord.HTTPException(response, {"message": "blocked", "retry_after": 1.0})
+    return type("CommandInvokeError", (Exception,), {"original": inner})()
+
+
+def _quiet_guard(monkeypatch, module, tag, clock):
+    import discord_login
+
+    closed = []
+
+    class _ClosableBot:
+        async def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(
+        module,
+        "_QUIET",
+        discord_login.QuietOnBlock(
+            _ClosableBot(), tag, watch=discord_login.RuntimeRateLimit(clock=clock)
+        ),
+    )
+    return closed
+
+
+def _error_ctx():
+    return type("Ctx", (), {"command": type("Cmd", (), {"name": "boss"})()})()
+
+
+def test_one_rate_limited_timer_command_does_not_close_the_bot(monkeypatch):
+    import asyncio
+
+    closed = _quiet_guard(monkeypatch, timer_bot, "[timer]", lambda: 0.0)
+
+    asyncio.run(timer_bot.on_command_error(_error_ctx(), _rate_limited_error()))
+
+    assert closed == []
+
+
+def test_a_sustained_block_closes_the_timer_bot(monkeypatch):
+    import asyncio
+
+    now = [0.0]
+    closed = _quiet_guard(monkeypatch, timer_bot, "[timer]", lambda: now[0])
+
+    for moment in (0.0, 10.0, 20.0):
+        now[0] = moment
+        asyncio.run(timer_bot.on_command_error(_error_ctx(), _rate_limited_error()))
+
+    assert closed == [True]
+    assert timer_bot._QUIET.exit_code == 76

@@ -1734,14 +1734,16 @@ async def on_ready():
         await refresh_board()
 
 
-def _is_rate_limited(error: BaseException) -> bool:
-    """True if Discord turned this command away for rate limiting.
+# Closes this bot when 429s keep arriving after login. discord_login
+# only turns one into an exit code at login time, so before this a block
+# that started mid-session left the bot up and knocking -- which
+# supervisor.py:76-82 concluded is what keeps these blocks alive.
+_QUIET = discord_login.QuietOnBlock(bot, "[items]")
 
-    The interesting exception is wrapped: the framework hands the handler
-    a CommandInvokeError carrying the real one in .original.
-    """
-    original = getattr(error, "original", error)
-    return isinstance(original, discord.HTTPException) and original.status == 429
+
+def _is_rate_limited(error: BaseException) -> bool:
+    """True if Discord turned this command away for rate limiting."""
+    return discord_login.is_command_rate_limited(error)
 
 
 async def _safe_send(ctx, embed) -> None:
@@ -1799,6 +1801,9 @@ async def on_command_error(ctx, error):
                 "minute or two.",
             ),
         )
+        # After the reply, not before: the member's explanation is worth
+        # one more request, and it is the last thing this bot does.
+        await _QUIET.note(error)
         return
 
     await _safe_send(ctx, error_embed("Something went wrong", str(error)))
@@ -1819,6 +1824,7 @@ def main() -> None:
         os.environ["ITEMS_SHEET_ID"], os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     )
     discord_login.run(bot, os.environ["ITEMS_DISCORD_TOKEN"])
+    sys.exit(_QUIET.exit_code)
 
 
 

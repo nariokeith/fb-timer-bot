@@ -7,6 +7,7 @@ indistinguishable, to the supervisor, from a bug. It restarts in seconds,
 logs in again, and refreshes the very ban it is waiting out.
 """
 
+import asyncio
 import sys
 
 import discord
@@ -226,3 +227,138 @@ def test_the_brief_code_matches_the_supervisors():
     import supervisor
 
     assert discord_login.EXIT_RATE_LIMITED_BRIEF == supervisor.EXIT_RATE_LIMITED_BRIEF
+
+
+# ---------------------------------------------------------------------------
+# 429s that arrive AFTER a successful login.
+#
+# The exit codes above only fire from run(), which wraps the *login*. A
+# block that starts once the bot is already connected surfaces in a
+# command handler instead, so nothing exits, the supervisor never hears
+# about it, and every bot keeps knocking at an address that supervisor.py
+# concluded only goes quiet when the knocking stops.
+# ---------------------------------------------------------------------------
+
+
+def _watch(clock, threshold=3, window=120.0):
+    return discord_login.RuntimeRateLimit(
+        threshold=threshold, window=window, clock=clock
+    )
+
+
+def test_a_single_runtime_rate_limit_is_not_worth_going_quiet_over():
+    """One unlucky request is not a sustained block, and a bot that quit
+    over it would spend 30 minutes offline for a hiccup."""
+    watch = _watch(lambda: 0.0)
+
+    assert watch.record() is False
+
+
+def test_enough_runtime_rate_limits_inside_the_window_says_go_quiet():
+    now = [0.0]
+    watch = _watch(lambda: now[0])
+
+    assert watch.record() is False
+    now[0] = 10.0
+    assert watch.record() is False
+    now[0] = 20.0
+    assert watch.record() is True
+
+
+def test_rate_limits_spread_wider_than_the_window_never_accumulate():
+    """Otherwise one 429 a day would eventually trip the threshold."""
+    now = [0.0]
+    watch = _watch(lambda: now[0])
+
+    for _ in range(6):
+        assert watch.record() is False, "isolated 429s must not add up"
+        now[0] += 121.0
+
+
+def test_the_window_slides_rather_than_resetting():
+    """Three inside the window still counts even when older ones have aged
+    out -- a block does not politely restart its clock."""
+    now = [0.0]
+    watch = _watch(lambda: now[0])
+
+    watch.record()
+    now[0] = 200.0
+    assert watch.record() is False
+    now[0] = 210.0
+    assert watch.record() is False
+    now[0] = 220.0
+    assert watch.record() is True
+
+
+def _rate_limited():
+    """Discord's own JSON 429 -- the block that starts after login."""
+    return _http_exception(429, {"message": "blocked", "retry_after": 1.0})
+
+
+class _FakeBot:
+    def __init__(self):
+        self.closes = 0
+
+    async def close(self):
+        self.closes += 1
+
+
+def _command_error(inner):
+    """What discord.py hands an error handler: the real one, wrapped."""
+    return type("CommandInvokeError", (Exception,), {"original": inner})()
+
+
+def _guard(bot, clock, tag="[test]"):
+    return discord_login.QuietOnBlock(
+        bot, tag, watch=discord_login.RuntimeRateLimit(clock=clock)
+    )
+
+
+def test_an_ordinary_command_failure_never_closes_the_bot():
+    bot = _FakeBot()
+    guard = _guard(bot, lambda: 0.0)
+
+    for _ in range(10):
+        asyncio.run(guard.note(_command_error(ValueError("boom"))))
+
+    assert bot.closes == 0
+    assert guard.exit_code == 0
+
+
+def test_a_sustained_block_closes_the_bot_and_asks_for_the_brief_cooldown():
+    now = [0.0]
+    bot = _FakeBot()
+    guard = _guard(bot, lambda: now[0])
+
+    for moment in (0.0, 10.0, 20.0):
+        now[0] = moment
+        asyncio.run(guard.note(_command_error(_rate_limited())))
+
+    assert bot.closes == 1
+    assert guard.exit_code == discord_login.EXIT_RATE_LIMITED_BRIEF
+
+
+def test_the_bot_is_closed_only_once_however_many_commands_fail():
+    """close() is not idempotent, and every queued command would call it."""
+    now = [0.0]
+    bot = _FakeBot()
+    guard = _guard(bot, lambda: now[0])
+
+    for moment in (0.0, 10.0, 20.0, 30.0, 40.0):
+        now[0] = moment
+        asyncio.run(guard.note(_command_error(_rate_limited())))
+
+    assert bot.closes == 1
+
+
+def test_a_bare_rate_limit_counts_even_when_not_wrapped():
+    """Not every caller has a CommandInvokeError to unwrap."""
+    now = [0.0]
+    bot = _FakeBot()
+    guard = _guard(bot, lambda: now[0])
+
+    for moment in (0.0, 10.0, 20.0):
+        now[0] = moment
+        asyncio.run(guard.note(_rate_limited()))
+
+    assert bot.closes == 1
