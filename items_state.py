@@ -321,21 +321,6 @@ def _encode_with_total(state: State, total: int) -> list[str]:
         if len(_render(current)) > MAX_CONTENT:
             raise ValueError("a binding is too large for a state shard")
 
-    for request in state.queue:
-        request_payload = request.to_dict()
-        current = payloads[-1]
-        current["queue"].append(request_payload)
-        if len(_render(current)) <= MAX_CONTENT:
-            continue
-
-        current["queue"].pop()
-        current = {"part": len(payloads), "total": total, "queue": []}
-        payloads.append(current)
-
-        current["queue"].append(request_payload)
-        if len(_render(current)) > MAX_CONTENT:
-            raise ValueError("a pending request is too large for a state shard")
-
     for raffle in state.raffles:
         raffle_payload = raffle.to_dict()
         current = payloads[-1]
@@ -350,6 +335,37 @@ def _encode_with_total(state: State, total: int) -> list[str]:
         current["raffles"].append(raffle_payload)
         if len(_render(current)) > MAX_CONTENT:
             raise ValueError("a raffle is too large for a state shard")
+
+    # Raffles before the queue, and the queue last of all. Both orders
+    # decode identically -- shards are merged by key, not by position --
+    # but they cost very differently to WRITE.
+    #
+    # The queue is the volatile part: !request adds, and every !distribute
+    # approval removes. The raffles are the bulk (6170 bytes against the
+    # queue's 1176 on the live guild) and change only when a poll opens or
+    # is drawn. With the queue packed first, removing one request shifted
+    # every raffle into a different shard, so a single approval rewrote
+    # all five -- measured on the live pin, and visible in the logs as
+    # "save_state from approve: 5 edited, 0 unchanged of 5 shards".
+    #
+    # Packed last, a queue change disturbs only the final shard, because
+    # nothing is packed behind it to shift.
+    for request in state.queue:
+        request_payload = request.to_dict()
+        current = payloads[-1]
+        # setdefault, not indexing: packed last, the shard this lands in
+        # may have been opened by the raffle loop and carry no queue key.
+        current.setdefault("queue", []).append(request_payload)
+        if len(_render(current)) <= MAX_CONTENT:
+            continue
+
+        current["queue"].pop()
+        current = {"part": len(payloads), "total": total, "queue": []}
+        payloads.append(current)
+
+        current["queue"].append(request_payload)
+        if len(_render(current)) > MAX_CONTENT:
+            raise ValueError("a pending request is too large for a state shard")
 
     contents = [_render(payload) for payload in payloads]
     # The loops above bound the shards they fill item by item, but shard 0

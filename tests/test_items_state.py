@@ -891,3 +891,92 @@ def test_dropping_the_pool_shrinks_the_stored_state():
     assert len(items_state.encode_state(fat)) < 4, (
         "15 drawn raffles carrying 16 names each should no longer need shards"
     )
+
+
+# -- The queue is packed last -------------------------------------------------
+#
+# Approving a request is the most frequent officer action -- !distribute
+# runs it for every member request -- and it was the most expensive save
+# in the bot. The queue used to be packed BEFORE the raffles, which are
+# the bulk of the state (6170 bytes against the queue's 1176 on the live
+# guild), so removing one queue entry shifted every raffle into a
+# different shard and rewrote all five. Measured on the live pin:
+# approve/deny cost 5 of 5 shards, while appending cost 1.
+#
+# Packed last, a queue change disturbs only the final shard, because
+# nothing is packed behind it.
+
+def _bulky_state(queued=6, raffles=20):
+    state = items_state.State(officer_channel_id=1)
+    for n in range(raffles):
+        state.raffles.append(
+            items_state.Raffle(
+                item=f"Some Boss's Special Log {n}", channel_id=1, message_id=n,
+                created_at=f"2026-08-{n % 28 + 1:02d} 09:00:00",
+                ends_at=f"2026-08-{n % 28 + 1:02d} 10:00:00",
+                winners=("SomeWinnerName",), drawn=True,
+            )
+        )
+    for n in range(queued):
+        state.queue.append(
+            items_state.PendingRequest(
+                id=f"req{n:03d}", user_id=n, ign=f"PlayerName{n:03d}",
+                item="Asta's Belt", type="Gear",
+                requested_at="2026-08-19 09:00:00",
+            )
+        )
+    return state
+
+
+def _shards_rewritten(before, after):
+    changed = sum(1 for i in range(min(len(before), len(after))) if before[i] != after[i])
+    return changed + abs(len(after) - len(before))
+
+
+def test_approving_a_request_rewrites_only_the_last_shard():
+    """The hot path: !distribute approves, which pops from the queue."""
+    state = _bulky_state()
+    before = items_state.encode_state(state)
+    assert len(before) > 2, "test needs a multi-shard state to be meaningful"
+
+    state.queue.pop(0)
+    after = items_state.encode_state(state)
+
+    rewritten = _shards_rewritten(before, after)
+    assert rewritten <= 2, (
+        f"removing one queue entry rewrote {rewritten} of {len(before)} shards"
+    )
+
+
+def test_a_new_request_rewrites_only_the_last_shard():
+    state = _bulky_state()
+    before = items_state.encode_state(state)
+
+    state.queue.append(
+        items_state.PendingRequest(
+            id="new", user_id=99, ign="Newcomer", item="Asta's Belt",
+            type="Gear", requested_at="2026-08-19 10:00:00",
+        )
+    )
+    after = items_state.encode_state(state)
+
+    assert _shards_rewritten(before, after) <= 2
+
+
+def test_the_queue_keeps_its_order_through_the_round_trip():
+    """Packed last, but still first-come-first-served."""
+    state = _bulky_state()
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert [r.id for r in restored.queue] == [r.id for r in state.queue]
+
+
+def test_raffles_and_queue_both_survive_being_reordered():
+    state = _bulky_state()
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert len(restored.raffles) == len(state.raffles)
+    assert len(restored.queue) == len(state.queue)
+    assert restored.raffles[0].item == state.raffles[0].item
