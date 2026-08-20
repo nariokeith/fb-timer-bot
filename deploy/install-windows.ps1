@@ -71,8 +71,16 @@ try {
     Write-Host ""
 
     # -- 1. Credentials, before anything is downloaded ------------------
+    $installedEnv = Join-Path $CodeDir '.env'
     if (-not (Test-Path $EnvFile)) {
-        Halt "no .env file next to this installer.`n  Expected: $EnvFile`n  Ask whoever sent you this for it, put it in this folder, and run INSTALL.bat again."
+        # An update should not mean re-sending live tokens over chat, nor
+        # keeping a folder full of them on someone's desktop forever.
+        if (Test-Path $installedEnv) {
+            Say "Using the credentials already installed"
+            $EnvFile = $installedEnv
+        } else {
+            Halt "no .env file next to this installer.`n  Expected: $EnvFile`n  Ask whoever sent you this for it, put it in this folder, and run INSTALL.bat again."
+        }
     }
     $envMap = @{}
     foreach ($line in Get-Content $EnvFile) {
@@ -95,33 +103,48 @@ try {
     Start-Sleep -Seconds 2
 
     # -- 2. Python, unpacked rather than installed ----------------------
-    Say "Setting up Python (about 10 MB)"
-    if (Test-Path $PyDir) { Remove-Item -Recurse -Force $PyDir }
-    New-Item -ItemType Directory -Force -Path $PyDir | Out-Null
-    $pyZipPath = Join-Path $env:TEMP 'python-embed.zip'
-    Fetch $PyZip $pyZipPath
-    Expand-Archive -Path $pyZipPath -DestinationPath $PyDir -Force
-
+    # Re-running this script IS the update path, so it must not spend ten
+    # megabytes and several minutes rebuilding an interpreter that is
+    # already sitting there working.
     $python = Join-Path $PyDir 'python.exe'
-    if (-not (Test-Path $python)) { Halt "the Python download did not unpack correctly." }
+    $pythonUsable = $false
+    if (Test-Path $python) {
+        $v = & $python --version 2>$null
+        if ($LASTEXITCODE -eq 0 -and $v -match 'Python 3\.13') {
+            & $python -m pip --version 2>&1 | Out-Null
+            $pythonUsable = ($LASTEXITCODE -eq 0)
+        }
+    }
+
+    if ($pythonUsable) {
+        Say "Reusing the Python already installed"
+    } else {
+        Say "Setting up Python (about 10 MB, once)"
+        if (Test-Path $PyDir) { Remove-Item -Recurse -Force $PyDir }
+        New-Item -ItemType Directory -Force -Path $PyDir | Out-Null
+        $pyZipPath = Join-Path $env:TEMP 'python-embed.zip'
+        Fetch $PyZip $pyZipPath
+        Expand-Archive -Path $pyZipPath -DestinationPath $PyDir -Force
+        if (-not (Test-Path $python)) { Halt "the Python download did not unpack correctly." }
 
     # The embeddable build ships python313._pth with `import site`
     # commented out, which leaves site-packages off the path -- pip can
     # neither install nor import anything until this is on.
-    $pth = Get-ChildItem $PyDir -Filter 'python*._pth' | Select-Object -First 1
-    if (-not $pth) { Halt "the embedded Python has no ._pth file to configure." }
-    (Get-Content $pth.FullName) -replace '^\s*#\s*import site\s*$', 'import site' |
-        Set-Content $pth.FullName
-    if (-not (Select-String -Path $pth.FullName -Pattern '^import site' -Quiet)) {
-        Halt "could not enable site-packages in the embedded Python."
-    }
+        $pth = Get-ChildItem $PyDir -Filter 'python*._pth' | Select-Object -First 1
+        if (-not $pth) { Halt "the embedded Python has no ._pth file to configure." }
+        (Get-Content $pth.FullName) -replace '^\s*#\s*import site\s*$', 'import site' |
+            Set-Content $pth.FullName
+        if (-not (Select-String -Path $pth.FullName -Pattern '^import site' -Quiet)) {
+            Halt "could not enable site-packages in the embedded Python."
+        }
 
-    $getPip = Join-Path $env:TEMP 'get-pip.py'
-    Fetch $GetPip $getPip
-    & $python $getPip --no-warn-script-location 2>&1 | Out-Null
-    & $python -m pip --version | Out-Null
-    if ($LASTEXITCODE -ne 0) { Halt "pip could not be set up inside the embedded Python." }
-    Say "Python ready (used only by these bots, nothing else on this PC changes)"
+        $getPip = Join-Path $env:TEMP 'get-pip.py'
+        Fetch $GetPip $getPip
+        & $python $getPip --no-warn-script-location 2>&1 | Out-Null
+        & $python -m pip --version | Out-Null
+        if ($LASTEXITCODE -ne 0) { Halt "pip could not be set up inside the embedded Python." }
+        Say "Python ready (used only by these bots, nothing else on this PC changes)"
+    }
 
     # -- 3. The code ----------------------------------------------------
     Say "Downloading the bots"
@@ -133,9 +156,26 @@ try {
     $unpacked = @(Get-ChildItem $staging -Directory) | Select-Object -First 1
     if (-not $unpacked) { Halt "the code download did not unpack as expected." }
 
+    # supervisor.py writes its log beside itself, so refreshing the code
+    # would delete the history -- precisely when an update is being made
+    # because something went wrong. Carry it across.
+    $logs = Join-Path $CodeDir 'logs'
+    $logsKeep = Join-Path $env:TEMP 'fb-timer-bot-logs'
+    if (Test-Path $logsKeep) { Remove-Item -Recurse -Force $logsKeep }
+    if (Test-Path $logs) { Move-Item $logs $logsKeep }
+
+    # Likewise the credentials, when this run is reusing the installed set.
+    $envKeep = $null
+    if ($EnvFile -eq $installedEnv -and (Test-Path $installedEnv)) {
+        $envKeep = Join-Path $env:TEMP 'fb-timer-bot-env'
+        Copy-Item -Force $installedEnv $envKeep
+        $EnvFile = $envKeep
+    }
+
     if (Test-Path $CodeDir) { Remove-Item -Recurse -Force $CodeDir }
     New-Item -ItemType Directory -Force -Path $CodeDir | Out-Null
     Copy-Item -Recurse -Force (Join-Path $unpacked.FullName '*') $CodeDir
+    if (Test-Path $logsKeep) { Move-Item $logsKeep $logs }
 
     # -- 4. Dependencies -------------------------------------------------
     Say "Installing dependencies (a few minutes; only this once)"

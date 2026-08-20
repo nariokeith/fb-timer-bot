@@ -128,13 +128,34 @@ Four things, none technical:
 
 ## Updating later
 
-Pushing to `main` changes nothing on their PC. They re-run `INSTALL.bat`,
-which reinstalls from the latest `main` and restarts the bots. It is
-idempotent — re-running repairs an install rather than duplicating it.
+Pushing to `main` changes nothing on their PC. Updating is one message:
+**"double-click INSTALL.bat again"**. It is the same file they already
+ran, and it is idempotent — a re-run repairs an install rather than
+duplicating it.
 
-This is deliberate rather than a missing feature: the 2026-08-18 outage
-was made worse by an auto-deploy landing mid-rate-limit and restarting
-all three bots into it.
+A re-run is deliberately cheap, because it happens on someone else's
+machine and their patience is the budget:
+
+| | First run | Re-run |
+|---|---|---|
+| Python (10 MB) | downloaded | **reused** if it still works |
+| Dependencies | all installed | only what changed |
+| Code | downloaded | downloaded (this is the point) |
+| `logs/` | created | **kept** — moved aside and back |
+| `.env` | required beside the installer | **reused** from the install |
+
+That last row matters: updating does not mean re-sending live tokens over
+chat. Ask them to **keep the setup folder** and re-running it is enough;
+if they have deleted it, `INSTALL.bat` and `install-windows.ps1` alone
+are enough for an update, because the credentials are already installed.
+
+The logs row matters for the same reason — `supervisor.py` writes beside
+itself, so refreshing the code would otherwise delete the history exactly
+when the update is being made *because* something went wrong.
+
+**There is no auto-update, deliberately.** The 2026-08-18 outage was made
+worse by an auto-deploy landing mid-rate-limit and restarting all three
+bots into it. Nothing changes on that PC unless someone decides it should.
 
 ## Where the logs are
 

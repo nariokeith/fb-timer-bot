@@ -269,3 +269,32 @@ def test_the_installer_needs_no_administrator(windows):
     )
     for elevated in ("winget", "Start-Process -Verb RunAs", "InstallAllUsers"):
         assert elevated not in code, f"{elevated!r} needs elevation or a system install"
+
+
+# ---------------------------------------------------------------------------
+# Updating is re-running INSTALL.bat, so a re-run has to be cheap and
+# non-destructive. The first version was neither: it deleted the embedded
+# Python and every wheel and fetched them again -- about 40 MB and several
+# minutes for a one-line change -- and took the log directory with it,
+# which lives inside the code directory it wiped.
+# ---------------------------------------------------------------------------
+
+
+def test_an_update_keeps_the_existing_python(windows):
+    """Re-downloading 10 MB of interpreter to change a line of Python is
+    minutes of someone else's time, and another chance to fail."""
+    assert "Reusing the Python already installed" in windows
+
+
+def test_an_update_preserves_the_logs(windows):
+    """DEFAULT_LOG_FILE sits inside the code directory, so refreshing the
+    code deletes the history -- exactly when an update is being made
+    because something is wrong."""
+    assert "logs" in windows
+    assert "Move-Item" in windows
+
+
+def test_an_update_does_not_need_the_credentials_sent_again(windows):
+    """Otherwise every update means re-sending live tokens over chat, and
+    keeping a folder full of them on someone else's desktop forever."""
+    assert "already installed" in windows
