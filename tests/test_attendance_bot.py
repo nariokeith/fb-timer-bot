@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import attendance_bot
 from attendance_bosses import BossAmbiguous, BossNotFound
 from attendance_bot import _is_officer, error_text
+from attendance_vision import VisionError
 
 
 class FakeRole:
