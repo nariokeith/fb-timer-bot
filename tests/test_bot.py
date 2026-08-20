@@ -350,20 +350,40 @@ def test_kill_times_survive_a_move_to_a_host_in_another_timezone(monkeypatch):
 
 
 class _WatcherChannel:
+    """Stands in for a text channel.
+
+    send() takes content positionally as well as by keyword, because
+    discord.py's does -- persist() calls channel.send(content) that way.
+    A fake with a narrower signature than the real thing turns a working
+    code path into a TypeError only at the times of day the path runs.
+    """
+
     def __init__(self, channel_id=100):
         self.id = channel_id
         self.mention = f"#channel-{channel_id}"
         self.sent = []
 
-    async def send(self, **kwargs):
-        self.sent.append(kwargs)
-        return type("Msg", (), {"id": 1})()
+    async def send(self, content=None, **kwargs):
+        self.sent.append({"content": content, **kwargs})
+        return type("Msg", (), {"id": 1, "pin": None})()
 
 
 def test_the_spawn_watcher_completes_a_tick(monkeypatch):
+    """Runs a real tick, whatever the wall clock says.
+
+    persist() is stubbed because a scheduled boss really can fall due
+    while this runs -- 27 weekly slots across 18 bosses -- and then the
+    tick writes state. Without the stub this passes or fails depending on
+    the time of day, which is worse than not testing it.
+    """
     import asyncio
 
     _configured(monkeypatch)
+
+    async def fake_persist():
+        pass
+
+    monkeypatch.setattr(timer_bot, "persist", fake_persist)
     monkeypatch.setattr(timer_bot.bot, "get_channel", lambda _id: _WatcherChannel())
 
     asyncio.run(timer_bot.spawn_watcher.coro())
