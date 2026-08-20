@@ -133,6 +133,14 @@ Pushing to `main` changes nothing on their PC. Updating is one message:
 ran, and it is idempotent — a re-run repairs an install rather than
 duplicating it.
 
+The installer updates itself too. Only the bot code comes from GitHub —
+`INSTALL.bat` and `install-windows.ps1` are whatever files the host
+already has — so an installer bug could not be fixed by re-running it,
+and needed a file sent over chat. Since it downloads the repo anyway, it
+now compares the shipped copy of itself against the running one and
+replaces it, then asks for one more double-click. That happens only when
+this file actually changed.
+
 A re-run is deliberately cheap, because it happens on someone else's
 machine and their patience is the budget:
 

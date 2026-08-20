@@ -337,3 +337,28 @@ def test_no_two_powershell_variables_differ_only_in_case(windows):
 
     collisions = {k: sorted(v) for k, v in by_lower.items() if len(v) > 1}
     assert not collisions, f"these are the same variable to PowerShell: {collisions}"
+
+
+def test_the_installer_refreshes_itself_from_the_download(windows):
+    """Only the bot code comes from GitHub; the installer is whatever file
+    the host already has. So a bug in the installer -- like the case
+    collision that broke the first real install -- cannot be fixed by
+    re-running it, and needs a file sent over chat instead.
+
+    Since it downloads the repo anyway, it can compare the shipped copy
+    of itself against the one running and replace it. Then every future
+    fix, installer included, is the same one instruction: run it again.
+    """
+    assert "$PSCommandPath" in windows, "the script never looks at its own path"
+    assert "Get-FileHash" in windows, "no way to tell the two copies apart"
+
+
+def test_the_self_update_does_not_relaunch_itself(windows):
+    """It asks for one more double-click instead of re-executing.
+
+    Re-exec on Windows means process juggling that cannot be tested from
+    here, and getting it wrong breaks the one thing the host can do. A
+    second click is cheap and only happens when the installer changed.
+    """
+    assert "-Verb RunAs" not in windows
+    assert "Start-Process powershell" not in windows

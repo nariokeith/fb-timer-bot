@@ -102,7 +102,52 @@ try {
     Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
 
-    # -- 2. Python, unpacked rather than installed ----------------------
+    Say "Downloading the bots"
+    $codeZip = Join-Path $env:TEMP 'fb-timer-bot.zip'
+    Fetch $Code $codeZip
+    $staging = Join-Path $env:TEMP 'fb-timer-bot-unzip'
+    if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
+    Expand-Archive -Path $codeZip -DestinationPath $staging -Force
+    $unpacked = @(Get-ChildItem $staging -Directory) | Select-Object -First 1
+    if (-not $unpacked) { Halt "the code download did not unpack as expected." }
+
+    # -- 2. A newer copy of this script ---------------------------------
+    # Only the bot code comes from GitHub; this file is whatever the host
+    # already has. So an installer bug cannot be fixed by re-running it --
+    # it needs a file sent over chat, which is the one thing this whole
+    # design exists to avoid. Since the repo is downloaded anyway, take
+    # the newer copy of ourselves out of it.
+    #
+    # Replaced and then stopped, rather than re-executed: relaunching is
+    # process juggling that cannot be tested from a Mac, and getting it
+    # wrong breaks the only thing the host is able to do. One more
+    # double-click is cheap, and only ever happens when this file changed.
+    $shippedPs1 = Join-Path $unpacked.FullName 'deploy\install-windows.ps1'
+    if ((Test-Path $shippedPs1) -and $PSCommandPath -and (Test-Path $PSCommandPath)) {
+        $newer = (Get-FileHash $shippedPs1 -Algorithm SHA256).Hash
+        $mine  = (Get-FileHash $PSCommandPath -Algorithm SHA256).Hash
+        if ($newer -ne $mine) {
+            # PowerShell parses the whole script before running it, so
+            # overwriting the file under ourselves is safe; exit at once
+            # regardless.
+            Copy-Item -Force $shippedPs1 $PSCommandPath
+            $shippedBat = Join-Path $unpacked.FullName 'deploy\INSTALL.bat'
+            $localBat   = Join-Path $Root 'INSTALL.bat'
+            if ((Test-Path $shippedBat) -and (Test-Path $localBat)) {
+                Copy-Item -Force $shippedBat $localBat
+            }
+            Write-Host ""
+            Write-Host "  The installer updated itself to a newer version." -ForegroundColor Cyan
+            Write-Host "  Nothing is broken - this is normal."
+            Write-Host ""
+            Write-Host "  Please double-click INSTALL.bat once more to finish."
+            Write-Host ""
+            Stop-Transcript | Out-Null
+            exit 0
+        }
+    }
+
+    # -- 3. Python, unpacked rather than installed ----------------------
     # Re-running this script IS the update path, so it must not spend ten
     # megabytes and several minutes rebuilding an interpreter that is
     # already sitting there working.
@@ -150,16 +195,6 @@ try {
         if ($LASTEXITCODE -ne 0) { Halt "pip could not be set up inside the embedded Python." }
         Say "Python ready (used only by these bots, nothing else on this PC changes)"
     }
-
-    # -- 3. The code ----------------------------------------------------
-    Say "Downloading the bots"
-    $codeZip = Join-Path $env:TEMP 'fb-timer-bot.zip'
-    Fetch $Code $codeZip
-    $staging = Join-Path $env:TEMP 'fb-timer-bot-unzip'
-    if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
-    Expand-Archive -Path $codeZip -DestinationPath $staging -Force
-    $unpacked = @(Get-ChildItem $staging -Directory) | Select-Object -First 1
-    if (-not $unpacked) { Halt "the code download did not unpack as expected." }
 
     # supervisor.py writes its log beside itself, so refreshing the code
     # would delete the history -- precisely when an update is being made
