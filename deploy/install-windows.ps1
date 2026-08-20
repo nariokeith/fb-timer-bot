@@ -28,7 +28,7 @@ $EnvFile = Join-Path $Root '.env'
 $Task    = 'fb-timer-bot'
 
 $PyZip  = 'https://www.python.org/ftp/python/3.13.4/python-3.13.4-embed-amd64.zip'
-$GetPip = 'https://bootstrap.pypa.io/get-pip.py'
+$GetPipUrl = 'https://bootstrap.pypa.io/get-pip.py'
 $Code   = 'https://github.com/nariokeith/fb-timer-bot/archive/refs/heads/main.zip'
 
 # Every credential the three bots refuse to start without. Missing any
@@ -138,9 +138,14 @@ try {
             Halt "could not enable site-packages in the embedded Python."
         }
 
-        $getPip = Join-Path $env:TEMP 'get-pip.py'
-        Fetch $GetPip $getPip
-        & $python $getPip --no-warn-script-location 2>&1 | Out-Null
+        # Two names, not one differing only in case: PowerShell variable
+        # names are case-INSENSITIVE, so a URL constant and a destination
+        # path spelled the same way are a single variable. The second
+        # assignment overwrote the URL, and Invoke-WebRequest was asked to
+        # download from a local file that did not exist yet.
+        $getPipFile = Join-Path $env:TEMP 'get-pip.py'
+        Fetch $GetPipUrl $getPipFile
+        & $python $getPipFile --no-warn-script-location 2>&1 | Out-Null
         & $python -m pip --version | Out-Null
         if ($LASTEXITCODE -ne 0) { Halt "pip could not be set up inside the embedded Python." }
         Say "Python ready (used only by these bots, nothing else on this PC changes)"

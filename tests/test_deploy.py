@@ -315,3 +315,25 @@ def test_the_bots_run_without_a_console_window(windows):
     action = re.search(r"New-ScheduledTaskAction[^\n]*\n[^\n]*", windows).group(0)
     assert "pythonw" in windows
     assert "$pythonw" in action, f"the task still launches a console python: {action}"
+
+
+def test_no_two_powershell_variables_differ_only_in_case(windows):
+    """PowerShell variable names are case-INSENSITIVE, so $GetPip and
+    $getPip are one variable. That shipped: the URL constant was silently
+    overwritten by the destination path, and Invoke-WebRequest was asked
+    to download from a local file that did not exist yet. It failed on the
+    guildmate's PC with 'Could not find file …\\get-pip.py'.
+
+    Nothing else catches this -- the script parses, and every name reads
+    as distinct to anyone skimming it.
+    """
+    code = "\n".join(
+        line for line in windows.splitlines() if not line.strip().startswith("#")
+    )
+    names = set(re.findall(r"\$([A-Za-z_][A-Za-z0-9_]*)", code))
+    by_lower = {}
+    for name in names:
+        by_lower.setdefault(name.lower(), set()).add(name)
+
+    collisions = {k: sorted(v) for k, v in by_lower.items() if len(v) > 1}
+    assert not collisions, f"these are the same variable to PowerShell: {collisions}"
