@@ -362,3 +362,39 @@ def test_the_self_update_does_not_relaunch_itself(windows):
     """
     assert "-Verb RunAs" not in windows
     assert "Start-Process powershell" not in windows
+
+
+def test_the_self_update_never_replaces_the_running_batch_file(windows):
+    """cmd.exe keeps a byte OFFSET into the .bat it is running and re-reads
+    from it after each command. Overwriting that file mid-execution makes
+    cmd resume inside different content and run whatever fragment lands
+    there -- seen on the host's PC as "'o' is not recognized", the tail of
+    an echo.
+
+    Replacing this .ps1 is safe by contrast: PowerShell parses a script
+    fully before executing it. A .bat is read as it goes.
+    """
+    code = "\n".join(
+        line for line in windows.splitlines() if not line.strip().startswith("#")
+    )
+    copies = re.findall(r"^\s*Copy-Item[^\n]*$", code, re.M)
+    offenders = [c.strip() for c in copies if "INSTALL.bat" in c or "$localBat" in c]
+    assert not offenders, f"the self-update writes over the running batch file: {offenders}"
+
+
+def test_stop_transcript_is_called_once(windows):
+    """Called twice, the second reports 'the host is not currently
+    transcribing' -- in red, at the end of a successful run, meaning
+    nothing to the person reading it. `exit` inside a try still runs the
+    finally, so the finally alone is enough.
+    """
+    code = "\n".join(
+        line for line in windows.splitlines() if not line.strip().startswith("#")
+    )
+    assert code.count("Stop-Transcript") == 1, "Stop-Transcript is called more than once"
+
+
+def test_windows_scripts_are_committed_with_crlf():
+    """These are edited on a Mac and read by cmd.exe and PowerShell."""
+    attrs = (REPO / ".gitattributes").read_text()
+    assert "*.bat" in attrs and "eol=crlf" in attrs

@@ -52,7 +52,11 @@ function Halt ($m) {
     Write-Host "  STOPPED: $m" -ForegroundColor Red
     Write-Host "  Send install-log.txt back to whoever gave you this."
     Write-Host ""
-    Stop-Transcript | Out-Null
+    # No Stop-Transcript here. `exit` inside the try still runs the finally
+    # at the bottom, and calling it twice makes the second one complain
+    # that "the host is not currently transcribing" -- printed in red,
+    # directly under a message asking the reader to send a log, where it
+    # looks like the real fault.
     exit 1
 }
 function Fetch ($url, $dest) {
@@ -131,18 +135,28 @@ try {
             # overwriting the file under ourselves is safe; exit at once
             # regardless.
             Copy-Item -Force $shippedPs1 $PSCommandPath
-            $shippedBat = Join-Path $unpacked.FullName 'deploy\INSTALL.bat'
-            $localBat   = Join-Path $Root 'INSTALL.bat'
-            if ((Test-Path $shippedBat) -and (Test-Path $localBat)) {
-                Copy-Item -Force $shippedBat $localBat
-            }
+
+            # INSTALL.bat is deliberately NOT replaced. cmd.exe keeps a
+            # byte OFFSET into the batch file it is running and re-reads
+            # from it after each command, so overwriting that file
+            # mid-execution makes cmd resume inside different content and
+            # run whatever fragment lands there -- observed as
+            # "'o' is not recognized", the tail of an echo. This script is
+            # safe to replace because PowerShell parses a script fully
+            # before executing it; a .bat is not.
+            #
+            # It costs nothing: the .bat is a fifteen-line stub that
+            # forwards to this file and has no reason to change.
             Write-Host ""
             Write-Host "  The installer updated itself to a newer version." -ForegroundColor Cyan
             Write-Host "  Nothing is broken - this is normal."
             Write-Host ""
             Write-Host "  Please double-click INSTALL.bat once more to finish."
             Write-Host ""
-            Stop-Transcript | Out-Null
+            # No Stop-Transcript here: `exit` inside a try still runs the
+            # finally below, and a second call errors with "the host is
+            # not currently transcribing" -- printed in red, alarming, and
+            # entirely meaningless to whoever is reading it.
             exit 0
         }
     }
