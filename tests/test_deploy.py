@@ -438,22 +438,6 @@ def test_the_script_uses_powershell_comments_not_docstrings(windows):
     assert '"""' not in windows
 
 
-def test_the_import_check_puts_the_code_on_the_path(windows):
-    """`python -c` adds the CURRENT directory to sys.path, and that is the
-    folder INSTALL.bat sits in -- not where the bots were installed. The
-    check therefore failed with "No module named 'bot'" on an install that
-    was fine, and refused to register a working setup.
-
-    The directory is passed as an argument rather than interpolated, since
-    this path routinely contains spaces and could contain a quote.
-    """
-    probe = re.search(r"\$probe\s*=\s*(.+?)\n\s*\$check", windows, re.S)
-    assert probe, "no import probe found"
-    assert "sys.path.insert" in probe.group(1)
-    assert "sys.argv[1]" in probe.group(1), "the path is interpolated, not passed"
-    assert "$CodeDir" in windows.split("$check = Run")[1].split("\n")[0]
-
-
 def test_autostart_has_a_fallback_that_cannot_be_refused(windows):
     """Register-ScheduledTask returned "Access is denied" on the host's PC,
     un-elevated and registering only for themselves. Policy, an ACL on the
@@ -481,3 +465,30 @@ def test_a_failed_start_shows_the_end_of_the_bot_log(windows):
     """The host cannot be asked to go and find a file before saying what
     went wrong; put it on the screen they are already looking at."""
     assert "Last lines of the bot log" in windows
+
+
+def test_the_code_directory_is_on_the_embedded_pythons_path(windows):
+    """A ._pth file puts the embeddable interpreter in isolated mode:
+    sys.path is exactly those lines, PYTHONPATH is ignored, and the
+    script's own directory is NOT added (bpo-34841). So `pythonw bot.py`
+    ran bot.py and then failed on `import channel_guard` beside it.
+    """
+    written = re.search(
+        r"@\((.*?)\)\s*\|\s*Set-Content\s+-Path\s+\$pth\.FullName", windows, re.S
+    )
+    assert written, "nothing writes the ._pth file"
+    lines = written.group(1)
+    assert "$CodeDir" in lines, "the ._pth never gains the code directory"
+    assert "'import site'" in lines, "site-packages would be unreachable"
+    assert "'python313.zip'" in lines, "the standard library would be unreachable"
+
+
+def test_the_import_check_does_not_arrange_its_own_success(windows):
+    """It injected the code directory into sys.path, so it passed while
+    every bot failed on import -- it was exercising a path the bots never
+    get. A check that manufactures the conditions for its own success is
+    worse than no check: it certifies the install and hides the fault.
+    """
+    probe = re.search(r"\$probe\s*=\s*(.+?)\n\s*\$check", windows, re.S).group(1)
+    assert "sys.path" not in probe, "the check still fakes the search path"
+    assert "import bot" in probe

@@ -261,6 +261,28 @@ try {
     Copy-Item -Recurse -Force (Join-Path $unpacked.FullName '*') $CodeDir
     if (Test-Path $logsKeep) { Move-Item $logsKeep $logs }
 
+    # The embeddable Python finds nothing next to a script it runs.
+    #
+    # A ._pth file switches the interpreter into isolated mode: sys.path
+    # becomes exactly the lines in that file, PYTHONPATH is ignored, and
+    # the script's own directory is NOT added -- documented, and tracked
+    # as bpo-34841. So `pythonw -u bot.py` executed bot.py happily and
+    # then failed on `import channel_guard`, which sits beside it.
+    #
+    # Rewritten on every run rather than only on a fresh install, because
+    # the reuse path keeps a ._pth written by an older version of this
+    # script. Absolute, because this file knows the path exactly and a
+    # relative one only invites questions about what it is relative to.
+    $pth = Get-ChildItem $PyDir -Filter 'python*._pth' | Select-Object -First 1
+    if (-not $pth) { Halt "the embedded Python has no ._pth file to configure." }
+    @(
+        'python313.zip'
+        '.'
+        $CodeDir
+        'import site'
+    ) | Set-Content -Path $pth.FullName -Encoding ASCII
+    Say "Python can see the bots"
+
     # -- 4. Dependencies -------------------------------------------------
     Say "Installing dependencies (a few minutes; only this once)"
     $deps = Run $python @('-m','pip','install','--quiet','--no-warn-script-location',
@@ -276,16 +298,16 @@ try {
     # is: a bad token, a broken key or a missing package fails here,
     # where the message can still be read, rather than silently later.
     Say "Checking the bots can start"
-    # The directory travels as an ARGUMENT, not as a working directory and
-    # not interpolated into the source. `python -c` puts the current
-    # directory on sys.path, and the current directory here is the folder
-    # INSTALL.bat sits in -- so the check reported "No module named 'bot'"
-    # about a perfectly good install. The scheduled task was always right;
-    # it sets -WorkingDirectory. Passing it as argv also sidesteps quoting:
-    # this path routinely contains spaces, and could contain a quote.
-    $probe = "import sys; sys.path.insert(0, sys.argv[1]); " +
-             "import bot, items_bot, attendance_bot; print('ok')"
-    $check = Run $python @('-c', $probe, $CodeDir)
+    # Deliberately NO sys.path injection. An earlier version added the
+    # code directory itself, which made the check pass while every bot
+    # failed on import -- it was testing a path the bots never get. A
+    # check that arranges its own success is worse than none, because it
+    # certifies the install and hides the fault until the log is read.
+    #
+    # This now relies on the ._pth written above, which is exactly what
+    # the running bots rely on.
+    $probe = "import bot, items_bot, attendance_bot; print('ok')"
+    $check = Run $python @('-c', $probe)
     if ($check.Code -ne 0 -or $check.Output -notmatch 'ok') {
         Halt "the bots could not load:`n$($check.Output)"
     }
