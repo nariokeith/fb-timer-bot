@@ -398,3 +398,41 @@ def test_windows_scripts_are_committed_with_crlf():
     """These are edited on a Mac and read by cmd.exe and PowerShell."""
     attrs = (REPO / ".gitattributes").read_text()
     assert "*.bat" in attrs and "eol=crlf" in attrs
+
+
+def test_external_programs_are_run_through_the_guard(windows):
+    """Windows PowerShell 5.1 turns a native command's stderr into a
+    NativeCommandError, and with $ErrorActionPreference = 'Stop' that
+    TERMINATES the script. `python -m pip --version` on a Python without
+    pip therefore threw instead of reporting a non-zero exit code, and
+    reached the host as "FAILED: ...python.exe: No module named pip".
+
+    pwsh 7 does not behave this way, so no amount of checking from a Mac
+    catches it. Routing every external call through Run() does.
+    """
+    code = "\n".join(
+        line for line in windows.splitlines() if not line.strip().startswith("#")
+    )
+    body = code.split("function Run ", 1)[1].split("\nfunction ", 1)[0]
+    rest = code.replace(body, "")
+
+    stray = re.findall(r"^\s*(?:\$\w+\s*=\s*)?&\s*\$python\b[^\n]*", rest, re.M)
+    stray += re.findall(r"^\s*powercfg\b[^\n]*", rest, re.M)
+    assert not stray, f"external calls bypassing Run(): {[s.strip() for s in stray]}"
+
+
+def test_no_native_call_merges_stderr_outside_the_guard(windows):
+    """`2>&1` is what converts stderr into the terminating error above."""
+    code = "\n".join(
+        line for line in windows.splitlines() if not line.strip().startswith("#")
+    )
+    body = code.split("function Run ", 1)[1].split("\nfunction ", 1)[0]
+    rest = code.replace(body, "")
+
+    assert "2>&1" not in rest, "a native call outside Run() still merges stderr"
+
+
+def test_the_script_uses_powershell_comments_not_docstrings(windows):
+    '''A Python-style """docstring""" is a parse error in PowerShell, and
+    the script is edited from Python here.'''
+    assert '"""' not in windows

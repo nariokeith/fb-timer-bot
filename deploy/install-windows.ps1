@@ -59,6 +59,31 @@ function Halt ($m) {
     # looks like the real fault.
     exit 1
 }
+# Run an external program, returning its exit code and its output.
+#
+# Windows PowerShell 5.1 -- which INSTALL.bat invokes, not pwsh 7 -- turns
+# a native command's stderr into a NativeCommandError, and with
+# $ErrorActionPreference = 'Stop' that error TERMINATES the script. So
+# `python -m pip --version` on a Python with no pip did not return a
+# non-zero exit code to be checked: it threw, and surfaced to the host as
+# "FAILED: ...python.exe: No module named pip".
+#
+# Programs write ordinary progress to stderr all the time, so every
+# external call here goes through this. The preference is relaxed for the
+# duration of the call only, and the exit code is what gets checked.
+#
+# Not reproducible from a Mac: pwsh 7 does not behave this way.
+function Run ($exe, [string[]]$argv) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $exe @argv 2>&1 | Out-String
+        [pscustomobject]@{ Code = $LASTEXITCODE; Output = $out }
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
 function Fetch ($url, $dest) {
     # UseBasicParsing: without it Invoke-WebRequest wants Internet
     # Explorer's engine, which is gone from current Windows.
@@ -168,10 +193,9 @@ try {
     $python = Join-Path $PyDir 'python.exe'
     $pythonUsable = $false
     if (Test-Path $python) {
-        $v = & $python --version 2>$null
-        if ($LASTEXITCODE -eq 0 -and $v -match 'Python 3\.13') {
-            & $python -m pip --version 2>&1 | Out-Null
-            $pythonUsable = ($LASTEXITCODE -eq 0)
+        $ver = Run $python @('--version')
+        if ($ver.Code -eq 0 -and $ver.Output -match 'Python 3\.13') {
+            $pythonUsable = ((Run $python @('-m','pip','--version')).Code -eq 0)
         }
     }
 
@@ -204,9 +228,10 @@ try {
         # download from a local file that did not exist yet.
         $getPipFile = Join-Path $env:TEMP 'get-pip.py'
         Fetch $GetPipUrl $getPipFile
-        & $python $getPipFile --no-warn-script-location 2>&1 | Out-Null
-        & $python -m pip --version | Out-Null
-        if ($LASTEXITCODE -ne 0) { Halt "pip could not be set up inside the embedded Python." }
+        $bootstrap = Run $python @($getPipFile, '--no-warn-script-location')
+        if ((Run $python @('-m','pip','--version')).Code -ne 0) {
+            Halt "pip could not be set up inside the embedded Python.`n$($bootstrap.Output)"
+        }
         Say "Python ready (used only by these bots, nothing else on this PC changes)"
     }
 
@@ -233,9 +258,9 @@ try {
 
     # -- 4. Dependencies -------------------------------------------------
     Say "Installing dependencies (a few minutes; only this once)"
-    & $python -m pip install --quiet --no-warn-script-location `
-        -r (Join-Path $CodeDir 'requirements.txt')
-    if ($LASTEXITCODE -ne 0) { Halt "installing dependencies failed." }
+    $deps = Run $python @('-m','pip','install','--quiet','--no-warn-script-location',
+                          '-r', (Join-Path $CodeDir 'requirements.txt'))
+    if ($deps.Code -ne 0) { Halt "installing dependencies failed:`n$($deps.Output)" }
 
     Copy-Item -Force $EnvFile (Join-Path $CodeDir '.env')
     Say "Credentials copied in"
@@ -246,9 +271,9 @@ try {
     # is: a bad token, a broken key or a missing package fails here,
     # where the message can still be read, rather than silently later.
     Say "Checking the bots can start"
-    $check = & $python -c "import bot, items_bot, attendance_bot; print('ok')" 2>&1
-    if ($LASTEXITCODE -ne 0 -or $check -notmatch 'ok') {
-        Halt "the bots could not load:`n$check"
+    $check = Run $python @('-c', "import bot, items_bot, attendance_bot; print('ok')")
+    if ($check.Code -ne 0 -or $check.Output -notmatch 'ok') {
+        Halt "the bots could not load:`n$($check.Output)"
     }
 
     # -- 6. Autostart ----------------------------------------------------
@@ -280,9 +305,8 @@ try {
     # Reported honestly: powercfg can be refused by policy, and claiming
     # success when the machine still sleeps would send someone hunting
     # for a bug that is really a power setting.
-    powercfg /change standby-timeout-ac 0 2>&1 | Out-Null
-    $sleepOk = ($LASTEXITCODE -eq 0)
-    powercfg /change hibernate-timeout-ac 0 2>&1 | Out-Null
+    $sleepOk = ((Run 'powercfg' @('/change','standby-timeout-ac','0')).Code -eq 0)
+    Run 'powercfg' @('/change','hibernate-timeout-ac','0') | Out-Null
     if ($sleepOk) { Say "Sleep turned off while plugged in" }
     else { Say "COULD NOT turn sleep off -- set Settings > System > Power to Never" }
 
