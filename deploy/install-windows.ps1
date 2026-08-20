@@ -201,7 +201,17 @@ try {
     # At logon rather than at startup, because a per-user task needs a
     # session -- and this deliberately never asks for an administrator.
     # ExecutionTimeLimit zero, or Task Scheduler kills them after 3 days.
-    $action = New-ScheduledTaskAction -Execute $python `
+    # pythonw.exe, not python.exe. An at-logon task runs in the user's own
+    # interactive session, so a console executable parks a black window on
+    # their desktop at every logon -- forever, saying nothing, in front of
+    # someone with every reason to close it. Closing it kills all three
+    # bots. pythonw is the same interpreter without the console, and it
+    # costs nothing: the output that matters goes to the log file, print()
+    # is a no-op when there is no stdout, and the children's output is
+    # read through pipes the supervisor owns rather than its own stdout.
+    $pythonw = Join-Path $PyDir 'pythonw.exe'
+    if (-not (Test-Path $pythonw)) { Halt "the embedded Python has no pythonw.exe." }
+    $action = New-ScheduledTaskAction -Execute $pythonw `
         -Argument '-u supervisor.py' -WorkingDirectory $CodeDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `

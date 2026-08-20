@@ -298,3 +298,20 @@ def test_an_update_does_not_need_the_credentials_sent_again(windows):
     """Otherwise every update means re-sending live tokens over chat, and
     keeping a folder full of them on someone else's desktop forever."""
     assert "already installed" in windows
+
+
+def test_the_bots_run_without_a_console_window(windows):
+    """A scheduled task with an at-logon trigger runs in the user's own
+    session, so a console executable puts a black window on their desktop
+    at every logon -- forever, saying nothing, in front of someone who has
+    every reason to close it. Closing it kills all three bots.
+
+    pythonw.exe is the same interpreter without the console. It ships in
+    the embeddable distribution, and it costs nothing here because the
+    output that matters goes to the log file: print() is a documented
+    no-op when sys.stdout is None, and the children's output is read
+    through pipes the supervisor owns rather than through its stdout.
+    """
+    action = re.search(r"New-ScheduledTaskAction[^\n]*\n[^\n]*", windows).group(0)
+    assert "pythonw" in windows
+    assert "$pythonw" in action, f"the task still launches a console python: {action}"
