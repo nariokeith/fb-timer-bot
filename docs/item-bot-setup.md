@@ -196,12 +196,13 @@ Render dashboard → your `fb-timer-bot` service → **Environment**. Add:
 same service account must be an **Editor** on the real Logs Tracker; share it if
 you haven't.
 
-`render.yaml` already declares these keys, but Render will not invent values for
-`sync: false` entries — you must type them into the dashboard.
+These go in the `.env` file the installer reads — see
+[running-on-windows.md](running-on-windows.md), or `deploy/setup.sh` on a
+Linux host. Nothing invents them for you.
 
 ### 4. Deploy and check
 
-Render redeploys on push. In the service **Logs**, look for all three:
+Re-run the installer, then look in `supervisor.log` for all three:
 
 ```
 [supervisor] starting timer: ... bot.py

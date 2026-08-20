@@ -137,7 +137,7 @@ No data migration. All three bots keep their state in pinned Discord
 messages, so the queue, the timers and any raffle session restore on the
 first successful login.
 
-Once you are happy, delete the Render service and the HetrixTools monitor.
+Once you are happy, stop whatever was running the bots before.
 
 ## Day-to-day
 

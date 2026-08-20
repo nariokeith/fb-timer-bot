@@ -542,144 +542,21 @@ def _get(port, path="/", timeout=5.0):
         return r.status, r.read().decode()
 
 
-def test_keepalive_answers_while_every_bot_is_down(stopper):
-    """The regression test for the outage: no child alive, still answering.
-
-    If this fails, Render sees a dead port, spins the service down, and the
-    bots cannot come back even once Discord is reachable again.
-    """
-    sup = Supervisor([ChildSpec("crashy", EXIT_CRASH)], restart_delay=60.0)
-    stopper.append(sup)
-    server = supervisor_mod.start_keepalive(sup, port=0)
-    assert server is not None, "keep-alive server did not bind"
-    try:
-        sup.start_all()
-        _settle()
-        sup.tick()
-        assert sup.running_names() == [], "test needs every child dead"
-
-        status, body = _get(server.server_address[1])
-        assert status == 200
-        assert body, "keep-alive answered with an empty body"
-    finally:
-        supervisor_mod.stop_keepalive(server)
-
-
-def test_keepalive_reports_which_children_are_running(stopper):
-    sup = Supervisor([ChildSpec("sleeper", SLEEP_FOREVER)])
-    stopper.append(sup)
-    server = supervisor_mod.start_keepalive(sup, port=0)
-    try:
-        sup.start_all()
-        _wait_until(lambda: sup.running_names() == ["sleeper"])
-
-        _status, body = _get(server.server_address[1])
-        assert "sleeper" in body, body
-    finally:
-        supervisor_mod.stop_keepalive(server)
-
-
-def test_keepalive_binds_the_port_env_var(stopper, monkeypatch):
-    """Render injects $PORT; binding anything else means no open port."""
-    import socket
-
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        free_port = probe.getsockname()[1]
-
-    monkeypatch.setenv("PORT", str(free_port))
-    sup = Supervisor([])
-    stopper.append(sup)
-    server = supervisor_mod.start_keepalive(sup)
-    try:
-        assert server is not None
-        assert server.server_address[1] == free_port
-    finally:
-        supervisor_mod.stop_keepalive(server)
-
-
-def test_keepalive_survives_a_port_already_in_use(stopper, monkeypatch):
-    """A taken port must not stop the bots -- they matter more than the ping."""
-    import socket
-
-    # The port has to be held on the address the server will actually
-    # pick, and without $PORT that is now loopback. A mismatched pair is
-    # no conflict at all: SO_REUSEADDR lets a wildcard bind and a
-    # loopback one coexist, so holding the wrong one tests nothing.
-    monkeypatch.delenv("PORT", raising=False)
-    held = socket.socket()
-    held.bind(("127.0.0.1", 0))
-    held.listen(1)
-    taken = held.getsockname()[1]
-    try:
-        sup = Supervisor([])
-        stopper.append(sup)
-        server = supervisor_mod.start_keepalive(sup, port=taken)
-        assert server is None, "expected the bind to fail without raising"
-    finally:
-        held.close()
-
-
-def test_run_binds_the_port_even_when_every_child_crashes():
-    """End to end through run(), the entry point Render actually executes.
-
-    Covers the wiring, not just start_keepalive: a keep-alive that works in
-    isolation but is never started by run() would fail in exactly the way
-    the outage did, and silently.
-    """
-    import socket
-    import urllib.request
-
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-
-    script = (
-        "import supervisor\n"
-        "supervisor.CHILDREN = [supervisor.ChildSpec('crashy', "
-        f"[{sys.executable!r}, '-c', 'import sys; sys.exit(1)'])]\n"
-        "supervisor.Supervisor(supervisor.CHILDREN, restart_delay=60.0).run()\n"
-    )
-    env = {**os.environ, "PORT": str(port)}
-    proc = subprocess.Popen(
-        [sys.executable, "-u", "-c", script], cwd=REPO_ROOT, env=env
-    )
-    try:
-        def answers():
-            try:
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/", timeout=1.0
-                ) as r:
-                    return r.status == 200
-            except Exception:
-                return False
-
-        assert _wait_until(answers, timeout=15.0), (
-            "run() never bound $PORT; Render would see a dead service and sleep it"
-        )
-    finally:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-
-# -- Cloudflare IP ban (exit 75) ---------------------------------------------
-#
-# Discord rate-limits by IP, and all three bots share this instance's one
-# egress IP. So the cooldown after a ban has to be service-wide: holding
-# back only the child that reported it leaves its two siblings logging in
-# every few seconds, refreshing the ban none of them can then get past.
-
-EXIT_RATE_LIMITED_CHILD = _python(f"import sys; sys.exit({EXIT_RATE_LIMITED})")
-
-
 def test_a_rate_limited_child_is_restarted_eventually():
     """75 means "come back later", not "stay stopped"."""
     assert should_restart(EXIT_RATE_LIMITED) is True
     for spec in CHILDREN:
         assert should_restart(EXIT_RATE_LIMITED, spec.no_restart_codes) is True
+
+
+# -- Rate-limit cooldown -----------------------------------------------------
+#
+# Discord rate-limits by IP, and all three bots share one egress address.
+# So the cooldown after a ban has to be service-wide: holding back only
+# the child that reported it leaves its two siblings logging in every few
+# seconds, refreshing the ban none of them can then get past.
+
+EXIT_RATE_LIMITED_CHILD = _python(f"import sys; sys.exit({EXIT_RATE_LIMITED})")
 
 
 def test_a_rate_limited_child_waits_out_the_cooldown(stopper):
@@ -843,54 +720,6 @@ def test_the_brief_cooldown_also_covers_the_siblings(stopper):
     sup.tick()
     sup._due_at["sibling"] = time.monotonic()
     assert sup.tick() == []
-
-
-def test_keepalive_stays_on_localhost_without_renders_port(stopper, monkeypatch):
-    """Binding 0.0.0.0 pops Windows Defender's firewall dialog on first
-    run -- during an install nobody can watch, in front of someone who
-    cannot tell it apart from a virus warning, and who has to be an
-    administrator to allow it.
-
-    Nothing off Render reaches this port from another machine: it exists
-    so Render's spin-down timer sees an answer, and Render is the only
-    place that sets $PORT.
-    """
-    monkeypatch.delenv("PORT", raising=False)
-    sup = Supervisor([])
-    stopper.append(sup)
-    server = supervisor_mod.start_keepalive(sup, port=0)
-    try:
-        assert server is not None
-        assert server.server_address[0] == "127.0.0.1"
-    finally:
-        supervisor_mod.stop_keepalive(server)
-
-
-def test_keepalive_still_listens_everywhere_on_render(stopper, monkeypatch):
-    """Render's health check comes from off-box, so $PORT means 0.0.0.0."""
-    monkeypatch.setenv("PORT", "0")
-    sup = Supervisor([])
-    stopper.append(sup)
-    server = supervisor_mod.start_keepalive(sup)
-    try:
-        assert server is not None
-        assert server.server_address[0] == "0.0.0.0"
-    finally:
-        supervisor_mod.stop_keepalive(server)
-
-
-# ---------------------------------------------------------------------------
-# A log file, because the Windows host has nowhere else to put one.
-#
-# Task Scheduler discards a process's stdout, so every line the three bots
-# print on that PC vanishes -- there is no dashboard, no journalctl, and
-# nobody who can read a console that does not exist. A file is the only
-# record its owner can be asked to send back.
-#
-# The lines that matter come from the CHILDREN, not the supervisor, so a
-# tee over sys.stdout would capture almost nothing: children inherit the
-# real file descriptor and write straight past it.
-# ---------------------------------------------------------------------------
 
 
 def _wait_for(path, needle, timeout=10.0):

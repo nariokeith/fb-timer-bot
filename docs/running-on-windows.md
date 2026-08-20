@@ -105,15 +105,18 @@ between them. `tests/test_bot.py` pins that.
 
 ## Cut over
 
-**Suspend the Render service before they run the installer.** Two live
-copies double-post every boss warning and both write the same pinned
-state messages.
+**Nothing else may be running the bots at the same time.** Two live copies
+double-post every boss warning and both write the same pinned state
+messages, so stop any other host — a laptop, an old service — before the
+installer runs. This is how the move off Render was done on 2026-08-20,
+and Render, its uptime monitor and its DuckDNS domain were deleted once
+the bots answered from here.
 
-There is no data migration. All three bots keep their state in pinned
-Discord messages, so the queue, the timers and any raffle session restore
-on the first successful login. Once you can see the bots online and
-answering, delete the Render service, the HetrixTools monitor and the
-DuckDNS domain — all three existed only to stop Render sleeping.
+There is no data migration, ever. All three bots keep their state in
+pinned Discord messages, so the queue, the timers and any raffle session
+restore on the first successful login. That is also why an update can
+delete and re-download the whole install directory without losing
+anything.
 
 ## What to tell them, in plain words
 

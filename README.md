@@ -334,20 +334,44 @@ service account's `client_email` as an **Editor**. On Render, set
 Without **Server Members Intent** the bot cannot read nicknames, so every
 raffle voter comes back as unidentified and no winner can be drawn.
 
-## Deploy 24/7 on Render (free tier)
+## Deploy 24/7
 
-Free-tier services sleep after 15 minutes without web traffic, so the bot runs a tiny web server and an external pinger keeps it awake. State is mirrored to a pinned Discord message because Render wipes the disk on every restart.
+The bots run on a Windows PC at home. See **[docs/running-on-windows.md](docs/running-on-windows.md)**
+for the full procedure; the short version is that the person hosting them
+unzips a folder and double-clicks `INSTALL.bat`, and everything else --
+Python included -- installs itself into their user profile.
 
-1. **Push this repo to GitHub** (private is fine; `.env` is git-ignored and never uploaded).
-2. **Create the service:** [dashboard.render.com](https://dashboard.render.com) → **New → Blueprint** → connect the GitHub repo. Render reads `render.yaml` and configures everything; it will prompt you for **DISCORD_TOKEN** (plus the four attendance secrets, which can be left blank for now — see [Attendance logging](#attendance-logging)) — paste your bot token there.
-   - (Alternative without Blueprint: New → Web Service → pick the repo → runtime Python, build `pip install -r requirements.txt`, start `python -u supervisor.py`, plan Free → add env vars `DISCORD_TOKEN`, `BOT_TZ=Asia/Manila`, `PYTHON_VERSION=3.13.4`, plus `ATTENDANCE_DISCORD_TOKEN`, `SHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_JSON`, `GEMINI_API_KEY` if attendance is being set up now.)
-3. Wait for the deploy, then open the service URL (like `https://fb-timer-bot.onrender.com`) — it should say *FB Timer bot is alive*, and the bot should be online in Discord.
-4. **Keep it awake:** create a free monitor at [uptimerobot.com](https://uptimerobot.com) → **New Monitor** → type *HTTP(s)* → paste the Render URL → interval **5 minutes**.
-5. In Discord, run `!setchannel` in your notification channel. Optionally run `!setstoragechannel` in a private channel to keep the storage message out of sight.
+Any Ubuntu machine works too: `sudo bash deploy/setup.sh`, then
+**[docs/google-cloud-setup.md](docs/google-cloud-setup.md)** for a free
+always-on VM.
 
-Auto-deploy is on by default: pushing to GitHub redeploys the bot. Kill timers survive redeploys via the pinned storage message.
+### Not a hosting provider, deliberately
 
-### Free-tier fine print
+This ran on Render's free tier until 2026-08-20, and the blueprint has
+been removed rather than left to rot.
 
-- 750 free instance hours/month covers one service 24/7 — but only one; a second free service would exceed it.
-- If the pinger ever lapses and the instance sleeps, a notification can arrive late or (rarely) be missed while it wakes.
+Render routes every free service in a region through one outbound address
+shared with all the others ("Outbound IP ranges are shared across *all*
+services in the same region" -- Render's own docs), and Discord refused
+that address from Oregon, Singapore and Ohio in turn. It is not caused by
+this bot's traffic and no code change lifts it; dedicated egress there
+costs $100/month. Oracle Cloud's signup was rejected outright, and Google
+Cloud's billing requires tax information.
+
+A residential address is what Discord tolerates, and it is the only
+environment with a clean measurement behind it: on 2026-08-18 all three
+bots ran on a home machine without a single block while Render was being
+refused.
+
+What went with it: the keep-alive HTTP server (free services sleep; a home
+PC does not), the uptime monitor that pinged it, and `render.yaml`. State
+still lives in a pinned Discord message, which matters more than ever --
+updating deletes and re-downloads the install directory.
+
+### Updating
+
+Push to `main`, then ask the host to double-click `INSTALL.bat` again. It
+keeps the Python and credentials it already has, fetches only what
+changed, and restarts the bots. There is no auto-deploy on purpose: the
+2026-08-18 outage was made worse by one landing mid-rate-limit and
+restarting all three bots into it.
