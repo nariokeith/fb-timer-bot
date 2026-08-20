@@ -53,19 +53,36 @@ The tokens can be regenerated at any time if you need to revoke access.
 
 1. Unzip the folder anywhere
 2. Double-click `INSTALL.bat`
-3. Wait — a few minutes the first time, mostly Python and dependencies
+3. Wait — a few minutes, once
 
-That is it. No administrator, no reboot, no PowerShell, no typing.
+That is the whole of it. **No administrator, no reboot, no Python to
+install, no PowerShell, no typing, nothing to configure.** Everything the
+bots need lands in one folder inside their own user profile, and
+uninstalling is deleting that folder plus the scheduled task.
 
-The installer downloads the code, installs Python 3.13 if it is missing,
-builds the environment, copies the credentials in, registers the bots to
-start at every logon, and turns off sleep-while-plugged-in. It finishes
-by saying either that the bots are running or that they are not.
+Python comes from the **embeddable distribution**: a 10 MB zip that runs
+where it is unpacked. Nothing else on their PC changes — no PATH edit, no
+system Python, no interference with anything they already have.
+Installing Python properly was the biggest failure point in earlier
+versions of this, because it wants winget or a downloaded installer,
+rewrites PATH, and can need a reboot before that PATH is visible — none
+of which someone can be walked through by message.
+
+Every package has a prebuilt Windows wheel — verified across the whole of
+`requirements.txt` with `pip download --platform win_amd64
+--only-binary=:all:` — so no compiler is needed either.
+
+The installer refuses early and says why, rather than half-finishing:
+
+- no `.env` beside it, or a credential missing from it, and it names which
+- a service account key that is not valid JSON on one line
+- the bots failing to import once installed, which catches a bad token or
+  a broken key while the message can still be read
 
 If anything fails it writes **`install-log.txt`** next to the .bat and
-asks them to send it back. Nobody can see their screen, so that file is
-the only diagnostic there is — it is worth telling them to send it
-without being asked.
+says to send it back. Nobody else can see that machine, so that file is
+the only diagnostic there is — worth telling them to send it without
+being asked.
 
 ## Why native, not WSL
 
@@ -77,7 +94,11 @@ talked through blind.
 
 Times are now anchored to `BOT_TZ` at each conversion with `ZoneInfo`
 (`bot.py`: `local_now()` and `_epoch()`), so the host's clock no longer decides
-anything. That mattered beyond Windows: `deaths` is persisted as Unix
+anything. It is also why `requirements.txt` pins **tzdata**: Windows
+ships no IANA timezone database, so `zoneinfo` has nothing to read and
+`ZoneInfo("Asia/Manila")` raises on import without it.
+
+That mattered beyond Windows: `deaths` is persisted as Unix
 timestamps, and state written on Render (a UTC host) and read back on a
 PC set to another zone silently moved every boss kill time by the offset
 between them. `tests/test_bot.py` pins that.
@@ -123,6 +144,11 @@ all three bots into it.
 - **Logon, not boot.** The task starts at logon so it never needs an
   administrator. A PC left at the lock screen after an overnight update
   will not start the bots until someone signs in.
-- **The installer is untested.** It was written on a Mac, where no
-  PowerShell exists to run it. `install-log.txt` is how the first run
-  gets debugged.
+- **The installer has never run on Windows.** It was written on a Mac.
+  What has been checked there: it parses under PowerShell 7.6.5, every
+  cmdlet it calls ships with Windows 10/11, its `.env` parsing and
+  credential checks execute correctly, and its edit to the embedded
+  Python's `._pth` was run against the real file from python.org and is
+  idempotent. What cannot be checked from a Mac: the scheduled task,
+  `powercfg`, and the bots actually starting. `install-log.txt` is how
+  the first run gets debugged.

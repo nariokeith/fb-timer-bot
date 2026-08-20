@@ -9,6 +9,12 @@ idna==3.18
 multidict==6.7.1
 propcache==0.5.2
 python-dotenv==1.2.2
+# The IANA timezone database. Unix hosts ship one in /usr/share/zoneinfo;
+# Windows ships none at all, so zoneinfo.TZPATH is empty there and
+# ZoneInfo("Asia/Manila") raises on import -- the timer bot never starts.
+# Pinned since bot.py stopped using time.tzset(), which does not exist on
+# Windows. tests/test_bot.py empties TZPATH to prove this is load-bearing.
+tzdata==2026.2
 yarl==1.24.2
 google-genai==2.16.0
 gspread==6.2.1

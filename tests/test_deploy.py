@@ -233,3 +233,39 @@ def test_the_installer_never_slices_an_argument_array_by_range(windows):
         line for line in windows.splitlines() if not line.strip().startswith("#")
     )
     assert ".Count-1)]" not in code.replace(" ", "")
+
+
+def test_requirements_pin_the_timezone_database():
+    """Windows has no system IANA database, so this is what makes
+    ZoneInfo("Asia/Manila") resolve there instead of raising on import."""
+    assert "tzdata" in (REPO / "requirements.txt").read_text()
+
+
+def test_the_installer_brings_its_own_python(windows):
+    """Nothing may need installing on the host.
+
+    Installing Python system-wide was the biggest failure point: it wants
+    winget or a downloaded installer, changes PATH, and can need a reboot
+    before the new PATH is visible -- none of which someone can be walked
+    through blind. The embeddable distribution is a zip that runs where it
+    is unpacked.
+    """
+    assert "embed-amd64.zip" in windows
+
+
+def test_the_installer_enables_site_in_the_embedded_python(windows):
+    """The embeddable build ships python313._pth with `import site`
+    commented out, and pip cannot install anything until it is on."""
+    assert "_pth" in windows
+    assert "import site" in windows
+
+
+def test_the_installer_needs_no_administrator(windows):
+    """Everything lands under the user's own profile, so no UAC prompt
+    appears -- one more dialog nobody could explain over Discord."""
+    assert "LOCALAPPDATA" in windows
+    code = "\n".join(
+        line for line in windows.splitlines() if not line.strip().startswith("#")
+    )
+    for elevated in ("winget", "Start-Process -Verb RunAs", "InstallAllUsers"):
+        assert elevated not in code, f"{elevated!r} needs elevation or a system install"

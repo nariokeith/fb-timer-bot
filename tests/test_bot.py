@@ -450,3 +450,27 @@ def test_every_timer_command_actually_runs(monkeypatch):
         ran.append(command.name)
 
     assert sorted(ran) == sorted(c.name for c in ours)
+
+
+def test_the_timezone_resolves_without_a_system_database():
+    """Windows ships no IANA timezone database.
+
+    zoneinfo.TZPATH is empty there, so the only remaining source is the
+    pip-installed `tzdata` package -- without it ZoneInfo(BOT_TZ) raises
+    on import and the timer bot never starts at all. Emptying TZPATH
+    reproduces that exactly on a machine that does have one.
+
+    This is the other half of dropping time.tzset(): it made Windows
+    possible in one way and impossible in another.
+    """
+    import zoneinfo
+
+    original = zoneinfo.TZPATH
+    zoneinfo.reset_tzpath([])
+    # no_cache, not ZoneInfo(): importing bot.py already resolved this key
+    # and the cache would answer from it, so the emptied TZPATH would
+    # never be consulted and this test would pass on a broken build.
+    try:
+        zoneinfo.ZoneInfo.no_cache(timer_bot.BOT_TZ)
+    finally:
+        zoneinfo.reset_tzpath(original)
