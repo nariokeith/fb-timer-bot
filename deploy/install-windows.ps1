@@ -271,7 +271,16 @@ try {
     # is: a bad token, a broken key or a missing package fails here,
     # where the message can still be read, rather than silently later.
     Say "Checking the bots can start"
-    $check = Run $python @('-c', "import bot, items_bot, attendance_bot; print('ok')")
+    # The directory travels as an ARGUMENT, not as a working directory and
+    # not interpolated into the source. `python -c` puts the current
+    # directory on sys.path, and the current directory here is the folder
+    # INSTALL.bat sits in -- so the check reported "No module named 'bot'"
+    # about a perfectly good install. The scheduled task was always right;
+    # it sets -WorkingDirectory. Passing it as argv also sidesteps quoting:
+    # this path routinely contains spaces, and could contain a quote.
+    $probe = "import sys; sys.path.insert(0, sys.argv[1]); " +
+             "import bot, items_bot, attendance_bot; print('ok')"
+    $check = Run $python @('-c', $probe, $CodeDir)
     if ($check.Code -ne 0 -or $check.Output -notmatch 'ok') {
         Halt "the bots could not load:`n$($check.Output)"
     }

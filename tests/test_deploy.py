@@ -436,3 +436,19 @@ def test_the_script_uses_powershell_comments_not_docstrings(windows):
     '''A Python-style """docstring""" is a parse error in PowerShell, and
     the script is edited from Python here.'''
     assert '"""' not in windows
+
+
+def test_the_import_check_puts_the_code_on_the_path(windows):
+    """`python -c` adds the CURRENT directory to sys.path, and that is the
+    folder INSTALL.bat sits in -- not where the bots were installed. The
+    check therefore failed with "No module named 'bot'" on an install that
+    was fine, and refused to register a working setup.
+
+    The directory is passed as an argument rather than interpolated, since
+    this path routinely contains spaces and could contain a quote.
+    """
+    probe = re.search(r"\$probe\s*=\s*(.+?)\n\s*\$check", windows, re.S)
+    assert probe, "no import probe found"
+    assert "sys.path.insert" in probe.group(1)
+    assert "sys.argv[1]" in probe.group(1), "the path is interpolated, not passed"
+    assert "$CodeDir" in windows.split("$check = Run")[1].split("\n")[0]
