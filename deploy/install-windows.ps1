@@ -128,7 +128,12 @@ try {
 
     # An earlier copy must stop before its files can be replaced: Windows
     # will not overwrite a running executable. This is the update path too.
+    # Stop whatever is already running, by either mechanism. Windows will
+    # not replace files that are open, and a re-run is the update path.
     Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue
+    Get-Process -Name 'pythonw','python' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($PyDir, 'OrdinalIgnoreCase') } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
 
     Say "Downloading the bots"
@@ -299,16 +304,48 @@ try {
     # read through pipes the supervisor owns rather than its own stdout.
     $pythonw = Join-Path $PyDir 'pythonw.exe'
     if (-not (Test-Path $pythonw)) { Halt "the embedded Python has no pythonw.exe." }
-    $action = New-ScheduledTaskAction -Execute $pythonw `
-        -Argument '-u supervisor.py' -WorkingDirectory $CodeDir
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries -StartWhenAvailable `
-        -ExecutionTimeLimit ([TimeSpan]::Zero)
-    Register-ScheduledTask -TaskName $Task -Action $action -Trigger $trigger `
-        -Settings $settings -Force `
-        -Description 'Lordnine field boss timer, attendance and item bots' | Out-Null
-    Say "Set to start automatically at every logon"
+    # Two mechanisms, because the first one is not always permitted.
+    # Register-ScheduledTask returned "Access is denied" on the host's PC
+    # even un-elevated and registering only for themselves -- whether from
+    # policy, an ACL on the task folder, or security software, none of
+    # which can be diagnosed from here or asked about over chat.
+    #
+    # A shortcut in the user's own Startup folder cannot be refused: it is
+    # an ordinary file in their own profile. It gives up Task Scheduler's
+    # restart-on-failure, which costs nothing here, because supervisor.py
+    # is the thing that restarts bots and it restarts itself only when
+    # Windows starts it -- which is exactly once, at logon, either way.
+    $useTask = $false
+    try {
+        $action = New-ScheduledTaskAction -Execute $pythonw `
+            -Argument '-u supervisor.py' -WorkingDirectory $CodeDir
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries -StartWhenAvailable `
+            -ExecutionTimeLimit ([TimeSpan]::Zero)
+        Register-ScheduledTask -TaskName $Task -Action $action -Trigger $trigger `
+            -Settings $settings -Force `
+            -Description 'Lordnine field boss timer, attendance and item bots' | Out-Null
+        $useTask = $true
+        Say "Set to start automatically at every logon"
+    } catch {
+        $startup = [Environment]::GetFolderPath('Startup')
+        $lnkPath = Join-Path $startup 'Lordnine bots.lnk'
+        try {
+            $shell = New-Object -ComObject WScript.Shell
+            $lnk = $shell.CreateShortcut($lnkPath)
+            $lnk.TargetPath       = $pythonw
+            $lnk.Arguments        = '-u supervisor.py'
+            $lnk.WorkingDirectory = $CodeDir
+            $lnk.Description      = 'Lordnine field boss timer, attendance and item bots'
+            $lnk.WindowStyle      = 7   # minimised; pythonw shows nothing anyway
+            $lnk.Save()
+        } catch {
+            Halt "could not set the bots to start automatically:`n$($_.Exception.Message)"
+        }
+        if (-not (Test-Path $lnkPath)) { Halt "the startup shortcut was not created." }
+        Say "Set to start automatically at every logon (via the Startup folder)"
+    }
 
     # -- 7. Try to stop the PC sleeping ---------------------------------
     # Reported honestly: powercfg can be refused by policy, and claiming
@@ -319,12 +356,30 @@ try {
     if ($sleepOk) { Say "Sleep turned off while plugged in" }
     else { Say "COULD NOT turn sleep off -- set Settings > System > Power to Never" }
 
-    Start-ScheduledTask -TaskName $Task
-    Start-Sleep -Seconds 25
+    # Start it now so nobody has to log out and back in.
+    if ($useTask) {
+        Start-ScheduledTask -TaskName $Task
+    } else {
+        Start-Process -FilePath $pythonw -ArgumentList '-u supervisor.py' `
+            -WorkingDirectory $CodeDir -WindowStyle Hidden
+    }
 
-    $state = (Get-ScheduledTask -TaskName $Task).State
+    # Verified from the supervisor's own log, not from "the task is
+    # Running": the supervisor stays up even when all three children exit
+    # 78, so its being alive was never evidence the bots were. The log
+    # says what actually happened.
+    $logFile = Join-Path $CodeDir 'logs\supervisor.log'
+    $started = $false
+    foreach ($attempt in 1..30) {
+        Start-Sleep -Seconds 1
+        if (Test-Path $logFile) {
+            $tail = Get-Content $logFile -Tail 40 -ErrorAction SilentlyContinue
+            if ($tail -match 'logged in|State restored|restored state') { $started = $true; break }
+        }
+    }
+
     Write-Host ""
-    if ($state -eq 'Running') {
+    if ($started) {
         Write-Host "  DONE - the bots are running." -ForegroundColor Green
         Write-Host ""
         Write-Host "  Leave this PC on and plugged in. They start again on"
@@ -337,8 +392,13 @@ try {
         Write-Host "  the File Explorer address bar:"
         Write-Host "      %LOCALAPPDATA%\fb-timer-bot\app\logs" -ForegroundColor Cyan
     } else {
-        Write-Host "  Installed, but they are not running (state: $state)." -ForegroundColor Yellow
+        Write-Host "  Installed, but the bots did not report logging in." -ForegroundColor Yellow
         Write-Host "  Send install-log.txt back to whoever gave you this."
+        if (Test-Path $logFile) {
+            Write-Host ""
+            Write-Host "  Last lines of the bot log:"
+            Get-Content $logFile -Tail 15 | ForEach-Object { Write-Host "    $_" }
+        }
     }
     Write-Host ""
 }

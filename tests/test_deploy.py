@@ -452,3 +452,32 @@ def test_the_import_check_puts_the_code_on_the_path(windows):
     assert "sys.path.insert" in probe.group(1)
     assert "sys.argv[1]" in probe.group(1), "the path is interpolated, not passed"
     assert "$CodeDir" in windows.split("$check = Run")[1].split("\n")[0]
+
+
+def test_autostart_has_a_fallback_that_cannot_be_refused(windows):
+    """Register-ScheduledTask returned "Access is denied" on the host's PC,
+    un-elevated and registering only for themselves. Policy, an ACL on the
+    task folder, or security software -- none of it diagnosable from here,
+    and none of it something to ask a non-technical person about.
+
+    A shortcut in their own Startup folder is an ordinary file in their own
+    profile, so it cannot be refused.
+    """
+    assert "GetFolderPath('Startup')" in windows
+    assert "WScript.Shell" in windows
+    assert "CreateShortcut" in windows
+
+
+def test_the_install_is_verified_from_the_bot_log(windows):
+    """Not from "the task is Running". The supervisor stays up even when
+    all three children exit 78, so its being alive never proved the bots
+    were. The log says what actually happened.
+    """
+    assert "supervisor.log" in windows
+    assert "logged in" in windows, "nothing checks the bots actually logged in"
+
+
+def test_a_failed_start_shows_the_end_of_the_bot_log(windows):
+    """The host cannot be asked to go and find a file before saying what
+    went wrong; put it on the screen they are already looking at."""
+    assert "Last lines of the bot log" in windows

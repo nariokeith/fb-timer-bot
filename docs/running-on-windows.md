@@ -187,6 +187,23 @@ someone's disk.
 `install-log.txt`, beside `INSTALL.bat`, is a separate thing -- it covers
 the installation only.
 
+## How it starts itself
+
+Preferably a scheduled task at logon. Where that is refused -- the first
+real host answered `Register-ScheduledTask` with "Access is denied", not
+elevated and registering only for themselves -- it falls back to a
+shortcut in the user's own Startup folder, which is an ordinary file in
+their own profile and cannot be refused.
+
+The fallback gives up Task Scheduler's restart-on-failure, which costs
+nothing: `supervisor.py` is what restarts bots, and Windows starts it
+exactly once either way, at logon.
+
+Either mechanism launches `pythonw.exe`, so nothing appears on screen.
+Uninstalling means removing whichever one is present -- Task Scheduler's
+`fb-timer-bot`, or "Lordnine bots" under `shell:startup` -- and deleting
+`%LOCALAPPDATA%\fb-timer-bot`.
+
 ## The honest limits
 
 - **No power, no bot.** The guild has no visibility into that machine.
