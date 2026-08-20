@@ -3,3 +3,6 @@
 data.json
 __pycache__/
 service-account.json
+
+# Runtime logs (supervisor.py writes these; see docs/running-on-windows.md)
+logs/

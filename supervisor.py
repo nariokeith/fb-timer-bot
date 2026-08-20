@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -87,6 +88,19 @@ BRIEF_RATE_LIMIT_COOLDOWN = 1800.0  # 30 minutes
 
 
 DEFAULT_KEEPALIVE_PORT = 8080
+
+# Where the running log goes, and how big it may get.
+#
+# Render shows stdout in a dashboard and systemd hands it to journald,
+# but Windows Task Scheduler simply discards it -- so on the PC this now
+# runs on, every line the three bots print would vanish. There is no
+# console to read and nobody who could read one. A file is the only
+# record its owner can be asked to copy back.
+#
+# Two files of LOG_MAX_BYTES, so the whole thing is bounded on a machine
+# nobody maintains: months of gateway chatter must not fill a disk.
+DEFAULT_LOG_FILE = Path(__file__).with_name("logs") / "supervisor.log"
+LOG_MAX_BYTES = 2 * 1024 * 1024  # 2 MB, plus one rotated copy
 
 
 @dataclass(frozen=True)
@@ -188,6 +202,8 @@ class Supervisor:
         restart_reset_after: float = RESTART_RESET_AFTER,
         rate_limit_cooldown: float = RATE_LIMIT_COOLDOWN,
         brief_rate_limit_cooldown: float = BRIEF_RATE_LIMIT_COOLDOWN,
+        log_file: "Path | None" = None,
+        max_log_bytes: int = LOG_MAX_BYTES,
     ):
         self._specs = {spec.name: spec for spec in specs}
         self._procs: dict[str, subprocess.Popen] = {}
@@ -215,6 +231,69 @@ class Supervisor:
         # child that just crashed apart from one that ran healthily for a
         # while before crashing (which resets its backoff).
         self._launched_at: dict[str, float] = {}
+        self._log_file = Path(log_file) if log_file is not None else None
+        self._max_log_bytes = max_log_bytes
+        # One writer at a time: a thread per child pumps its output here,
+        # and rotation renames the file out from under all of them.
+        self._log_lock = threading.Lock()
+        if self._log_file is not None:
+            self._log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # -- logging ----------------------------------------------------------
+
+    def log(self, line: str) -> None:
+        """Report one line to stdout and, if configured, to the log file.
+
+        Always stdout as well, never instead: Render reads stdout and
+        journald reads stdout, and neither will ever look at this file.
+        """
+        print(line, flush=True)
+        if self._log_file is None:
+            return
+        with self._log_lock:
+            try:
+                self._rotate_if_needed()
+                with self._log_file.open("a", encoding="utf-8", errors="replace") as fh:
+                    fh.write(line.rstrip("\n") + "\n")
+            except OSError:
+                # A full or unwritable disk must not take the bots down;
+                # stdout above already carried the line.
+                pass
+
+    def _rotate_if_needed(self) -> None:
+        """Keep at most two files. Caller holds _log_lock."""
+        try:
+            if self._log_file.stat().st_size < self._max_log_bytes:
+                return
+        except FileNotFoundError:
+            return
+        previous = self._log_file.with_suffix(self._log_file.suffix + ".1")
+        try:
+            previous.unlink()
+        except FileNotFoundError:
+            pass
+        self._log_file.rename(previous)
+
+    def _pump(self, name: str, stream) -> None:
+        """Forward one child's output, line by line, until it closes.
+
+        The children are separate processes, so their output never passes
+        through this one's sys.stdout -- capturing it means reading their
+        pipe. That is the whole point: the lines worth having ("[items]
+        restored state", a traceback, discord.py's rate-limit warnings)
+        are theirs, not the supervisor's.
+        """
+        try:
+            for line in stream:
+                self.log(line.rstrip())
+        except (ValueError, OSError):
+            # The pipe closed under us while the child was being killed.
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
 
     # -- inspection -------------------------------------------------------
 
@@ -229,8 +308,23 @@ class Supervisor:
 
     def _launch(self, name: str) -> None:
         spec = self._specs[name]
-        print(f"[supervisor] starting {name}: {' '.join(spec.argv)}", flush=True)
-        self._procs[name] = subprocess.Popen(spec.argv, env=os.environ.copy())
+        self.log(f"[supervisor] starting {name}: {' '.join(spec.argv)}")
+        proc = subprocess.Popen(
+            spec.argv,
+            env=os.environ.copy(),
+            # Piped only so the output can be captured on the way past.
+            # stderr folded into stdout keeps interleaving intact, which
+            # matters when a traceback follows the line that caused it.
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            errors="replace",
+        )
+        self._procs[name] = proc
+        threading.Thread(
+            target=self._pump, args=(name, proc.stdout), daemon=True
+        ).start()
         self._launched_at[name] = time.monotonic()
 
     def start_all(self) -> None:
@@ -260,9 +354,8 @@ class Supervisor:
             del self._procs[name]
             spec = self._specs[name]
             if not should_restart(code, spec.no_restart_codes):
-                print(
-                    f"[supervisor] {name} exited with {code}; leaving it stopped",
-                    flush=True,
+                self.log(
+                    f"[supervisor] {name} exited with {code}; leaving it stopped"
                 )
                 self._due_at.pop(name, None)
                 self._current_delay.pop(name, None)
@@ -275,11 +368,10 @@ class Supervisor:
                     else self._brief_rate_limit_cooldown
                 )
                 self._cooldown_until = max(self._cooldown_until, now + cooldown)
-                print(
+                self.log(
                     f"[supervisor] {name} was rate-limited by Discord; "
                     f"holding every bot for {cooldown}s so "
-                    "the block on this IP can lift",
-                    flush=True,
+                    "the block on this IP can lift"
                 )
 
             uptime = now - self._launched_at.get(name, now)
@@ -290,16 +382,14 @@ class Supervisor:
 
             delay = self._current_delay.get(name, self._restart_delay)
             if delay >= self._max_restart_delay:
-                print(
+                self.log(
                     f"[supervisor] {name} is crash-looping; capping restart "
-                    f"delay at {self._max_restart_delay}s",
-                    flush=True,
+                    f"delay at {self._max_restart_delay}s"
                 )
             else:
-                print(
+                self.log(
                     f"[supervisor] {name} exited with {code}; restarting in "
-                    f"{delay}s",
-                    flush=True,
+                    f"{delay}s"
                 )
             self._due_at[name] = now + delay
             self._current_delay[name] = min(delay * 2, self._max_restart_delay)
@@ -321,7 +411,7 @@ class Supervisor:
         self._stopping = True
         for name, proc in self._procs.items():
             if proc.poll() is None:
-                print(f"[supervisor] stopping {name}", flush=True)
+                self.log(f"[supervisor] stopping {name}")
                 proc.terminate()
 
         deadline = time.monotonic() + timeout
@@ -347,13 +437,12 @@ class Supervisor:
                 # child; re-entering it here would mutate self._procs out
                 # from under its own iteration. Ignore and let the first
                 # call finish.
-                print(
+                self.log(
                     f"[supervisor] received signal {signum} while already "
-                    "stopping; ignoring",
-                    flush=True,
+                    "stopping; ignoring"
                 )
                 return
-            print(f"[supervisor] received signal {signum}", flush=True)
+            self.log(f"[supervisor] received signal {signum}")
             self.stop_all()
             raise SystemExit(0)
 
@@ -380,7 +469,7 @@ class Supervisor:
             # would empty self._procs and exit the supervisor mid-wait,
             # abandoning the very restart it just scheduled.
             if not self._procs and not self._due_at:
-                print("[supervisor] no children left; exiting", flush=True)
+                self.log("[supervisor] no children left; exiting")
                 return
 
 
@@ -397,4 +486,7 @@ CHILDREN = [
 
 
 if __name__ == "__main__":
-    Supervisor(CHILDREN).run()
+    # A log file in production, not only in tests: this is the only
+    # record that exists on a Windows host, where Task Scheduler throws
+    # stdout away and there is no console to read.
+    Supervisor(CHILDREN, log_file=DEFAULT_LOG_FILE).run()

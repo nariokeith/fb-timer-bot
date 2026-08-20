@@ -136,6 +136,28 @@ This is deliberate rather than a missing feature: the 2026-08-18 outage
 was made worse by an auto-deploy landing mid-rate-limit and restarting
 all three bots into it.
 
+## Where the logs are
+
+Windows Task Scheduler discards a process's stdout, so there is no
+console, no dashboard and no journal on that PC. `supervisor.py` writes
+its own copy instead, and it captures the three bots' output as well as
+its own -- the useful lines come from the children, and those never pass
+through the supervisor's stdout, so it reads their pipes deliberately.
+
+    %LOCALAPPDATA%\fb-timer-bot\app\logs\supervisor.log
+
+Paste that folder path into the File Explorer address bar. The installer
+prints it when it finishes, too. Ask for `supervisor.log`; if the problem
+is older than a couple of megabytes of chatter, `supervisor.log.1` holds
+the previous stretch.
+
+Two files of 2 MB is the whole footprint, on purpose: this runs
+unattended for months on a machine nobody maintains, and it must not fill
+someone's disk.
+
+`install-log.txt`, beside `INSTALL.bat`, is a separate thing -- it covers
+the installation only.
+
 ## The honest limits
 
 - **No power, no bot.** The guild has no visibility into that machine.

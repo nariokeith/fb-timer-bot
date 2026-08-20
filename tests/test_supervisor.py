@@ -877,3 +877,113 @@ def test_keepalive_still_listens_everywhere_on_render(stopper, monkeypatch):
         assert server.server_address[0] == "0.0.0.0"
     finally:
         supervisor_mod.stop_keepalive(server)
+
+
+# ---------------------------------------------------------------------------
+# A log file, because the Windows host has nowhere else to put one.
+#
+# Task Scheduler discards a process's stdout, so every line the three bots
+# print on that PC vanishes -- there is no dashboard, no journalctl, and
+# nobody who can read a console that does not exist. A file is the only
+# record its owner can be asked to send back.
+#
+# The lines that matter come from the CHILDREN, not the supervisor, so a
+# tee over sys.stdout would capture almost nothing: children inherit the
+# real file descriptor and write straight past it.
+# ---------------------------------------------------------------------------
+
+
+def _wait_for(path, needle, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists() and needle in path.read_text(errors="replace"):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_child_output_reaches_the_log_file(tmp_path, stopper):
+    log = tmp_path / "supervisor.log"
+    sup = Supervisor(
+        [ChildSpec("talker", _python("print('hello from the bot', flush=True)"))],
+        restart_delay=0,
+        log_file=log,
+    )
+    stopper.append(sup)
+    sup.start_all()
+
+    assert _wait_for(log, "hello from the bot"), (
+        f"child stdout never reached the log; got: {log.read_text() if log.exists() else '<no file>'}"
+    )
+
+
+def test_child_stderr_reaches_the_log_file(tmp_path, stopper):
+    """Tracebacks and discord.py's own warnings go to stderr, and those
+    are the lines someone actually needs when the bots misbehave."""
+    log = tmp_path / "supervisor.log"
+    sup = Supervisor(
+        [ChildSpec("noisy", _python(
+            "import sys; print('a wild traceback', file=sys.stderr, flush=True)"))],
+        restart_delay=0,
+        log_file=log,
+    )
+    stopper.append(sup)
+    sup.start_all()
+
+    assert _wait_for(log, "a wild traceback")
+
+
+def test_the_supervisors_own_lines_reach_the_log_file(tmp_path, stopper):
+    log = tmp_path / "supervisor.log"
+    sup = Supervisor([ChildSpec("gone", EXIT_CLEAN)], restart_delay=0, log_file=log)
+    stopper.append(sup)
+    sup.start_all()
+    sup.tick()
+
+    assert _wait_for(log, "gone"), "the supervisor's own reporting was not recorded"
+
+
+def test_child_output_still_reaches_stdout(tmp_path, stopper, capfd):
+    """A tee, not a redirect: Render reads stdout and journalctl reads
+    stdout, and neither would ever look at this file."""
+    log = tmp_path / "supervisor.log"
+    sup = Supervisor(
+        [ChildSpec("talker", _python("print('visible too', flush=True)"))],
+        restart_delay=0,
+        log_file=log,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    _wait_for(log, "visible too")
+
+    assert "visible too" in capfd.readouterr().out
+
+
+def test_the_log_is_rotated_before_it_can_fill_the_disk(tmp_path, stopper):
+    """It runs unattended for months on a machine nobody maintains."""
+    log = tmp_path / "supervisor.log"
+    sup = Supervisor(
+        [ChildSpec("chatty", _python(
+            "print('x' * 200, flush=True)\n" * 40))],
+        restart_delay=0,
+        log_file=log,
+        max_log_bytes=1000,
+    )
+    stopper.append(sup)
+    sup.start_all()
+    time.sleep(2)
+
+    assert log.exists()
+    assert log.stat().st_size <= 4000, "the live log grew past its cap"
+    assert (tmp_path / "supervisor.log.1").exists(), "nothing was rotated out"
+
+
+def test_the_entry_point_configures_a_log_file():
+    """Wiring, not just the option: a Supervisor that supports logging but
+    is never given a path would leave the Windows host with nothing, in
+    exactly the way this was added to prevent."""
+    source = (REPO_ROOT / "supervisor.py").read_text()
+    entry = source[source.index('if __name__ == "__main__":'):]
+
+    assert "log_file=" in entry, "the production supervisor gets no log file"
+    assert supervisor_mod.DEFAULT_LOG_FILE.name.endswith(".log")

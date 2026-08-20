@@ -195,6 +195,10 @@ try {
         Write-Host ""
         Write-Host "  Ask whoever sent you this to check Discord and confirm"
         Write-Host "  all three bots show as online."
+        Write-Host ""
+        Write-Host "  If they ever ask you for the bot logs, paste this into"
+        Write-Host "  the File Explorer address bar:"
+        Write-Host "      %LOCALAPPDATA%\fb-timer-bot\app\logs" -ForegroundColor Cyan
     } else {
         Write-Host "  Installed, but they are not running (state: $state)." -ForegroundColor Yellow
         Write-Host "  Send install-log.txt back to whoever gave you this."
