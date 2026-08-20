@@ -311,7 +311,7 @@ def test_the_bots_clock_reads_bot_tz_on_a_host_set_to_something_else(
 ):
     expected = _datetime.now(ZoneInfo("Asia/Manila")).replace(tzinfo=None)
 
-    drift = abs((timer_bot.now() - expected).total_seconds())
+    drift = abs((timer_bot.local_now() - expected).total_seconds())
     assert drift < 5, f"bot clock is {drift}s from Manila time"
 
 
@@ -336,3 +336,117 @@ def test_kill_times_survive_a_move_to_a_host_in_another_timezone(monkeypatch):
         _time.tzset()
 
     assert read_there["deaths"]["Venatus"] == killed_at
+
+
+# ---------------------------------------------------------------------------
+# Actually run the two code paths that use the clock.
+#
+# `now = now()` makes `now` a local, shadowing the module function it is
+# trying to call, so both of these raised UnboundLocalError on every
+# single execution. 835 tests were green throughout: nothing here had
+# ever executed the watcher or !killed, only the pure helpers around
+# them. Asserting a function is importable is not the same as running it.
+# ---------------------------------------------------------------------------
+
+
+class _WatcherChannel:
+    def __init__(self, channel_id=100):
+        self.id = channel_id
+        self.mention = f"#channel-{channel_id}"
+        self.sent = []
+
+    async def send(self, **kwargs):
+        self.sent.append(kwargs)
+        return type("Msg", (), {"id": 1})()
+
+
+def test_the_spawn_watcher_completes_a_tick(monkeypatch):
+    import asyncio
+
+    _configured(monkeypatch)
+    monkeypatch.setattr(timer_bot.bot, "get_channel", lambda _id: _WatcherChannel())
+
+    asyncio.run(timer_bot.spawn_watcher.coro())
+
+
+def test_killed_records_an_interval_boss(monkeypatch):
+    import asyncio
+
+    data = _configured(monkeypatch)
+    persisted = []
+
+    async def fake_persist():
+        persisted.append(True)
+
+    monkeypatch.setattr(timer_bot, "persist", fake_persist)
+    ctx = FakeTimerCtx()
+
+    asyncio.run(timer_bot.killed.callback(ctx, "Venatus"))
+
+    assert "Venatus" in data["deaths"], "the kill was never recorded"
+    assert persisted, "the kill was never saved"
+
+
+def test_boss_lookup_reports_a_scheduled_boss(monkeypatch):
+    """The other branch of !killed, which answers without persisting."""
+    import asyncio
+
+    _configured(monkeypatch)
+    ctx = FakeTimerCtx()
+
+    asyncio.run(timer_bot.killed.callback(ctx, "Clemantis"))
+
+    assert ctx.sent, "no answer for a scheduled boss"
+
+
+def test_every_timer_command_actually_runs(monkeypatch):
+    """Execute all eight command bodies, not just import them.
+
+    The UnboundLocalError above sat in !killed and the watcher through a
+    fully green suite, because nothing here had ever called them. A test
+    that only checks a command is registered, or that a helper it uses
+    returns the right value, cannot see a NameError in the body.
+
+    This asserts nothing about behaviour on purpose -- the per-command
+    tests do that. It asserts only that each body can be entered and left
+    without raising, which is the failure that shipped.
+    """
+    import asyncio
+    import inspect
+
+    _configured(monkeypatch)
+
+    async def fake_persist():
+        pass
+
+    monkeypatch.setattr(timer_bot, "persist", fake_persist)
+    # Bind the real sleep before patching: timer_bot.asyncio IS asyncio,
+    # so a lambda calling asyncio.sleep would call the patched one.
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(timer_bot.asyncio, "sleep", lambda _d: real_sleep(0))
+    monkeypatch.setattr(timer_bot.bot, "get_channel", lambda _id: _WatcherChannel())
+
+    # One valid argument per command that needs one.
+    arguments = {
+        "killed": ("Venatus",),
+        "boss": ("Venatus",),
+        "timer": ("1",),
+    }
+
+    # discord.py's built-in !help is library code with its own contract;
+    # this is about the bodies written in bot.py.
+    ours = [c for c in timer_bot.bot.commands if c.callback.__module__ == "bot"]
+    assert len(ours) == 8, f"expected 8 commands in bot.py, found {len(ours)}"
+
+    ran = []
+    for command in ours:
+        ctx = FakeTimerCtx()
+        ctx.channel = _WatcherChannel()
+        args = arguments.get(command.name, ())
+        try:
+            asyncio.run(command.callback(ctx, *args))
+        except Exception as exc:  # noqa: BLE001 - the point is to see any
+            raise AssertionError(f"!{command.name} raised {exc!r}") from exc
+        ran.append(command.name)
+
+    assert sorted(ran) == sorted(c.name for c in ours)

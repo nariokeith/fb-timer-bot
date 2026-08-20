@@ -76,7 +76,7 @@ PowerShell, a reboot and a second run, none of which someone can be
 talked through blind.
 
 Times are now anchored to `BOT_TZ` at each conversion with `ZoneInfo`
-(`bot.py`: `now()` and `_epoch()`), so the host's clock no longer decides
+(`bot.py`: `local_now()` and `_epoch()`), so the host's clock no longer decides
 anything. That mattered beyond Windows: `deaths` is persisted as Unix
 timestamps, and state written on Render (a UTC host) and read back on a
 PC set to another zone silently moved every boss kill time by the offset

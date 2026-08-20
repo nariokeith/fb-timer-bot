@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo
 # another moved every boss kill time by the offset between them.
 #
 # ZoneInfo works everywhere, so BOT_TZ is now applied at each conversion
-# (now(), _epoch()) instead of globally. tzset is still called where it
+# (local_now(), _epoch()) instead of globally. tzset is still called where it
 # exists, so log and file timestamps keep matching the bots' own clock.
 BOT_TZ = os.getenv("BOT_TZ", os.environ.get("TZ", "Asia/Manila"))
 _TZ = ZoneInfo(BOT_TZ)
@@ -48,8 +48,15 @@ if hasattr(time, "tzset"):
     time.tzset()
 
 
-def now() -> datetime:
+def local_now() -> datetime:
     """The current time in BOT_TZ, naive.
+
+    Named local_now rather than now so it cannot be shadowed: `now` is
+    the obvious name for a local holding the current time, and this file
+    already uses it that way twice. Written `now = now()`, the assignment
+    binds `now` locally for the whole function, so the call on its own
+    right-hand side raises UnboundLocalError -- which it did, on every
+    tick of the watcher and every !killed, until the name changed.
 
     Naive rather than aware because every comparison in this module --
     spawn schedules, kill times, the state file -- is against naive
@@ -271,7 +278,7 @@ async def state_msg_is_recent() -> bool:
 async def persist() -> None:
     """Save state locally and mirror it into a pinned/recent Discord message."""
     global state_msg
-    prune_state(now())
+    prune_state(local_now())
     save_local()
     target_id = storage_channel_id()
     if not target_id:
@@ -500,7 +507,7 @@ async def spawn_watcher():
     if channel is None:
         return
 
-    now = now()
+    now = local_now()
     changed = False
     for boss in ALL_BOSSES.values():
         # 10-minute warning for the upcoming spawn.
@@ -681,7 +688,7 @@ async def killed(ctx: commands.Context, boss_name: str, *, when: str = ""):
     if boss is None:
         await ctx.send(embed=unknown_boss_embed(boss_name))
         return
-    now = now()
+    now = local_now()
     if boss in SCHEDULED_BOSSES:
         slots = ", ".join(
             f"{WEEKDAYS[d]} {t}" for d, t in SCHEDULED_BOSSES[boss]
@@ -747,7 +754,7 @@ async def boss_info(ctx: commands.Context, boss_name: str):
         footer = f"Fixed weekly schedule: {slots}"
     await ctx.send(
         embed=boss_embed(
-            "📋 Boss Timer", boss, boss_field(boss, now()), footer=footer
+            "📋 Boss Timer", boss, boss_field(boss, local_now()), footer=footer
         )
     )
 
@@ -803,7 +810,7 @@ def build_boss_embeds(now: datetime, limit: int | None = None) -> list[discord.E
 async def bosses(ctx: commands.Context, scope: str = ""):
     """Next 20 spawns: !bosses — or the full list: !bosses all"""
     limit = None if scope.lower() == "all" else 20
-    await ctx.send(embeds=build_boss_embeds(now(), limit=limit))
+    await ctx.send(embeds=build_boss_embeds(local_now(), limit=limit))
 
 
 @killed.error
@@ -850,7 +857,7 @@ async def timer(ctx: commands.Context, seconds: str):
         )
         return
 
-    ends_at = now() + timedelta(seconds=remaining)
+    ends_at = local_now() + timedelta(seconds=remaining)
     msg = await ctx.send(
         embed=make_embed("⏳ Timer", f"Time remaining: {ts(ends_at, 'R')}")
     )
