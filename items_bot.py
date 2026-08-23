@@ -79,16 +79,48 @@ def today_pht() -> str:
     return items_rules.pht_day(items_rules.format_timestamp(items_rules.now_pht()))
 
 
-def gear_cap() -> int:
-    """The daily gear limit, from the environment.
+# The cap the most recent snapshot carried, or None before the first one.
+# See gear_cap.
+_LAST_KNOWN_GEAR_CAP: int | None = None
 
-    A malformed value falls back to the default rather than crashing the
-    bot: a typo in a Render env var should not take the bot down.
+
+def _env_gear_cap() -> int:
+    """The daily gear limit from the environment: the fallback behind the sheet.
+
+    Kept as a fallback rather than removed, so an unreachable or
+    never-edited sheet leaves the bot on the number it has been using
+    instead of silently reverting to the built-in default. A malformed
+    value falls back further rather than crashing the bot: a typo in an
+    env var should not take the bot down.
     """
-    try:
-        return int(os.getenv("ITEMS_GEAR_DAILY_CAP", ""))
-    except ValueError:
-        return items_rules.DEFAULT_GEAR_DAILY_CAP
+    return items_rules.parse_cap(
+        os.getenv("ITEMS_GEAR_DAILY_CAP", ""), items_rules.DEFAULT_GEAR_DAILY_CAP
+    )
+
+
+def gear_cap(snapshot: items_sheet.Snapshot | None = None) -> int:
+    """The daily gear limit: the sheet's gear_daily_cap row, else the environment.
+
+    The snapshot costs nothing to consult -- the config tab is read in
+    the same batched call as the roster and the ledger -- so every
+    enforcing caller passes the snapshot it already holds and gets the
+    number currently in the sheet, with no restart and no extra read.
+
+    Called with no snapshot (!itemhelp, which prints the rule but holds
+    none), it answers with the cap the last snapshot showed. Giving that
+    command a read of its own would spend quota on something any member
+    can repeat, and the number is only ever used to *describe* the rule
+    -- enforcement always goes through a snapshot.
+    """
+    global _LAST_KNOWN_GEAR_CAP
+    if snapshot is None:
+        if _LAST_KNOWN_GEAR_CAP is None:
+            return _env_gear_cap()
+        return _LAST_KNOWN_GEAR_CAP
+    _LAST_KNOWN_GEAR_CAP = items_rules.parse_cap(
+        snapshot.config.get(items_sheet.GEAR_CAP_KEY, ""), _env_gear_cap()
+    )
+    return _LAST_KNOWN_GEAR_CAP
 
 
 def _calling_frame_name() -> str:
@@ -1083,7 +1115,7 @@ async def request_cmd(ctx, *, argument: str = ""):
             ctx.author.id,
             snapshot,
             _STATE,
-            cap=gear_cap(),
+            cap=gear_cap(snapshot),
             today=today_pht(),
         )
 
@@ -1231,7 +1263,7 @@ async def approve(request_id: str, officer_name: str) -> str:
             already_has_special=items_sheet.holds_special(
                 snapshot, request.ign, request.item
             ),
-            cap=gear_cap(),
+            cap=gear_cap(snapshot),
         )
         if not eligibility.allowed:
             return (
@@ -1487,13 +1519,13 @@ async def refresh_panel(interaction: discord.Interaction, page: int) -> None:
     page = min(page, page_count(requests) - 1)
     view = (
         DistributePanel(
-            requests, snapshot, cap=gear_cap(), today=today_pht(), page=page
+            requests, snapshot, cap=gear_cap(snapshot), today=today_pht(), page=page
         )
         if requests
         else None
     )
     if view is None:
-        embed = build_panel_embed([], snapshot, gear_cap(), today_pht())
+        embed = build_panel_embed([], snapshot, gear_cap(snapshot), today_pht())
     else:
         embed = view.build_embed()
     await interaction.message.edit(embed=embed, view=view)
@@ -1515,14 +1547,14 @@ async def distribute_cmd(ctx):
 
     requests = list(_STATE.queue)
     view = (
-        DistributePanel(requests, snapshot, cap=gear_cap(), today=today_pht())
+        DistributePanel(requests, snapshot, cap=gear_cap(snapshot), today=today_pht())
         if requests
         else None
     )
     embed = (
         view.build_embed()
         if view is not None
-        else build_panel_embed([], snapshot, gear_cap(), today_pht())
+        else build_panel_embed([], snapshot, gear_cap(snapshot), today_pht())
     )
     message = await ctx.send(embed=embed, view=view)
     if view is not None:

@@ -249,12 +249,14 @@ def reset_module_state():
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
     items_bot._SHEET_LOCK = asyncio.Lock()
+    items_bot._LAST_KNOWN_GEAR_CAP = None
     if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
         items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
     yield
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
     items_bot._SHEET_LOCK = asyncio.Lock()
+    items_bot._LAST_KNOWN_GEAR_CAP = None
     if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
         items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
 
@@ -280,19 +282,62 @@ def test_exit_code_matches_the_supervisors_leave_it_stopped_code():
     assert items_bot.EXIT_NOT_CONFIGURED == 78
 
 
-def test_gear_cap_defaults_to_three(monkeypatch):
+# The cap lives in the Logs Tracker's _BotConfig tab so an officer can
+# change it in the sheet, without an edit to .env and a restart on the
+# Windows PC the bots run on. The environment stays behind it as the
+# fallback, so an unreachable or unedited sheet keeps today's number.
+
+
+def test_gear_cap_prefers_the_sheets_row_over_the_environment(monkeypatch):
+    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "5")
+    assert items_bot.gear_cap(snapshot_with(config={"gear_daily_cap": "2"})) == 2
+
+
+def test_gear_cap_falls_back_to_the_environment_with_no_row_in_the_sheet(monkeypatch):
+    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "5")
+    assert items_bot.gear_cap(snapshot_with()) == 5
+
+
+def test_gear_cap_defaults_to_three_with_neither_a_row_nor_an_env_var(monkeypatch):
     monkeypatch.delenv("ITEMS_GEAR_DAILY_CAP", raising=False)
-    assert items_bot.gear_cap() == 3
+    assert items_bot.gear_cap(snapshot_with()) == 3
 
 
-def test_gear_cap_is_overridable(monkeypatch):
+def test_a_nonsense_cap_in_the_sheet_falls_back_to_the_environment(monkeypatch):
+    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "5")
+    assert items_bot.gear_cap(snapshot_with(config={"gear_daily_cap": "banana"})) == 5
+
+
+def test_a_nonsense_gear_cap_in_the_environment_still_falls_back_to_three(monkeypatch):
+    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "banana")
+    assert items_bot.gear_cap(snapshot_with()) == 3
+
+
+def test_zero_in_the_sheet_is_honoured_as_a_freeze(monkeypatch):
+    """The only way to stop gear requests from the sheet alone.
+
+    Treating 0 as a typo and falling back would hand out gear on the one
+    day the officers meant to hand out none.
+    """
+    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "5")
+    assert items_bot.gear_cap(snapshot_with(config={"gear_daily_cap": "0"})) == 0
+
+
+def test_gear_cap_with_no_snapshot_answers_with_the_last_one_it_saw(monkeypatch):
+    """!itemhelp has no snapshot in reach and must not buy one.
+
+    Every enforcing caller already holds a snapshot, so the help text can
+    reuse the number the most recent one carried instead of spending a
+    read against the quota the two bots share.
+    """
+    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "5")
+    items_bot.gear_cap(snapshot_with(config={"gear_daily_cap": "2"}))
+    assert items_bot.gear_cap() == 2
+
+
+def test_gear_cap_with_no_snapshot_uses_the_environment_before_any_read(monkeypatch):
     monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "5")
     assert items_bot.gear_cap() == 5
-
-
-def test_a_nonsense_gear_cap_falls_back_to_the_default(monkeypatch):
-    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "banana")
-    assert items_bot.gear_cap() == 3
 
 
 def test_a_module_level_lock_exists():
@@ -1287,7 +1332,7 @@ SPECIAL_GRID_ROWS = [
 ]
 
 
-def snapshot_with(ledger_rows=None, special_grid=None):
+def snapshot_with(ledger_rows=None, special_grid=None, config=None):
     return items_sheet.Snapshot(
         roster=["Kobe", "Dajz", "chinchong ni Mumu"],
         special_headers=SPECIAL_HEADER_ROW,
@@ -1299,6 +1344,7 @@ def snapshot_with(ledger_rows=None, special_grid=None):
             ["2026-08-07 10:00:00", "Kobe", "Benji's Heart", "Gear", "O", "1", "bbb"],
         ],
         special_grid=special_grid if special_grid is not None else SPECIAL_GRID_ROWS,
+        config=config if config is not None else {},
     )
 
 
@@ -4704,3 +4750,96 @@ def test_the_process_exits_normally_when_no_block_was_hit(monkeypatch):
     _watching_rate_limits(monkeypatch, lambda: 0.0)
 
     assert items_bot._QUIET.exit_code == 0
+
+
+# The three paths that must actually be governed by the number in the
+# sheet: what a member is refused, what an officer is stopped from
+# approving, and what the help text tells the guild the rule is. Each
+# sets the environment to a DIFFERENT number, so only the sheet's row can
+# produce the expected result.
+
+
+async def _noop_refresh():
+    return None
+
+
+def _requesting_against(monkeypatch, cap_cell, env):
+    """A !request with everything but the cap out of the way.
+
+    The officer channel is reachable, so an empty queue afterwards can
+    only mean the request was refused -- not that it was accepted and
+    then rolled back for want of somewhere to post it. `env` is always
+    set to a number that would give the OPPOSITE answer to `cap_cell`,
+    so a caller reading the environment instead of the sheet fails.
+    """
+    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", env)
+    items_bot._STATE.officer_channel_id = 99
+    monkeypatch.setattr(
+        items_sheet,
+        "read_snapshot",
+        lambda spreadsheet: snapshot_with(config={"gear_daily_cap": cap_cell}),
+    )
+    monkeypatch.setattr(items_bot, "today_pht", lambda: "2026-08-07")
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+    monkeypatch.setattr(items_bot, "refresh_board", _noop_refresh)
+    channel = FakeChannel(99)
+    monkeypatch.setattr(items_bot.bot, "get_channel", lambda channel_id: channel)
+    return FakeCtx(FakeChannel(1))
+
+
+def test_the_sheets_cap_is_what_a_request_is_refused_against(monkeypatch):
+    """Kobe has two gear logs today; the sheet says one and .env says five."""
+    ctx = _requesting_against(monkeypatch, cap_cell="1", env="5")
+
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Benji's Heart Kobe"))
+
+    assert items_bot._STATE.queue == []
+    assert "2/1" in ctx.sent[-1]["embed"].description
+
+
+def test_the_sheets_cap_is_what_an_approval_is_refused_against(monkeypatch):
+    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "5")
+    items_bot._STATE.queue = [_queued("a", "Kobe", "Asta's Belt", items_rules.GEAR)]
+    monkeypatch.setattr(
+        items_sheet,
+        "read_snapshot",
+        lambda spreadsheet: snapshot_with(config={"gear_daily_cap": "1"}),
+    )
+    written = []
+    monkeypatch.setattr(items_sheet, "commit_approval", lambda *a, **k: written.append(k))
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+    monkeypatch.setattr(items_bot, "today_pht", lambda: "2026-08-07")
+
+    message = asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert written == [], "the sheet's cap must stop the write"
+    assert "2/1" in message
+
+
+def test_the_sheets_cap_is_raised_by_editing_the_sheet_alone(monkeypatch):
+    """The point of the whole change: a bigger number in the cell works.
+
+    .env is left at the two gear logs Kobe has already used today, so
+    only the sheet's `9` can let this request through.
+    """
+    ctx = _requesting_against(monkeypatch, cap_cell="9", env="2")
+
+    asyncio.run(items_bot.request_cmd.callback(ctx, argument="Benji's Heart Kobe"))
+
+    assert [r.item for r in items_bot._STATE.queue] == ["Benji's Heart"]
+
+
+def test_itemhelp_states_the_sheets_rule_without_reading_the_sheet(monkeypatch):
+    monkeypatch.setenv("ITEMS_GEAR_DAILY_CAP", "5")
+    items_bot.gear_cap(snapshot_with(config={"gear_daily_cap": "2"}))
+
+    def unreachable(*args, **kwargs):
+        raise AssertionError("!itemhelp must not spend a read of its own")
+
+    monkeypatch.setattr(items_sheet, "read_snapshot", unreachable)
+    monkeypatch.setattr(items_sheet, "read_config", unreachable)
+    ctx = FakeCtx(FakeChannel(1))
+
+    asyncio.run(items_bot.itemhelp_cmd.callback(ctx))
+
+    assert "2 per player per day" in ctx.sent[-1]["embed"].description

@@ -433,26 +433,25 @@ def get_or_create_tab(spreadsheet, title: str, header: list[str]):
     return worksheet
 
 
-def read_config(spreadsheet) -> dict[str, str]:
-    """Bot settings stored in the sheet itself.
+def config_from_grid(grid: list[list[str]], title: str) -> dict[str, str]:
+    """The key/value rows of a _BotConfig grid, without the worksheet.
 
-    The sheet is used because Render wipes the disk on every restart, so
-    a local file would not survive.
+    Split out of read_config so a caller that already has the grid can
+    reuse this instead of writing a second parser. items_sheet reads the
+    config tab in the same batched call as the rest of its snapshot, and
+    a hand-rolled parser there would be one that quietly lost the
+    duplicate-key refusal below -- the exact silent disagreement this
+    module refuses everywhere else. `title` only names the worksheet in
+    that error, since the grid itself cannot say where it came from.
 
     Raises SheetStructureError if the same key appears in two rows.
     Silently letting the later row win (a plain dict comprehension would)
     could read back a different value than write_config just wrote for the
-    same key -- exactly the silent-disagreement failure mode this module
-    exists to prevent, and it is what write_config now refuses too.
+    same key.
     """
-    try:
-        worksheet = _worksheet(spreadsheet, CONFIG_TAB)
-    except gspread.exceptions.WorksheetNotFound:
-        return {}
-
     seen: dict[str, int] = {}
     result: dict[str, str] = {}
-    for number, row in enumerate(_grid(worksheet), start=1):
+    for number, row in enumerate(grid, start=1):
         if number == 1 or not row:
             continue
         key = row[0].strip()
@@ -461,11 +460,30 @@ def read_config(spreadsheet) -> dict[str, str]:
         if key in seen:
             raise SheetStructureError(
                 f"{key!r} has two rows ({seen[key]} and {number}) in "
-                f"worksheet {worksheet.title!r}; refusing to guess"
+                f"worksheet {title!r}; refusing to guess"
             )
         seen[key] = number
         result[key] = row[1].strip() if len(row) >= 2 else ""
     return result
+
+
+def read_config(spreadsheet) -> dict[str, str]:
+    """Bot settings stored in the sheet itself.
+
+    The sheet is used because Render wipes the disk on every restart, so
+    a local file would not survive.
+
+    Raises SheetStructureError if the same key appears in two rows (see
+    config_from_grid, which does the parsing) -- exactly the
+    silent-disagreement failure mode this module exists to prevent, and
+    it is what write_config refuses too.
+    """
+    try:
+        worksheet = _worksheet(spreadsheet, CONFIG_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        return {}
+
+    return config_from_grid(_grid(worksheet), worksheet.title)
 
 
 def write_config(spreadsheet, key: str, value: str) -> None:

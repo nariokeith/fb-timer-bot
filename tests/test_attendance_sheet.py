@@ -398,6 +398,7 @@ from attendance_sheet import (
     LOG_HEADER,
     LOG_TAB,
     append_log_entry,
+    config_from_grid,
     get_or_create_tab,
     image_already_logged,
     last_unreversed_entry,
@@ -454,6 +455,42 @@ def test_writing_an_existing_config_key_replaces_it():
 
 def test_config_is_empty_when_the_tab_does_not_exist():
     assert read_config(FakeSpreadsheet()) == {}
+
+
+# config_from_grid is read_config's parser with the worksheet lifted out,
+# so a caller that already holds the _BotConfig grid -- items_sheet reads
+# it in the same batch as the rest of the snapshot -- gets the duplicate
+# refusal and the blank-row handling instead of writing a second parser
+# that lacks them.
+
+
+def test_config_from_grid_reads_the_rows_below_the_header():
+    grid = [CONFIG_HEADER, ["target_tab", "Week 17"], ["officer_role_id", "12345"]]
+    assert config_from_grid(grid, CONFIG_TAB) == {
+        "target_tab": "Week 17",
+        "officer_role_id": "12345",
+    }
+
+
+def test_config_from_grid_refuses_a_duplicate_key_naming_both_rows():
+    grid = [CONFIG_HEADER, ["target_tab", "Week 17"], ["target_tab", "Week 18"]]
+    with pytest.raises(SheetStructureError, match=r"target_tab.*\(2 and 3\)"):
+        config_from_grid(grid, CONFIG_TAB)
+
+
+def test_config_from_grid_reads_a_key_with_no_value_cell_as_blank():
+    assert config_from_grid([CONFIG_HEADER, ["target_tab"]], CONFIG_TAB) == {
+        "target_tab": ""
+    }
+
+
+def test_config_from_grid_skips_blank_keys_and_empty_rows():
+    grid = [CONFIG_HEADER, [], ["", "orphaned"], ["  ", "x"], ["target_tab", "Week 17"]]
+    assert config_from_grid(grid, CONFIG_TAB) == {"target_tab": "Week 17"}
+
+
+def test_config_from_grid_is_empty_for_a_grid_with_nothing_in_it():
+    assert config_from_grid([], CONFIG_TAB) == {}
 
 
 def test_log_entry_is_appended_in_header_order():

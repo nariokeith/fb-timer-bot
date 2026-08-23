@@ -190,7 +190,7 @@ Render dashboard → your `fb-timer-bot` service → **Environment**. Add:
 |---|---|---|
 | `ITEMS_DISCORD_TOKEN` | the bot token | Same one you tested with |
 | `ITEMS_SHEET_ID` | `1Xx44UKBx0v5Pa0xbBzuVElEFZK-mdeQ5jHBBzBsKQgc` | The **real** sheet |
-| `ITEMS_GEAR_DAILY_CAP` | `3` | Optional; defaults to 3 anyway |
+| `ITEMS_GEAR_DAILY_CAP` | `3` | Optional fallback; the sheet's `gear_daily_cap` row wins |
 
 `GOOGLE_SERVICE_ACCOUNT_JSON` is already there — the item bot reuses it. The
 same service account must be an **Editor** on the real Logs Tracker; share it if
@@ -283,8 +283,10 @@ the held poll. If the retry still finds an unidentified voter, it holds again;
 !itemhelp                      the rules
 ```
 
-Rules: gear logs 3 per day, resetting midnight Manila time. Their IGN must
-match their row in the sheet. For special logs they answer **Yes** on the poll
+Rules: gear logs 3 per day by default, resetting midnight Manila time. To
+change that number, put a `gear_daily_cap` row in the Logs Tracker's
+`_BotConfig` tab — no restart, no code change, and the next command uses it.
+Their IGN must match their row in the sheet. For special logs they answer **Yes** on the poll
 in the raffle channel — `!request` will refuse them and say so.
 
 They also don't have to ask where they stand. Run `!setqueuechannel` once in

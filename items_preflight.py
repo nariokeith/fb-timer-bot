@@ -112,7 +112,52 @@ def check_snapshot(spreadsheet):
     gears = items_rules.item_names(snapshot.gear_headers)
     line(OK, f"{len(specials)} special-log items, {len(gears)} gear-log items")
     line(OK, f"{len(snapshot.ledger_rows)} rows already in the distribution log")
+    report_gear_cap(snapshot)
     return snapshot, specials, gears
+
+
+def report_gear_cap(snapshot) -> None:
+    """Say which daily gear limit the bot would enforce, and from where.
+
+    This is how an officer confirms an edit to the _BotConfig row took,
+    without starting the bot. The warning matters more than the number:
+    a cell the bot cannot read falls back silently at runtime, so a typo
+    would otherwise look exactly like a successful change.
+    """
+    environment = items_rules.parse_cap(
+        os.getenv("ITEMS_GEAR_DAILY_CAP", ""), items_rules.DEFAULT_GEAR_DAILY_CAP
+    )
+    cell = snapshot.config.get(items_sheet.GEAR_CAP_KEY, "").strip()
+    cap = items_rules.parse_cap(cell, environment)
+
+    # parse_cap returns the cell's own value only when it is zero or
+    # more, so asking it with a negative fallback separates "the cell
+    # says this" from "the cell is unreadable, here is the fallback" --
+    # which a comparison against `environment` could not, since a cell
+    # may legitimately hold the same number the environment does.
+    unreadable = cell and items_rules.parse_cap(cell, -1) < 0
+
+    if unreadable:
+        line(
+            WARN,
+            f"{items_sheet.GEAR_CAP_KEY} is {cell!r} in {items_sheet.CONFIG_TAB!r}, "
+            f"which is not a whole number -- gear cap {cap} per player per day, "
+            "from ITEMS_GEAR_DAILY_CAP instead",
+        )
+        return
+    if cell:
+        line(
+            OK,
+            f"gear cap {cap} per player per day, from the "
+            f"{items_sheet.GEAR_CAP_KEY} row in {items_sheet.CONFIG_TAB!r}",
+        )
+        return
+    line(
+        OK,
+        f"gear cap {cap} per player per day, from ITEMS_GEAR_DAILY_CAP -- add a "
+        f"{items_sheet.GEAR_CAP_KEY} row to {items_sheet.CONFIG_TAB!r} to set it "
+        "in the sheet instead",
+    )
 
 
 def check_duplicate_players(snapshot) -> None:

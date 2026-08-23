@@ -8,7 +8,7 @@ is running.
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import gspread
 import gspread.utils
@@ -16,9 +16,11 @@ import gspread.utils
 from attendance_bosses import header_base
 from attendance_roster import normalize
 from attendance_sheet import (
+    CONFIG_TAB,
     HEADER_ROW,
     PLAYER_COLUMN,
     SheetStructureError,
+    config_from_grid,
     find_column,
     get_or_create_tab,
     is_transient,
@@ -34,6 +36,12 @@ import items_rules
 SPECIAL_TAB = "Special Logs"
 GEAR_TAB = "Gear Logs"
 LEDGER_TAB = "Distribution Log"
+
+# Keys the item bot keeps in CONFIG_TAB, which read_snapshot carries in
+# `Snapshot.config`. Named here rather than in the bot because they name
+# rows in this spreadsheet, and items_preflight reports on them without
+# importing the Discord bot to do it.
+GEAR_CAP_KEY = "gear_daily_cap"
 
 LEDGER_HEADER = [
     "Timestamp (PHT)",
@@ -108,6 +116,10 @@ class Snapshot:
     gear_headers: list[str]
     ledger_rows: list[list[str]]
     special_grid: list[list[str]]
+    # The _BotConfig rows, read in the same batch. Defaulted so a
+    # Snapshot built by hand -- tests, and any caller that only cares
+    # about the roster -- need not know the config tab exists.
+    config: dict[str, str] = field(default_factory=dict)
 
 
 def _range_title(range_name: str) -> str:
@@ -186,7 +198,9 @@ def _read_snapshot_once(spreadsheet) -> Snapshot:
     # One metadata fetch, reused for both "which tabs exist" and the
     # Worksheet handle read_players/read_headers name in their errors.
     sheets = {sheet.title: sheet for sheet in spreadsheet.worksheets()}
-    grids = _read_grids(spreadsheet, sheets, (SPECIAL_TAB, GEAR_TAB, LEDGER_TAB))
+    grids = _read_grids(
+        spreadsheet, sheets, (SPECIAL_TAB, GEAR_TAB, LEDGER_TAB, CONFIG_TAB)
+    )
     special_grid = grids.get(SPECIAL_TAB, [])
     if not special_grid:
         raise SheetStructureError(f"Worksheet {SPECIAL_TAB!r} is missing or empty")
@@ -206,6 +220,7 @@ def _read_snapshot_once(spreadsheet) -> Snapshot:
         gear_headers=list(gear_grid[HEADER_ROW - 1]) if gear_grid else [],
         ledger_rows=ledger_grid[HEADER_ROW:] if ledger_grid else [],
         special_grid=special_grid,
+        config=config_from_grid(grids.get(CONFIG_TAB, []), CONFIG_TAB),
     )
 
 

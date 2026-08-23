@@ -5,7 +5,7 @@ import pytest
 
 import items_sheet
 import items_rules
-from attendance_sheet import SheetStructureError
+from attendance_sheet import CONFIG_HEADER, SheetStructureError
 from conftest import FakeSpreadsheet, FakeWorksheet
 
 SPECIAL_GRID = [
@@ -28,14 +28,17 @@ LEDGER_GRID = [
 ]
 
 
-def make_spreadsheet():
-    return FakeSpreadsheet(
-        {
-            items_sheet.SPECIAL_TAB: FakeWorksheet(SPECIAL_GRID, title=items_sheet.SPECIAL_TAB),
-            items_sheet.GEAR_TAB: FakeWorksheet(GEAR_GRID, title=items_sheet.GEAR_TAB),
-            items_sheet.LEDGER_TAB: FakeWorksheet(LEDGER_GRID, title=items_sheet.LEDGER_TAB),
-        }
-    )
+def make_spreadsheet(config_rows=None):
+    sheets = {
+        items_sheet.SPECIAL_TAB: FakeWorksheet(SPECIAL_GRID, title=items_sheet.SPECIAL_TAB),
+        items_sheet.GEAR_TAB: FakeWorksheet(GEAR_GRID, title=items_sheet.GEAR_TAB),
+        items_sheet.LEDGER_TAB: FakeWorksheet(LEDGER_GRID, title=items_sheet.LEDGER_TAB),
+    }
+    if config_rows is not None:
+        sheets[items_sheet.CONFIG_TAB] = FakeWorksheet(
+            [CONFIG_HEADER, *config_rows], title=items_sheet.CONFIG_TAB
+        )
+    return FakeSpreadsheet(sheets)
 
 
 def test_snapshot_reads_roster_headers_and_ledger():
@@ -44,6 +47,42 @@ def test_snapshot_reads_roster_headers_and_ledger():
     assert "Asta's Heart" in snapshot.special_headers
     assert "Asta's Belt" in snapshot.gear_headers
     assert snapshot.ledger_rows[0][1] == "Kobe"
+
+
+# The _BotConfig tab rides along in the snapshot's existing batched read
+# so that settings kept there -- the daily gear cap -- can be consulted on
+# every command without spending a second read against the 60-per-minute
+# quota the two bots share.
+
+
+def test_snapshot_carries_the_config_tabs_rows():
+    snapshot = items_sheet.read_snapshot(
+        make_spreadsheet([["gear_daily_cap", "5"], ["officer_channel_id", "42"]])
+    )
+    assert snapshot.config == {"gear_daily_cap": "5", "officer_channel_id": "42"}
+
+
+def test_reading_the_config_costs_no_extra_api_call():
+    """Metadata once, values once -- the config tab must not add a third.
+
+    Reaching for read_config here instead would spend a worksheet()
+    metadata fetch plus a values call on every single !request.
+    """
+    spreadsheet = make_spreadsheet([["gear_daily_cap", "5"]])
+    items_sheet.read_snapshot(spreadsheet)
+    assert spreadsheet.reads == 2
+
+
+def test_snapshot_config_is_empty_when_the_config_tab_does_not_exist():
+    assert items_sheet.read_snapshot(make_spreadsheet()).config == {}
+
+
+def test_snapshot_refuses_a_config_key_that_appears_twice():
+    spreadsheet = make_spreadsheet(
+        [["gear_daily_cap", "5"], ["gear_daily_cap", "9"]]
+    )
+    with pytest.raises(SheetStructureError, match=r"gear_daily_cap.*\(2 and 3\)"):
+        items_sheet.read_snapshot(spreadsheet, sleep=lambda _: None)
 
 
 def test_snapshot_excludes_the_ledger_header_row():

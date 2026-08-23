@@ -107,6 +107,10 @@ BOT_TZ=Asia/Manila
 ITEMS_GEAR_DAILY_CAP=3
 ```
 
+`ITEMS_GEAR_DAILY_CAP` is only the fallback. The daily gear limit is normally
+set in the Logs Tracker's `_BotConfig` tab, in a row keyed `gear_daily_cap`,
+which takes effect without editing this file or restarting anything.
+
 `GOOGLE_SERVICE_ACCOUNT_JSON` must be the entire key on **one line**. A
 pasted multi-line key is not valid JSON and fails with "Service account
 JSON is not valid JSON" — this cost an hour on 2026-08-18.

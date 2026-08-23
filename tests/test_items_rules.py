@@ -271,3 +271,34 @@ def test_the_cap_is_configurable():
         items_rules.GEAR, "Kobe", LEDGER, "2026-08-07", already_has_special=False, cap=2
     )
     assert not result.allowed
+
+
+# parse_cap turns one _BotConfig cell into the daily gear limit. Every
+# fallback case matters: a blank row, a typo, or a negative number must
+# leave the previously configured limit in force rather than inventing
+# one, because the alternative is the bot silently handing out more gear
+# than the officers agreed to.
+
+
+def test_parse_cap_reads_the_number_in_the_cell():
+    assert items_rules.parse_cap("5", 3) == 5
+
+
+def test_parse_cap_honours_zero_as_a_deliberate_freeze():
+    assert items_rules.parse_cap("0", 3) == 0
+
+
+def test_parse_cap_ignores_whitespace_around_the_number():
+    assert items_rules.parse_cap("  4 ", 3) == 4
+
+
+def test_parse_cap_falls_back_when_the_cell_is_blank():
+    assert items_rules.parse_cap("", 7) == 7
+
+
+def test_parse_cap_falls_back_on_a_value_that_is_not_a_number():
+    assert items_rules.parse_cap("banana", 7) == 7
+
+
+def test_parse_cap_falls_back_on_a_negative_number():
+    assert items_rules.parse_cap("-1", 7) == 7

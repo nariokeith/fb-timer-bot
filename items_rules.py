@@ -38,6 +38,24 @@ SPECIAL = "Special"
 GEAR = "Gear"
 
 
+def parse_cap(value: str, fallback: int) -> int:
+    """One config cell read as a daily gear limit, or `fallback`.
+
+    Zero is honoured: it is the only way to say "no gear today" from the
+    sheet, and refusing it would leave officers with no off switch.
+    Anything else that is not a whole number at least zero -- a blank
+    row, a note typed into the value column, a negative -- falls back
+    instead. Guessing at those would quietly change how much gear the
+    guild hands out, which is the one outcome nobody would notice until
+    the ledger disagreed with the officers.
+    """
+    try:
+        cap = int(value.strip())
+    except (AttributeError, ValueError):
+        return fallback
+    return cap if cap >= 0 else fallback
+
+
 def now_pht() -> datetime:
     return datetime.now(PHT)
 

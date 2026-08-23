@@ -250,8 +250,25 @@ Members request **gear logs** from the separate item-distribution bot:
 | `!myrequests` | List your pending requests. |
 | `!cancelrequest [item name]` | Withdraw a pending request; name the item when you have more than one. |
 
-Gear logs are limited to three per player per day, resetting at midnight in
-Manila time. An IGN must match the player's row in the Logs Tracker sheet.
+Gear logs are limited to three per player per day by default, resetting at
+midnight in Manila time. An IGN must match the player's row in the Logs Tracker
+sheet.
+
+**Changing the daily limit** does not need a code change or a restart: put a
+`gear_daily_cap` row in the Logs Tracker's `_BotConfig` tab and type the number
+in the value column.
+
+| key | value |
+|---|---|
+| `gear_daily_cap` | `3` |
+
+The next request, approval or `!distribute` picks it up — the bot reads that tab
+in the same call it already makes for the roster and the ledger, so watching it
+costs nothing. `0` freezes gear requests entirely. A blank, missing or
+unreadable value falls back to `ITEMS_GEAR_DAILY_CAP` in the environment, and
+then to `3`, so a typo leaves the limit where it was rather than changing it by
+surprise. Run `items_preflight.py` to see which number the bot would enforce and
+where it read it from.
 
 **Special logs are not requested — they are raffled.** Asking for one with
 `!request` is refused with a pointer to the raffle channel.
@@ -328,8 +345,13 @@ and **Server Members Intent** for its bot. Invite it with **View Channels**,
 **Send Messages**, **Embed Links**, **Read Message History**, and **Manage
 Messages** permissions. Share the Logs Tracker spreadsheet with the Google
 service account's `client_email` as an **Editor**. On Render, set
-`ITEMS_DISCORD_TOKEN`, `ITEMS_SHEET_ID`, and `GOOGLE_SERVICE_ACCOUNT_JSON`;
-`ITEMS_GEAR_DAILY_CAP` is optional and defaults to `3`.
+`ITEMS_DISCORD_TOKEN`, `ITEMS_SHEET_ID`, and `GOOGLE_SERVICE_ACCOUNT_JSON`.
+`ITEMS_GEAR_DAILY_CAP` is optional: it is the fallback behind the sheet's
+`gear_daily_cap` row, and defaults to `3`.
+
+The bot keeps its own settings in a `_BotConfig` tab on the Logs Tracker, the
+same mechanism the attendance bot uses on its sheet — `officer_channel_id` so a
+restart need not rescan every channel, and `gear_daily_cap` if you set one.
 
 Without **Server Members Intent** the bot cannot read nicknames, so every
 raffle voter comes back as unidentified and no winner can be drawn.
