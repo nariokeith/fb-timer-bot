@@ -384,9 +384,11 @@ def test_append_ledger_row_writes_the_columns_in_header_order():
         officer="Keith",
         user_id=7,
         request_id="zzz",
+        requested_at="2026-08-07 13:00:00",
     )
     assert spreadsheet.worksheet(items_sheet.LEDGER_TAB).appended[-1] == [
-        "2026-08-07 14:00:00", "Dajz", "Asta's Heart", "Special", "Keith", "7", "zzz"
+        "2026-08-07 14:00:00", "Dajz", "Asta's Heart", "Special", "Keith", "7", "zzz",
+        "2026-08-07 13:00:00",
     ]
 
 
@@ -403,6 +405,7 @@ def test_append_ledger_row_creates_the_tab_when_absent():
         officer="Keith",
         user_id=7,
         request_id="zzz",
+        requested_at="2026-08-07 13:00:00",
     )
     assert items_sheet.LEDGER_TAB in spreadsheet.created
 
@@ -418,6 +421,7 @@ def test_commit_approval_writes_the_cell_and_the_ledger_row():
         officer="Keith",
         user_id=7,
         request_id="zzz",
+        requested_at="2026-08-07 13:00:00",
     )
     assert spreadsheet.worksheet(items_sheet.SPECIAL_TAB).batches
     assert spreadsheet.worksheet(items_sheet.LEDGER_TAB).appended
@@ -435,6 +439,7 @@ def test_commit_approval_writes_no_ledger_row_when_the_cell_write_fails():
             officer="Keith",
             user_id=7,
             request_id="zzz",
+            requested_at="2026-08-07 13:00:00",
         )
     assert spreadsheet.worksheet(items_sheet.LEDGER_TAB).appended == []
 
@@ -457,6 +462,7 @@ def test_a_failed_ledger_append_is_reported_as_its_own_unretryable_error(monkeyp
             officer="Keith",
             user_id=7,
             request_id="zzz",
+            requested_at="2026-08-07 13:00:00",
         )
 
     assert exc.value.address == "B3"
@@ -616,3 +622,155 @@ def test_a_missing_tab_still_refuses_immediately(monkeypatch):
 
     with pytest.raises(items_sheet.SheetStructureError):
         items_sheet._worksheet_or_refuse(spreadsheet, "No Such Tab")
+
+
+# The ledger grew an eighth column, "Requested (PHT)", so the daily gear
+# cap can count the day the member asked rather than the day an officer
+# got round to approving. Live sheets predate it: they must keep working,
+# and the bot widens them itself rather than asking an officer to edit a
+# header row by hand while the queue is full.
+
+LEGACY_LEDGER_GRID = [
+    list(items_sheet.LEGACY_LEDGER_HEADER),
+    ["2026-08-07 09:00:00", "Kobe", "Asta's Belt", "Gear", "Officer", "1", "aaa"],
+]
+
+
+def legacy_spreadsheet():
+    sheets = {
+        items_sheet.SPECIAL_TAB: FakeWorksheet(SPECIAL_GRID, title=items_sheet.SPECIAL_TAB),
+        items_sheet.GEAR_TAB: FakeWorksheet(GEAR_GRID, title=items_sheet.GEAR_TAB),
+        items_sheet.LEDGER_TAB: FakeWorksheet(
+            LEGACY_LEDGER_GRID, title=items_sheet.LEDGER_TAB, cols=7
+        ),
+    }
+    return FakeSpreadsheet(sheets)
+
+
+def test_append_ledger_row_records_when_the_member_asked():
+    spreadsheet = make_spreadsheet()
+    items_sheet.append_ledger_row(
+        spreadsheet,
+        timestamp="2026-08-07 09:00:00",
+        ign="Dajz",
+        item="Asta's Belt",
+        item_type=items_rules.GEAR,
+        officer="Keith",
+        user_id=7,
+        request_id="zzz",
+        requested_at="2026-08-06 22:15:00",
+    )
+    assert spreadsheet.worksheet(items_sheet.LEDGER_TAB).appended[-1] == [
+        "2026-08-07 09:00:00", "Dajz", "Asta's Belt", "Gear", "Keith", "7", "zzz",
+        "2026-08-06 22:15:00",
+    ]
+
+
+def test_a_row_the_bot_writes_is_counted_on_the_day_it_was_requested():
+    """The two halves agree: what items_sheet writes, items_rules reads."""
+    spreadsheet = make_spreadsheet()
+    items_sheet.append_ledger_row(
+        spreadsheet,
+        timestamp="2026-08-07 09:00:00",
+        ign="Dajz",
+        item="Asta's Belt",
+        item_type=items_rules.GEAR,
+        officer="Keith",
+        user_id=7,
+        request_id="zzz",
+        requested_at="2026-08-06 22:15:00",
+    )
+    rows = items_sheet.read_snapshot(spreadsheet).ledger_rows
+    assert items_rules.gear_used_today(rows, "Dajz", "2026-08-06") == 1
+    assert items_rules.gear_used_today(rows, "Dajz", "2026-08-07") == 0
+
+
+def test_a_legacy_seven_column_ledger_is_still_readable():
+    snapshot = items_sheet.read_snapshot(legacy_spreadsheet())
+    assert snapshot.ledger_rows[0][1] == "Kobe"
+
+
+def test_appending_widens_a_legacy_ledger_before_writing_to_it():
+    spreadsheet = legacy_spreadsheet()
+    items_sheet.append_ledger_row(
+        spreadsheet,
+        timestamp="2026-08-07 14:00:00",
+        ign="Dajz",
+        item="Asta's Belt",
+        item_type=items_rules.GEAR,
+        officer="Keith",
+        user_id=7,
+        request_id="zzz",
+        requested_at="2026-08-06 22:15:00",
+    )
+    ledger = spreadsheet.worksheet(items_sheet.LEDGER_TAB)
+    assert ledger.col_count >= len(items_sheet.LEDGER_HEADER)
+    assert ledger._rows[0] == items_sheet.LEDGER_HEADER
+    assert ledger.appended[-1][-1] == "2026-08-06 22:15:00"
+
+
+def test_widening_a_legacy_ledger_happens_once():
+    """The second append finds an already-current header and just writes."""
+    spreadsheet = legacy_spreadsheet()
+    for request_id in ("zzz", "yyy"):
+        items_sheet.append_ledger_row(
+            spreadsheet,
+            timestamp="2026-08-07 14:00:00",
+            ign="Dajz",
+            item="Asta's Belt",
+            item_type=items_rules.GEAR,
+            officer="Keith",
+            user_id=7,
+            request_id=request_id,
+            requested_at="2026-08-06 22:15:00",
+        )
+    ledger = spreadsheet.worksheet(items_sheet.LEDGER_TAB)
+    assert ledger.col_count == len(items_sheet.LEDGER_HEADER)
+    assert len(ledger.appended) == 2
+
+
+def test_a_ledger_header_that_is_neither_shape_is_still_refused():
+    """Refusing to guess column order is the whole point of the check."""
+    spreadsheet = make_spreadsheet()
+    spreadsheet.worksheet(items_sheet.LEDGER_TAB)._rows[0][0:2] = ["IGN", "Timestamp (PHT)"]
+    with pytest.raises(SheetStructureError):
+        items_sheet.read_snapshot(spreadsheet)
+
+
+def test_commit_approval_passes_the_request_time_through_to_the_ledger():
+    spreadsheet = make_spreadsheet()
+    items_sheet.commit_approval(
+        spreadsheet,
+        ign="Dajz",
+        item="Asta's Belt",
+        item_type=items_rules.GEAR,
+        timestamp="2026-08-07 09:00:00",
+        officer="Keith",
+        user_id=7,
+        request_id="zzz",
+        requested_at="2026-08-06 22:15:00",
+    )
+    assert spreadsheet.worksheet(items_sheet.LEDGER_TAB).appended[-1][-1] == (
+        "2026-08-06 22:15:00"
+    )
+
+
+def test_an_empty_ledger_tab_is_reported_as_empty_not_widened():
+    """A blank tab someone made by hand is not a legacy tab."""
+    spreadsheet = FakeSpreadsheet({
+        items_sheet.SPECIAL_TAB: FakeWorksheet(SPECIAL_GRID, title=items_sheet.SPECIAL_TAB),
+        items_sheet.LEDGER_TAB: FakeWorksheet([], title=items_sheet.LEDGER_TAB, cols=7),
+    })
+    with pytest.raises(SheetStructureError) as exc:
+        items_sheet.append_ledger_row(
+            spreadsheet,
+            timestamp="2026-08-07 14:00:00",
+            ign="Dajz",
+            item="Asta's Belt",
+            item_type=items_rules.GEAR,
+            officer="Keith",
+            user_id=7,
+            request_id="zzz",
+            requested_at="2026-08-06 22:15:00",
+        )
+    assert "empty" in str(exc.value).lower()

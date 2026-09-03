@@ -1429,7 +1429,6 @@ def test_panel_lines_number_each_request_and_show_its_status():
         ],
         SNAPSHOT,
         cap=3,
-        today="2026-08-07",
     )
     assert lines[0].startswith("**1.")
     assert "Dajz" in lines[0] and "Asta's Heart" in lines[0]
@@ -1442,7 +1441,7 @@ def test_panel_lines_flag_a_player_at_the_cap():
     ]
     lines = items_bot.panel_lines(
         [_queued("b", "Kobe", "Asta's Belt", items_rules.GEAR)],
-        snapshot_with(ledger_rows=ledger), cap=3, today="2026-08-07",
+        snapshot_with(ledger_rows=ledger), cap=3,
     )
     assert "⚠️" in lines[0]
 
@@ -1451,7 +1450,7 @@ def test_panel_lines_flag_a_special_the_player_already_holds():
     """Kobe already has Asta's Heart in SPECIAL_GRID_ROWS."""
     lines = items_bot.panel_lines(
         [_queued("a", "Kobe", "Asta's Heart", items_rules.SPECIAL)],
-        SNAPSHOT, cap=3, today="2026-08-07",
+        SNAPSHOT, cap=3,
     )
     assert "already has it" in lines[0]
 
@@ -1462,14 +1461,14 @@ def test_panel_lines_show_a_requests_note():
         type=items_rules.SPECIAL, requested_at="2026-08-07 09:00:00",
         note="previously requested as Kobe",
     )
-    lines = items_bot.panel_lines([request], SNAPSHOT, cap=3, today="2026-08-07")
+    lines = items_bot.panel_lines([request], SNAPSHOT, cap=3)
     assert "previously requested as Kobe" in lines[0]
 
 
 def test_panel_lines_number_from_the_page_start():
     lines = items_bot.panel_lines(
         [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)],
-        SNAPSHOT, cap=3, today="2026-08-07", start=26,
+        SNAPSHOT, cap=3, start=26,
     )
     assert lines[0].startswith("**26.")
 
@@ -1493,7 +1492,7 @@ def test_page_two_lists_requests_twenty_six_through_fifty():
         _queued(f"id{n}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
         for n in range(60)
     ]
-    panel = items_bot.DistributePanel(queue, SNAPSHOT, cap=3, today="2026-08-07", page=1)
+    panel = items_bot.DistributePanel(queue, SNAPSHOT, cap=3, page=1)
 
     assert [option.value for option in panel.picker.options] == [
         f"id{n}" for n in range(25, 50)
@@ -1508,7 +1507,6 @@ def test_single_page_panel_has_no_page_buttons():
         [_queued("a", "Dajz", "Asta's Heart", items_rules.SPECIAL)],
         SNAPSHOT,
         cap=3,
-        today="2026-08-07",
     )
 
     assert [child.label for child in panel.children if child.row == 2] == []
@@ -1522,7 +1520,6 @@ def test_a_panel_keeps_each_officers_selection_separate():
         ],
         SNAPSHOT,
         cap=3,
-        today="2026-08-07",
     )
     panel.selected[101] = "a"
     panel.selected[202] = "b"
@@ -1535,7 +1532,7 @@ def test_page_button_edits_the_existing_message_and_clears_selections():
         _queued(f"id{n}", f"Player {n}", "Asta's Heart", items_rules.SPECIAL)
         for n in range(60)
     ]
-    panel = items_bot.DistributePanel(queue, SNAPSHOT, cap=3, today="2026-08-07")
+    panel = items_bot.DistributePanel(queue, SNAPSHOT, cap=3)
     channel = FakeChannel(99)
     message = asyncio.run(channel.send(embed=panel.build_embed(), view=panel))
     panel.message = message
@@ -1558,7 +1555,7 @@ def test_resolving_the_only_request_on_the_last_page_returns_to_a_nonempty_page(
         for n in range(26)
     ]
     panel = items_bot.DistributePanel(
-        list(items_bot._STATE.queue), SNAPSHOT, cap=3, today="2026-08-07", page=1
+        list(items_bot._STATE.queue), SNAPSHOT, cap=3, page=1
     )
     channel = FakeChannel(99)
     message = asyncio.run(channel.send(embed=panel.build_embed(), view=panel))
@@ -1579,7 +1576,7 @@ def test_resolving_the_only_request_on_the_last_page_returns_to_a_nonempty_page(
 
 
 def test_an_empty_queue_says_so():
-    embed = items_bot.build_panel_embed([], SNAPSHOT, cap=3, today="2026-08-07")
+    embed = items_bot.build_panel_embed([], SNAPSHOT, cap=3)
     assert "no pending" in embed.description.lower()
 
 
@@ -4843,3 +4840,151 @@ def test_itemhelp_states_the_sheets_rule_without_reading_the_sheet(monkeypatch):
     asyncio.run(items_bot.itemhelp_cmd.callback(ctx))
 
     assert "2 per player per day" in ctx.sent[-1]["embed"].description
+
+
+# --- Approving a request the day after it was made -------------------
+#
+# The queue does not always empty the same evening. When it does not,
+# the request still belongs to the day the member asked: the ledger row
+# records that day, and the re-check inside the write lock asks about
+# that day. Judging by the approval day instead was the production bug
+# where a member who had requested nothing all day was told they were
+# already at the cap.
+
+def _queued_on(day, request_id="a", ign="Dajz", item="Asta's Belt"):
+    return items_state.PendingRequest(
+        id=request_id, user_id=1, ign=ign, item=item,
+        type=items_rules.GEAR, requested_at=f"{day} 22:00:00",
+    )
+
+
+def _gear_row(ign, approved_on, requested_on, request_id):
+    return [
+        f"{approved_on} 09:00:00", ign, "Benji's Heart", "Gear", "O", "1",
+        request_id, f"{requested_on} 20:00:00",
+    ]
+
+
+def test_approve_records_the_day_the_member_asked_not_the_day_it_was_approved(
+    monkeypatch,
+):
+    items_bot._STATE.queue = [_queued_on("2026-08-06")]
+    calls = []
+    monkeypatch.setattr(items_sheet, "read_snapshot", lambda spreadsheet: SNAPSHOT)
+    monkeypatch.setattr(
+        items_sheet, "commit_approval",
+        lambda spreadsheet, **kwargs: calls.append(kwargs) or "B3",
+    )
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+
+    asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert calls[0]["requested_at"] == "2026-08-06 22:00:00"
+    assert calls[0]["timestamp"] != calls[0]["requested_at"], (
+        "the approval time is still recorded, in its own column"
+    )
+
+
+def test_yesterdays_request_is_approvable_when_today_is_already_full(monkeypatch):
+    """The officer-side half of the reported bug."""
+    monkeypatch.setattr(items_bot, "today_pht", lambda: "2026-08-07")
+    full_today = [
+        _gear_row("Dajz", "2026-08-07", "2026-08-07", f"t{n}") for n in range(3)
+    ]
+    items_bot._STATE.queue = [_queued_on("2026-08-06")]
+    calls = []
+    monkeypatch.setattr(
+        items_sheet, "read_snapshot", lambda spreadsheet: snapshot_with(ledger_rows=full_today)
+    )
+    monkeypatch.setattr(
+        items_sheet, "commit_approval",
+        lambda spreadsheet, **kwargs: calls.append(kwargs) or "B3",
+    )
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+
+    message = asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert len(calls) == 1, f"refused instead: {message}"
+    assert items_bot._STATE.queue == []
+
+
+def test_the_cap_still_bites_on_the_day_the_request_was_actually_made(monkeypatch):
+    """The guard against over-correcting: a full day is still full."""
+    monkeypatch.setattr(items_bot, "today_pht", lambda: "2026-08-07")
+    full_on_the_sixth = [
+        _gear_row("Dajz", "2026-08-07", "2026-08-06", f"s{n}") for n in range(3)
+    ]
+    items_bot._STATE.queue = [_queued_on("2026-08-06")]
+    monkeypatch.setattr(
+        items_sheet, "read_snapshot",
+        lambda spreadsheet: snapshot_with(ledger_rows=full_on_the_sixth),
+    )
+    monkeypatch.setattr(
+        items_sheet, "commit_approval",
+        lambda spreadsheet, **kwargs: pytest.fail("wrote past the cap"),
+    )
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+
+    message = asyncio.run(items_bot.approve("a", "Keith"))
+
+    assert "not approved" in message.lower()
+    assert "3/3" in message
+    assert len(items_bot._STATE.queue) == 1, "a refused request stays queued"
+
+
+def test_the_panel_counts_against_the_day_each_request_was_made():
+    """What the officer reads must match what clicking approve will do."""
+    full_today = [_gear_row("Dajz", "2026-08-07", "2026-08-07", f"t{n}") for n in range(3)]
+    lines = items_bot.panel_lines(
+        [_queued_on("2026-08-06"), _queued_on("2026-08-07", request_id="b")],
+        snapshot_with(ledger_rows=full_today),
+        cap=3,
+    )
+    assert "0/3" in lines[0] and "✅" in lines[0]
+    assert "3/3" in lines[1] and "⚠️" in lines[1]
+
+
+def test_clearing_an_overnight_backlog_still_stops_at_the_cap(monkeypatch):
+    """Four requests from last night, approved one at a time this morning.
+
+    approve() passes no pending_gear -- it relies on re-reading the
+    ledger under the lock, so each approval must see the row the
+    previous one wrote. That is what keeps the fourth out, and it only
+    works if the rows being written and the day being counted agree.
+    """
+    monkeypatch.setattr(items_bot, "today_pht", lambda: "2026-08-07")
+    ledger: list[list[str]] = []
+    items_bot._STATE.queue = [
+        _queued_on("2026-08-06", request_id=str(n), item=item)
+        for n, item in enumerate(
+            ["Asta's Belt", "Benji's Heart", "Asta's Belt", "Benji's Heart"]
+        )
+    ]
+    monkeypatch.setattr(
+        items_sheet, "read_snapshot",
+        lambda spreadsheet: snapshot_with(ledger_rows=list(ledger)),
+    )
+
+    def commit(spreadsheet, **kw):
+        ledger.append([
+            kw["timestamp"], kw["ign"], kw["item"], kw["item_type"], kw["officer"],
+            str(kw["user_id"]), kw["request_id"], kw["requested_at"],
+        ])
+        return "B3"
+
+    monkeypatch.setattr(items_sheet, "commit_approval", commit)
+    monkeypatch.setattr(items_bot, "save_state", _noop_save)
+
+    messages = [asyncio.run(items_bot.approve(str(n), "Keith")) for n in range(4)]
+
+    assert len(ledger) == 3, "the fourth must be refused"
+    assert "not approved" in messages[3].lower() and "3/3" in messages[3]
+    assert {items_rules.pht_day(row[7]) for row in ledger} == {"2026-08-06"}
+    assert len(items_bot._STATE.queue) == 1
+
+    # And the morning itself is untouched: the member may still ask today.
+    outcome = items_bot.evaluate_request(
+        "Asta's Belt Dajz", 1, snapshot_with(ledger_rows=list(ledger)),
+        items_state.State(), cap=3, today="2026-08-07",
+    )
+    assert outcome.accepted, outcome.message

@@ -302,3 +302,63 @@ def test_parse_cap_falls_back_on_a_value_that_is_not_a_number():
 
 def test_parse_cap_falls_back_on_a_negative_number():
     assert items_rules.parse_cap("-1", 7) == 7
+
+
+# The ledger's first column is when an OFFICER approved; its last is when
+# the MEMBER asked. The daily cap counts the day of the request, because
+# a request an officer only gets to the next morning otherwise ate into
+# that morning's allowance -- the member had used nothing that day and
+# was still told they were at the cap.
+BACKDATED = [
+    ["2026-08-07 09:00:00", "Kobe", "Asta's Belt", "Gear", "O", "1", "aaa",
+     "2026-08-06 22:00:00"],
+]
+
+
+def test_a_row_approved_today_counts_against_the_day_it_was_requested():
+    assert items_rules.gear_used_today(BACKDATED, "Kobe", "2026-08-06") == 1
+    assert items_rules.gear_used_today(BACKDATED, "Kobe", "2026-08-07") == 0
+
+
+def test_a_legacy_row_with_no_request_column_counts_by_its_timestamp():
+    """Rows written before the column existed still have to be counted."""
+    assert all(len(row) == 7 for row in LEDGER)
+    assert items_rules.gear_used_today(LEDGER, "Kobe", "2026-08-07") == 2
+
+
+def test_a_blank_request_cell_falls_back_to_the_timestamp():
+    """A hand-added row leaves the column empty; it must not vanish."""
+    blank = [[*row, ""] for row in LEDGER]
+    assert items_rules.gear_used_today(blank, "Kobe", "2026-08-07") == 2
+
+
+def test_gear_is_judged_against_the_day_the_request_was_made():
+    """The exact production report, as a test.
+
+    Kobe asks for three gear on the 6th. No officer gets to them that
+    night, so all three are approved on the morning of the 7th and carry
+    7th timestamps. On the 7th Kobe has used nothing, so a fresh request
+    must be allowed -- and a fourth request left over from the 6th must
+    still be refused, because the 6th is full.
+    """
+    approved_late = [
+        ["2026-08-07 09:00:00", "Kobe", "Asta's Belt", "Gear", "O", "1", "f1",
+         "2026-08-06 20:00:00"],
+        ["2026-08-07 09:05:00", "Kobe", "Benji's Heart", "Gear", "O", "1", "f2",
+         "2026-08-06 20:01:00"],
+        ["2026-08-07 09:10:00", "Kobe", "Amentis' Foot", "Gear", "O", "1", "f3",
+         "2026-08-06 20:02:00"],
+    ]
+    fresh = items_rules.check_eligibility(
+        items_rules.GEAR, "Kobe", approved_late, "2026-08-07",
+        already_has_special=False,
+    )
+    assert fresh.allowed, "the 7th is untouched -- Kobe used nothing that day"
+    assert fresh.used == 0
+
+    leftover = items_rules.check_eligibility(
+        items_rules.GEAR, "Kobe", approved_late, "2026-08-06",
+        already_has_special=False,
+    )
+    assert not leftover.allowed, "the 6th is full, whenever it is approved"
+    assert "3/3" in leftover.reason

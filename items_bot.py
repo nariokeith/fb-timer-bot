@@ -75,7 +75,13 @@ def missing_credentials(env: dict) -> list[str]:
 
 
 def today_pht() -> str:
-    """Today's date in Manila, as the ledger writes it."""
+    """Today's date in Manila, formatted as ledger days are.
+
+    Only the !request path uses this now: a request being made right now
+    belongs to today by definition. Approving one asks the request when
+    it was made instead -- see approve() -- because by then "today" may
+    no longer be the day the member asked on.
+    """
     return items_rules.pht_day(items_rules.format_timestamp(items_rules.now_pht()))
 
 
@@ -1172,7 +1178,6 @@ def panel_lines(
     requests: list[items_state.PendingRequest],
     snapshot: items_sheet.Snapshot,
     cap: int,
-    today: str,
     start: int = 1,
 ) -> list[str]:
     """One display line per pending request, with its current standing.
@@ -1180,13 +1185,20 @@ def panel_lines(
     The standing is recomputed at render time, not stored: an officer
     needs to see the position as it is now, which may differ from when
     the member requested.
+
+    Each gear line is counted against the day THAT request was made, not
+    against today, so the number the officer reads is the number the
+    approve button will act on. A request left overnight would otherwise
+    show a scary 3/3 borrowed from a different day and get denied by
+    hand.
     """
     lines = []
     for number, request in enumerate(requests, start=start):
         if request.type == items_rules.GEAR:
-            used = items_rules.gear_used_today(snapshot.ledger_rows, request.ign, today)
+            day = items_rules.pht_day(request.requested_at)
+            used = items_rules.gear_used_today(snapshot.ledger_rows, request.ign, day)
             flag = "⚠️" if used >= cap else "✅"
-            status = f"{flag} {used}/{cap} today"
+            status = f"{flag} {used}/{cap} on {day}"
         elif items_sheet.holds_special(snapshot, request.ign, request.item):
             status = "⚠️ already has it"
         else:
@@ -1205,12 +1217,11 @@ def build_panel_embed(
     requests: list[items_state.PendingRequest],
     snapshot: items_sheet.Snapshot,
     cap: int,
-    today: str,
     start: int = 1,
 ) -> discord.Embed:
     if not requests:
         return _embed("📦 Pending Item Requests", "There are no pending requests.", 0x95A5A6)
-    body = "\n".join(panel_lines(requests, snapshot, cap, today, start))
+    body = "\n".join(panel_lines(requests, snapshot, cap, start))
     return _embed("📦 Pending Item Requests", body, 0x3498DB)
 
 
@@ -1255,11 +1266,17 @@ async def approve(request_id: str, officer_name: str) -> str:
                 "Nothing was written again."
             )
 
+        # The day the MEMBER asked, not the day the officer got to it.
+        # An officer clearing last night's queue this morning must not
+        # spend this morning's allowance, and a member who asked
+        # yesterday must not be told they are at a cap they never
+        # touched today. See items_rules.ledger_day.
+        request_day = items_rules.pht_day(request.requested_at)
         eligibility = items_rules.check_eligibility(
             request.type,
             request.ign,
             snapshot.ledger_rows,
-            today_pht(),
+            request_day,
             already_has_special=items_sheet.holds_special(
                 snapshot, request.ign, request.item
             ),
@@ -1282,6 +1299,7 @@ async def approve(request_id: str, officer_name: str) -> str:
                     officer=officer_name,
                     user_id=request.user_id,
                     request_id=request.id,
+                    requested_at=request.requested_at,
                 )
             )
         except items_sheet.LedgerWriteError as exc:
@@ -1331,7 +1349,6 @@ class DistributePanel(discord.ui.View):
         snapshot: items_sheet.Snapshot,
         *,
         cap: int,
-        today: str,
         page: int = 0,
     ):
         super().__init__(timeout=PANEL_TIMEOUT)
@@ -1341,7 +1358,6 @@ class DistributePanel(discord.ui.View):
         self.requests = list(requests)
         self.snapshot = snapshot
         self.cap = cap
-        self.today = today
         self.total_pages = page_count(self.requests)
         self.page = min(max(page, 0), self.total_pages - 1)
         self.start = self.page * MAX_PANEL_OPTIONS + 1
@@ -1370,9 +1386,7 @@ class DistributePanel(discord.ui.View):
         requests = self.requests[
             self.page * MAX_PANEL_OPTIONS : (self.page + 1) * MAX_PANEL_OPTIONS
         ]
-        embed = build_panel_embed(
-            requests, self.snapshot, self.cap, self.today, start=self.start
-        )
+        embed = build_panel_embed(requests, self.snapshot, self.cap, start=self.start)
         if self.total_pages > 1:
             embed.set_footer(text=f"Page {self.page + 1} of {self.total_pages}")
         return embed
@@ -1417,7 +1431,6 @@ class DistributePanel(discord.ui.View):
                 self.requests,
                 self.snapshot,
                 cap=self.cap,
-                today=self.today,
                 page=page,
             )
             next_panel.message = interaction.message
@@ -1518,14 +1531,12 @@ async def refresh_panel(interaction: discord.Interaction, page: int) -> None:
     requests = list(_STATE.queue)
     page = min(page, page_count(requests) - 1)
     view = (
-        DistributePanel(
-            requests, snapshot, cap=gear_cap(snapshot), today=today_pht(), page=page
-        )
+        DistributePanel(requests, snapshot, cap=gear_cap(snapshot), page=page)
         if requests
         else None
     )
     if view is None:
-        embed = build_panel_embed([], snapshot, gear_cap(snapshot), today_pht())
+        embed = build_panel_embed([], snapshot, gear_cap(snapshot))
     else:
         embed = view.build_embed()
     await interaction.message.edit(embed=embed, view=view)
@@ -1547,14 +1558,14 @@ async def distribute_cmd(ctx):
 
     requests = list(_STATE.queue)
     view = (
-        DistributePanel(requests, snapshot, cap=gear_cap(snapshot), today=today_pht())
+        DistributePanel(requests, snapshot, cap=gear_cap(snapshot))
         if requests
         else None
     )
     embed = (
         view.build_embed()
         if view is not None
-        else build_panel_embed([], snapshot, gear_cap(snapshot), today_pht())
+        else build_panel_embed([], snapshot, gear_cap(snapshot))
     )
     message = await ctx.send(embed=embed, view=view)
     if view is not None:
@@ -1670,7 +1681,9 @@ async def itemhelp_cmd(ctx):
         "**`!cancelrequest [item name]`** — withdraw a request\n\n"
         "**Rules**\n"
         f"• Gear logs: {gear_cap()} per player per day, resetting at "
-        "midnight (Manila time).\n"
+        "midnight (Manila time). The day counted is the day you "
+        "*requested*, so a request an officer approves the next "
+        "morning does not use up that morning's allowance.\n"
         "• Special logs cannot be requested — they are raffled.\n\n"
         "Your IGN must match your row in the Logs Tracker sheet.",
         0x3498DB,
@@ -2541,6 +2554,11 @@ async def _record_winners(ctx, raffle, chosen: list[str]) -> WriteOutcome:
                     item=raffle.item,
                     item_type=items_rules.SPECIAL,
                     timestamp=now,
+                    # A raffle win was never requested -- the draw is
+                    # both the asking and the granting. Specials are not
+                    # day-capped either way, so this column exists here
+                    # only so every ledger row has one.
+                    requested_at=now,
                     officer=getattr(ctx.author, "display_name", str(ctx.author)),
                     user_id=ctx.author.id,
                     request_id=items_state.new_request_id(),

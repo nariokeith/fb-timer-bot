@@ -155,8 +155,11 @@ Then, in Discord:
 Test 13 is the one people skip. It's what proves a Render redeploy won't quietly
 eat everyone's requests.
 
-Check the `Distribution Log` tab afterwards: one row per approval, seven columns,
-timestamps in Manila time.
+Check the `Distribution Log` tab afterwards: one row per approval, eight columns,
+timestamps in Manila time. `Timestamp (PHT)` is when the officer approved;
+`Requested (PHT)` is when the member asked, and it is the one the daily gear cap
+counts. A tab created before that column existed has seven; the bot adds the
+eighth itself on the next approval, so there is nothing to edit by hand.
 
 ---
 

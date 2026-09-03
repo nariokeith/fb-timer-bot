@@ -17,6 +17,12 @@ branch is what answers that question.
 The second rule cannot be answered from the Gear Logs tab: its cells hold
 lifetime totals with no dates. It is answered from the Distribution Log
 ledger instead, which is why gear_used_today takes ledger rows.
+
+"Per PHT day" means the day the MEMBER asked, not the day an officer
+approved -- see ledger_day. The two differ only when the queue sits
+overnight, and that is exactly when counting the approval day went
+wrong: it charged the request to a day the member had not spent
+anything on, and refused their next one.
 """
 
 from datetime import datetime
@@ -69,6 +75,32 @@ def pht_day(timestamp: str) -> str:
     return timestamp.strip()[:10]
 
 
+def ledger_day(
+    row: list[str],
+    *,
+    timestamp_column: int = 0,
+    requested_column: int = 7,
+) -> str:
+    """The PHT day a ledger row counts against.
+
+    The day the MEMBER asked, not the day an officer approved. Those are
+    the same on any request handled the same evening, and differ exactly
+    when the queue sits overnight -- which is the case this function
+    exists for. Counting by the approval day meant a member who asked on
+    the 6th and was approved on the 7th spent the 7th's allowance too,
+    and was told they were at the cap on a day they had used nothing.
+
+    Falls back to the approval timestamp when the request column is
+    absent or blank: every row written before the column existed, and
+    every row an officer pastes in by hand, is a row whose only recorded
+    time is the approval. For those the two days were never
+    distinguishable anyway, so the timestamp is the best answer there is.
+    """
+    if len(row) > requested_column and row[requested_column].strip():
+        return pht_day(row[requested_column])
+    return pht_day(row[timestamp_column])
+
+
 def gear_used_today(
     ledger_rows: list[list[str]],
     ign: str,
@@ -77,12 +109,19 @@ def gear_used_today(
     timestamp_column: int = 0,
     ign_column: int = 1,
     type_column: int = 3,
+    requested_column: int = 7,
 ) -> int:
-    """How many gear logs this player has already been given today.
+    """How many gear logs this player has already been given for `today`.
+
+    "For today" is by request day -- see ledger_day. `today` is therefore
+    not always the current date: approving a leftover request asks about
+    the day that request was made.
 
     Rows too short to hold the columns we need are skipped rather than
     raising: a half-written ledger row must not make the cap
-    uncomputable and lock the player out entirely.
+    uncomputable and lock the player out entirely. The request column is
+    deliberately not part of that minimum, because a legacy row is
+    complete without it.
     """
     wanted = normalize(ign)
     count = 0
@@ -93,7 +132,10 @@ def gear_used_today(
             continue
         if normalize(row[ign_column]) != wanted:
             continue
-        if pht_day(row[timestamp_column]) == today:
+        day = ledger_day(
+            row, timestamp_column=timestamp_column, requested_column=requested_column
+        )
+        if day == today:
             count += 1
     return count
 

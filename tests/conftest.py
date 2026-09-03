@@ -38,6 +38,18 @@ class FakeGeminiClient:
         return self.interactions.calls
 
 
+class _GridLimitResponse:
+    """The 400 Sheets answers a write aimed past the grid's last column."""
+
+    def __init__(self, message: str):
+        self.status_code = 400
+        self.text = message
+        self._message = message
+
+    def json(self):
+        return {"error": {"code": 400, "message": self._message, "status": "ERROR"}}
+
+
 class FakeWorksheet:
     """Stands in for a gspread Worksheet.
 
@@ -45,11 +57,17 @@ class FakeWorksheet:
     string, blanks as "".
     """
 
-    def __init__(self, rows: list[list[str]], title: str = "Week 17"):
+    def __init__(self, rows: list[list[str]], title: str = "Week 17", cols: int | None = None):
         self._rows = [list(r) for r in rows]
         self.title = title
         self.batches: list[list[dict]] = []
         self.appended: list[list] = []
+        # The grid's declared width, which Sheets enforces: writing to a
+        # column past it is a 400, not a silent expansion. Modelled so a
+        # caller that widens a tab has to actually widen it here too.
+        self.col_count = cols if cols is not None else max(
+            (len(r) for r in self._rows), default=0
+        )
         # Set by FakeSpreadsheet when this sheet is registered, so grid
         # reads count against the same tally as spreadsheet-level calls.
         # None for a worksheet built standalone, as many tests do.
@@ -67,7 +85,14 @@ class FakeWorksheet:
         self.appended.append(list(values))
         self._rows.append(list(values))
 
+    def add_cols(self, cols: int):
+        self.col_count += cols
+
     def update_cell(self, row, col, value):
+        if col > self.col_count:
+            raise gspread.exceptions.APIError(
+                _GridLimitResponse(f"Range ({self.title}!{col}{row}) exceeds grid limits")
+            )
         while len(self._rows) < row:
             self._rows.append([])
         target = self._rows[row - 1]
@@ -163,7 +188,7 @@ class FakeSpreadsheet:
         return {"valueRanges": value_ranges}
 
     def add_worksheet(self, title, rows=100, cols=20):
-        ws = FakeWorksheet([], title=title)
+        ws = FakeWorksheet([], title=title, cols=cols)
         ws.spreadsheet = self
         self._sheets[title] = ws
         self.created.append(title)

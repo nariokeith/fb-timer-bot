@@ -28,6 +28,7 @@ from attendance_sheet import (
     read_config,
     read_headers,
     read_players,
+    retrying_read,
     write_config,
 )
 from attendance_sheet import TRANSIENT_CODES as attendance_transient_codes
@@ -43,7 +44,10 @@ LEDGER_TAB = "Distribution Log"
 # importing the Discord bot to do it.
 GEAR_CAP_KEY = "gear_daily_cap"
 
-LEDGER_HEADER = [
+# The header this tab had before it recorded request times. Live sheets
+# still have it, so it is not a historical curiosity -- it is the shape
+# read_snapshot meets until the next approval widens it.
+LEGACY_LEDGER_HEADER = [
     "Timestamp (PHT)",
     "IGN",
     "Item",
@@ -52,6 +56,15 @@ LEDGER_HEADER = [
     "Discord User ID",
     "Request ID",
 ]
+
+# "Timestamp (PHT)" is when an OFFICER approved. "Requested (PHT)" is
+# when the MEMBER asked, and it is the one the daily gear cap counts --
+# see items_rules.ledger_day. Both are kept because they answer different
+# questions: the cap needs the request day, and an officer reconciling
+# the log needs to know when it was actually handed over.
+REQUESTED_AT_HEADER = "Requested (PHT)"
+
+LEDGER_HEADER = [*LEGACY_LEDGER_HEADER, REQUESTED_AT_HEADER]
 
 # Google Sheets renders a checked checkbox as this in get_all_values().
 CHECKED_VALUES = {"true"}
@@ -206,7 +219,15 @@ def _read_snapshot_once(spreadsheet) -> Snapshot:
         raise SheetStructureError(f"Worksheet {SPECIAL_TAB!r} is missing or empty")
     gear_grid = grids.get(GEAR_TAB, [])
     ledger_grid = grids.get(LEDGER_TAB, [])
-    if ledger_grid and ledger_grid[HEADER_ROW - 1] != LEDGER_HEADER:
+    # Two headers are accepted, and only two. The legacy one is what a
+    # sheet deployed before request times were recorded still has; its
+    # rows are read as before, with items_rules falling back to the
+    # approval timestamp. Anything else is refused, because a header
+    # nobody wrote means the column order is a guess.
+    if ledger_grid and list(ledger_grid[HEADER_ROW - 1]) not in (
+        LEDGER_HEADER,
+        LEGACY_LEDGER_HEADER,
+    ):
         raise SheetStructureError(
             f"Worksheet {LEDGER_TAB!r} has an unexpected header "
             f"{ledger_grid[HEADER_ROW - 1]!r}; expected {LEDGER_HEADER!r}. "
@@ -386,6 +407,48 @@ def record_gear(spreadsheet, ign: str, item: str) -> str:
     return address
 
 
+def _widen_ledger(worksheet) -> None:
+    """Give a legacy ledger tab its "Requested (PHT)" column.
+
+    The tab was created with exactly as many columns as the header had,
+    so the new cell is genuinely outside the grid: writing H1 without
+    growing the grid first is a 400 from Sheets, not a silent expansion.
+    """
+    missing = len(LEDGER_HEADER) - worksheet.col_count
+    if missing > 0:
+        worksheet.add_cols(missing)
+    worksheet.update_cell(HEADER_ROW, len(LEDGER_HEADER), REQUESTED_AT_HEADER)
+
+
+def _ledger_worksheet(spreadsheet):
+    """The ledger tab, widened to the current header if it predates it.
+
+    The bot migrates the tab itself rather than refusing until an officer
+    edits row 1 by hand. A refusal here would land at the worst possible
+    moment -- mid-approval, with the item cell already written -- and the
+    change is one cell in a header, not a judgement call anyone needs to
+    make. Rows already in the tab keep their meaning: they have no
+    request time, and items_rules.ledger_day reads their timestamp.
+
+    Anything that is neither the current nor the legacy header still
+    raises, exactly as before.
+    """
+    try:
+        return get_or_create_tab(spreadsheet, LEDGER_TAB, LEDGER_HEADER)
+    except SheetStructureError:
+        # get_or_create_tab has just proved the tab exists; this second
+        # lookup only re-fetches the handle its exception did not carry.
+        worksheet = retrying_read(lambda: spreadsheet.worksheet(LEDGER_TAB))
+        grid = retrying_read(worksheet.get_all_values)
+        # An empty tab is not a legacy tab -- it is a tab someone made by
+        # hand and left blank, and get_or_create_tab's "is empty" is a
+        # better thing to show an officer than a header we invented.
+        if not grid or list(grid[HEADER_ROW - 1]) != LEGACY_LEDGER_HEADER:
+            raise
+        _widen_ledger(worksheet)
+        return worksheet
+
+
 def append_ledger_row(
     spreadsheet,
     *,
@@ -396,11 +459,17 @@ def append_ledger_row(
     officer: str,
     user_id: int,
     request_id: str,
+    requested_at: str,
 ) -> None:
-    """Append one audit row, creating the tab on first use."""
-    worksheet = get_or_create_tab(spreadsheet, LEDGER_TAB, LEDGER_HEADER)
+    """Append one audit row, creating or widening the tab on first use.
+
+    `requested_at` has no default on purpose. It is what the daily cap
+    counts, so a caller that has not thought about which day this row
+    belongs to must not be able to write one by accident.
+    """
+    worksheet = _ledger_worksheet(spreadsheet)
     worksheet.append_row(
-        [timestamp, ign, item, item_type, officer, str(user_id), request_id]
+        [timestamp, ign, item, item_type, officer, str(user_id), request_id, requested_at]
     )
 
 
@@ -414,6 +483,7 @@ def commit_approval(
     officer: str,
     user_id: int,
     request_id: str,
+    requested_at: str,
 ) -> str:
     """Write the item cell, then the ledger row. Returns the cell address.
 
@@ -430,7 +500,9 @@ def commit_approval(
     else:
         raise SheetStructureError(f"Unknown item type {item_type!r}")
 
-    row = [timestamp, ign, item, item_type, officer, str(user_id), request_id]
+    row = [
+        timestamp, ign, item, item_type, officer, str(user_id), request_id, requested_at
+    ]
     try:
         append_ledger_row(
             spreadsheet,
@@ -441,6 +513,7 @@ def commit_approval(
             officer=officer,
             user_id=user_id,
             request_id=request_id,
+            requested_at=requested_at,
         )
     except Exception as exc:
         raise LedgerWriteError(address, row, exc) from exc

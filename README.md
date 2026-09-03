@@ -254,6 +254,15 @@ Gear logs are limited to three per player per day by default, resetting at
 midnight in Manila time. An IGN must match the player's row in the Logs Tracker
 sheet.
 
+The day a request counts against is the day the **member asked**, not the day an
+officer approved it. Officers do not always clear the queue before midnight, and
+counting the approval day meant a request made on Monday and approved on Tuesday
+morning spent Tuesday's allowance too -- the member had requested nothing that
+day and was still told they were at the cap. The `Distribution Log` records both
+times: `Timestamp (PHT)` is the approval, `Requested (PHT)` is what the cap
+counts. Rows written before that column existed fall back to their approval
+timestamp, which for them was the only time ever recorded.
+
 **Changing the daily limit** does not need a code change or a restart: put a
 `gear_daily_cap` row in the Logs Tracker's `_BotConfig` tab and type the number
 in the value column.
