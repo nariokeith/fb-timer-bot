@@ -307,6 +307,7 @@ channel:
 | `!won <IGN>` | Record the current poll's winner and tick their checkbox in the Special Logs tab. |
 | `!won <IGN> - <IGN>` | Record several winners for the current poll. Names are split on a hyphen with a space on both sides, so a hyphenated IGN stays intact. |
 | `!skipraffle` | Leave the current poll undrawn and move to the next one. A later session can offer it again. |
+| `!nowinner` | Close the current poll with nobody winning it, so no later session offers it again. Writes nothing to the sheet. Asks for a second `!nowinner` to confirm whenever a draw could still be lost — players are eligible, or the pool was never frozen. |
 | `!iam <your IGN>` | Tell the bot which roster row your Discord account is. A successful fix retries a session held on this poll. |
 | `!bind @user <IGN>` | Officer: identify someone else, overriding their nickname and any earlier claim on that IGN; a successful fix retries a held session. |
 | `!notaplayer @user` | Officer: record that this account has no roster row, so it stops blocking raffles; a successful fix retries a held session. Undone by `!bind`. |

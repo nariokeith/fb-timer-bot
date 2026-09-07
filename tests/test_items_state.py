@@ -455,6 +455,48 @@ def test_a_raffle_survives_an_encode_decode_round_trip():
     assert restored.raffles[0].winners == ("Jjew",)
 
 
+def test_a_raffle_closed_with_no_winner_stays_closed_across_a_restart():
+    """!nowinner is only a fix if the restart cannot re-offer the log.
+
+    A no-winner close is the one drawn raffle with an empty winner list,
+    so it is also the one that a `drawn` flag lost in the round trip
+    would silently resurrect -- from_dict falls back to inferring
+    drawnness from the winners when the flag is absent.
+    """
+    state = items_state.State(
+        officer_channel_id=1,
+        raffles=[_raffle(eligible=(), listed=True, winners=(), drawn=True)],
+    )
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert restored.raffles[0].drawn is True
+    assert restored.raffles[0].winners == ()
+    assert items_state.session_candidates(restored, "2099-01-01 00:00:00") == []
+
+
+def test_a_session_outcome_with_no_winners_survives_the_round_trip():
+    """!nowinner records (item, ()) so the summary can tell it from a skip."""
+    state = items_state.State(
+        officer_channel_id=1,
+        raffle_session=items_state.RaffleSession(
+            items=("Asta's Heart", "Amentis Foot"),
+            position=2,
+            results=(("Asta's Heart", ("Jjew",)), ("Amentis Foot", ())),
+        ),
+    )
+
+    restored = items_state.decode_shards(items_state.encode_state(state))
+
+    assert restored.raffle_session.results == (
+        ("Asta's Heart", ("Jjew",)),
+        ("Amentis Foot", ()),
+    )
+    # The empty outcome must not leak a phantom name into the exclusions
+    # a later pool is filtered against.
+    assert restored.raffle_session.winners == ("Jjew",)
+
+
 def test_a_pin_written_before_raffles_existed_still_loads():
     """Production pins have none of the three new keys."""
     old = items_state.State(officer_channel_id=1)

@@ -252,6 +252,7 @@ def reset_module_state():
     items_bot._LAST_KNOWN_GEAR_CAP = None
     if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
         items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
+    items_bot._NOWINNER_ARMED = None
     yield
     items_bot._STATE = items_state.State()
     items_bot._STATE_MESSAGES = []
@@ -259,6 +260,7 @@ def reset_module_state():
     items_bot._LAST_KNOWN_GEAR_CAP = None
     if hasattr(items_bot, "_SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED"):
         items_bot._SUCCESSFUL_REQUESTS_SINCE_BOARD_POSTED = 0
+    items_bot._NOWINNER_ARMED = None
 
 
 def test_missing_credentials_lists_every_absent_name():
@@ -2908,8 +2910,8 @@ def test_help_says_request_is_gear_only_and_lists_the_raffle_commands():
     text = str(ctx.sent[-1]["embed"].to_dict())
     assert "gear" in text.casefold()
     for command in (
-        "!poll", "!startraffle", "!won", "!skipraffle", "!cancelpoll",
-        "!setraffleroles", "!setrafflechannel",
+        "!poll", "!startraffle", "!won", "!skipraffle", "!nowinner",
+        "!cancelpoll", "!setraffleroles", "!setrafflechannel",
     ):
         assert command in text
 
@@ -3153,8 +3155,8 @@ def test_no_command_is_defined_after_the_main_guard():
 def test_every_raffle_command_is_registered_on_the_bot():
     registered = {c.name for c in items_bot.bot.commands}
     for name in (
-        "poll", "cancelpoll", "startraffle", "won", "skipraffle", "iam",
-        "bind", "notaplayer", "setraffleroles", "setrafflechannel",
+        "poll", "cancelpoll", "startraffle", "won", "skipraffle", "nowinner",
+        "iam", "bind", "notaplayer", "setraffleroles", "setrafflechannel",
     ):
         assert name in registered, f"!{name} is not registered"
 
@@ -3542,6 +3544,241 @@ def test_skipraffle_refuses_with_no_session(monkeypatch):
     ctx, _ = _raffle_ctx()
 
     asyncio.run(items_bot.skipraffle_cmd.callback(ctx))
+
+    assert "!startraffle" in ctx.sent[-1]["embed"].description
+
+
+def test_nowinner_closes_an_empty_pool_and_writes_nothing(monkeypatch):
+    """The reported bug: a poll nobody was eligible for came back every sitting.
+
+    !skipraffle deliberately leaves a log undrawn, so it was the only way
+    to pass an undrawable poll and it re-offered it forever. !nowinner is
+    the terminal state that was missing.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=(), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+    monkeypatch.setattr(
+        items_sheet, "commit_approval",
+        lambda *a, **k: pytest.fail("closing with no winner must not tick a box"),
+    )
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Log A")
+    assert raffle.drawn is True
+    assert raffle.winners == ()
+    assert items_bot._STATE.raffle_session is None
+
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+
+    assert items_bot._STATE.raffle_session is None
+    assert "no closed poll" in ctx.sent[-1]["embed"].description
+
+
+def test_the_session_summary_names_a_log_closed_with_no_winner(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=(), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    summary = ctx.sent[-1]["embed"]
+    assert summary.title == "✅ Raffle session finished"
+    assert "closed with no winner" in summary.description
+    assert "Log A" in summary.description
+
+
+def test_nowinner_warns_once_before_closing_a_pool_with_players_left(monkeypatch):
+    """A mistyped !nowinner must not throw away a draw people voted for."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    assert items_state.find_raffle(items_bot._STATE, "Log A").drawn is False
+    assert items_bot._STATE.raffle_session.position == 0
+    warning = ctx.sent[-1]["embed"].description
+    assert "Jjew" in warning and "Kobe" in warning
+    assert "`!nowinner` again" in warning
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    assert items_state.find_raffle(items_bot._STATE, "Log A").drawn is True
+
+
+def test_a_nowinner_confirmation_does_not_carry_to_the_next_poll(monkeypatch):
+    """Confirming Log A must not arm Log B, which the officer never saw."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), listed=True)
+    _open_raffle(channel, item="Log B", ends="2026-08-09 10:00:00",
+                 eligible=("Kobe",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(
+        items=("Log A", "Log B"), position=0
+    )
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+    asyncio.run(items_bot.skipraffle_cmd.callback(ctx))
+    assert items_bot._STATE.raffle_session.current_item == "Log B"
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    assert items_state.find_raffle(items_bot._STATE, "Log B").drawn is False
+    assert "`!nowinner` again" in ctx.sent[-1]["embed"].description
+
+
+def test_a_nowinner_confirmation_does_not_survive_the_session(monkeypatch):
+    """A new sitting re-offers Log A at position 0; the old arm must be gone."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+    asyncio.run(items_bot.skipraffle_cmd.callback(ctx))
+    asyncio.run(items_bot.startraffle_cmd.callback(ctx))
+    assert items_bot._STATE.raffle_session.current_item == "Log A"
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    assert items_state.find_raffle(items_bot._STATE, "Log A").drawn is False
+    assert "`!nowinner` again" in ctx.sent[-1]["embed"].description
+
+
+def test_nowinner_keeps_the_names_a_part_written_draw_already_recorded(monkeypatch):
+    """Giving up on the rest must not erase the winner already ticked."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), winners=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Log A")
+    assert raffle.drawn is True
+    assert raffle.winners == ("Jjew",)
+
+
+def test_nowinner_warns_on_a_poll_whose_pool_was_never_frozen(monkeypatch):
+    """A held session has no pool yet, and unknown is not the same as empty.
+
+    A freeze that refused leaves `eligible` empty and `listed` False. The
+    officer has been shown no pool at all, so closing on the first press
+    would throw away a draw nobody has seen.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=(), listed=False)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    assert items_state.find_raffle(items_bot._STATE, "Log A").drawn is False
+    warning = ctx.sent[-1]["embed"].description
+    assert "`!nowinner` again" in warning
+    assert "never been frozen" in warning
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    assert items_state.find_raffle(items_bot._STATE, "Log A").drawn is True
+
+
+def test_nowinner_closes_a_frozen_empty_pool_without_asking_twice(monkeypatch):
+    """The reported case. A frozen pool that is empty really is empty."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=(), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    assert items_state.find_raffle(items_bot._STATE, "Log A").drawn is True
+
+
+def test_nowinner_does_not_count_a_recorded_winner_as_still_eligible(monkeypatch):
+    """A part-written draw's own winner is not someone the close takes from.
+
+    The warning exists to name the players losing a draw. Jjew has
+    already been given this log and their checkbox is ticked, so listing
+    them overstates what closing costs.
+    """
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), winners=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    warning = ctx.sent[-1]["embed"].description
+    assert "1 player is still eligible" in warning
+    assert "Kobe" in warning
+    assert "Jjew" not in warning
+
+
+def test_nowinner_closes_at_once_when_every_eligible_name_is_recorded(monkeypatch):
+    """Nothing is left to draw, so there is nothing to warn about."""
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew",))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew",), winners=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    raffle = items_state.find_raffle(items_bot._STATE, "Log A")
+    assert raffle.drawn is True
+    assert raffle.winners == ("Jjew",)
+
+
+def test_nowinner_names_a_single_recorded_winner_in_the_singular(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch, roster=("Jjew", "Kobe"))
+    ctx, channel = _raffle_ctx()
+    _open_raffle(channel, item="Log A", ends="2026-08-09 10:00:00",
+                 eligible=("Jjew", "Kobe"), winners=("Jjew",), listed=True)
+    items_bot._STATE.raffle_session = items_state.RaffleSession(items=("Log A",))
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
+
+    closing = ctx.sent[-2]["embed"]
+    assert "**Jjew** stays recorded as a winner" in closing.description
+    assert closing.title == "⚠️ Draw closed", (
+        "a log that did have a winner must not be titled 'no winner'"
+    )
+
+
+def test_nowinner_refuses_with_no_session(monkeypatch):
+    _configured_raffle(monkeypatch)
+    _sheet(monkeypatch)
+    ctx, _ = _raffle_ctx()
+
+    asyncio.run(items_bot.nowinner_cmd.callback(ctx))
 
     assert "!startraffle" in ctx.sent[-1]["embed"].description
 

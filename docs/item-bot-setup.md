@@ -240,7 +240,8 @@ its state. Then, in the raffle channel, whoever holds a raffle role runs:
 !startraffle                             draws every closed poll, one at a time
 !won <IGN>                               records the current poll's winner
 !won <IGN> - <IGN>                       records several winners for one poll
-!skipraffle                              leaves the current poll undrawn
+!skipraffle                              leaves the current poll undrawn, for a later session
+!nowinner                                closes the current poll for good with no winner
 !iam <your IGN>                          any member: which player you are
 !bind @user <IGN>                        officer: identify someone else
 !notaplayer @user                        officer: they have no roster row
@@ -263,6 +264,16 @@ names already recorded; re-run only the remaining names. If the checkbox was
 ticked but the ledger row failed, do not re-run that name — paste the row by
 hand. `!skipraffle` moves on without drawing, leaving the poll undrawn for a
 later session.
+
+A poll that can never be drawn — nobody voted, or every voter already holds
+that log — is closed with `!nowinner`. It marks the raffle finished with no
+winner and writes nothing to the sheet, so no later `!startraffle` offers it
+again; skipping such a poll would re-offer it every sitting forever. Because
+closing ends the draw for good, it asks for a second `!nowinner` to confirm
+whenever anything might still be lost: players are still eligible, or the pool
+was never frozen because the session is held on a voter it could not identify.
+A frozen pool that really is empty closes on the first press. To raffle that
+log another time, open a fresh poll with `!poll <special log>`.
 
 Every voter must be identifiable. The bot matches each voter's server nickname
 against the sheet, stripping the guild tag, so `BK | Jjew`, `M2 - Jjew`,

@@ -53,6 +53,17 @@ _SHEET_LOCK = asyncio.Lock()
 
 _STATE = items_state.State()
 
+# The session poll a repeated `!nowinner` would close, as (position,
+# item), or None when nothing is armed. Closing a log with players still
+# eligible gives an item to nobody, so it is confirmed by typing the
+# command twice rather than done on the first press.
+#
+# In memory rather than in _STATE: this answers "did the officer just see
+# the warning", which a restart makes false anyway. Forgetting it only
+# asks them again, which is the safe direction to fail, and it keeps a
+# transient confirmation out of the pinned-state schema.
+_NOWINNER_ARMED: tuple[int, str] | None = None
+
 # The pinned messages holding _STATE, cached in shard order so save_state
 # edits them instead of posting a new copy on every change.
 _STATE_MESSAGES: list[discord.Message] = []
@@ -636,7 +647,7 @@ _EXEMPT_COMMANDS = frozenset({
 })
 _OFFICER_COMMANDS = frozenset({"distribute", "setraffleroles"})
 _RAFFLE_COMMANDS = frozenset({
-    "poll", "cancelpoll", "startraffle", "won", "skipraffle",
+    "poll", "cancelpoll", "startraffle", "won", "skipraffle", "nowinner",
     "iam", "bind", "notaplayer",
 })
 _QUEUE_COMMANDS = frozenset({"request", "cancelrequest", "myrequests", "itemhelp"})
@@ -1702,7 +1713,10 @@ async def itemhelp_cmd(ctx):
             "**`!startraffle`** — draw every closed poll, one at a time\n"
             "**`!won <IGN>`** — record the current poll's winner\n"
             "**`!won <IGN> - <IGN>`** — several winners for one log\n"
-            "**`!skipraffle`** — leave the current poll undrawn\n"
+            "**`!skipraffle`** — leave the current poll undrawn, to be "
+            "offered again next sitting\n"
+            "**`!nowinner`** — close the current poll for good with nobody "
+            "winning it\n"
             "**`!cancelpoll <special log>`** — cancel an open poll\n"
             "\n**`!iam <your IGN>`** — tell the bot which player you are\n"
             "**`!bind @user <IGN>`** — officer: identify someone\n"
@@ -2346,14 +2360,22 @@ async def _freeze_raffle(ctx, raffle):
 
 async def _end_session(ctx) -> None:
     """Post the summary of the whole sitting and clear it from state."""
+    global _NOWINNER_ARMED
+
     session = _STATE.raffle_session
     lines: list[str] = []
     won = {item: igns for item, igns in session.results}
     for item in session.items:
         if item in won:
             igns = won[item]
-            label = "Winner" if len(igns) == 1 else "Winners"
-            lines.append(f"🏆 **{item}** — {label}: {', '.join(igns)}")
+            if not igns:
+                # !nowinner records an outcome with no names. Printing the
+                # winner line here would read "Winners: " with nothing
+                # after it.
+                lines.append(f"🚫 **{item}** — closed with no winner")
+            else:
+                label = "Winner" if len(igns) == 1 else "Winners"
+                lines.append(f"🏆 **{item}** — {label}: {', '.join(igns)}")
         elif item in session.skipped:
             lines.append(f"⏭️ **{item}** — skipped, still undrawn")
         else:
@@ -2361,6 +2383,7 @@ async def _end_session(ctx) -> None:
             # rather than printing a log with no outcome at all.
             lines.append(f"❔ **{item}** — no outcome recorded")
 
+    _NOWINNER_ARMED = None
     _STATE.raffle_session = None
     channel = (
         bot.get_channel(_STATE.officer_channel_id)
@@ -2455,9 +2478,12 @@ async def _post_current_poll(ctx) -> None:
     )
     footer = (
         "\n\nDraw the winner yourself, then run `!won <IGN>`. "
-        "`!skipraffle` leaves this log undrawn."
+        "`!skipraffle` leaves this log for another sitting; "
+        "`!nowinner` closes it with nobody winning."
         if pool
-        else "\n\nNobody is left eligible for this log. Run `!skipraffle` to move on."
+        else "\n\nNobody is left eligible for this log. Run `!nowinner` to "
+        "close it for good, or `!skipraffle` to be offered it again next "
+        "sitting."
     )
     await ctx.send(embed=ok_embed(
         f"🎲 Poll {session.position + 1} of {len(session.items)} — {raffle.item}",
@@ -2468,6 +2494,8 @@ async def _post_current_poll(ctx) -> None:
 @bot.command(name="startraffle")
 async def startraffle_cmd(ctx):
     """Begin a raffle session, or retry the poll the current one is stuck on."""
+    global _NOWINNER_ARMED
+
     if await _refuse_raffle(ctx, raffle_access(ctx)):
         return
 
@@ -2488,6 +2516,7 @@ async def startraffle_cmd(ctx):
         return
 
     previous = _STATE.raffle_session
+    _NOWINNER_ARMED = None
     _STATE.raffle_session = items_state.RaffleSession(
         items=tuple(raffle.item for raffle in candidates)
     )
@@ -2687,6 +2716,152 @@ async def skipraffle_cmd(ctx):
         f"**{item}** was left undrawn. It stays in the bot's state and the "
         "next `!startraffle` will offer it again.",
     ))
+    await _post_current_poll(ctx)
+
+
+@bot.command(name="nowinner")
+async def nowinner_cmd(ctx):
+    """Close the session's current poll with nobody winning it.
+
+    The outcome !skipraffle deliberately is not. A skipped log stays
+    undrawn on purpose and every later !startraffle offers it again,
+    which is right for a poll being postponed and wrong for one that can
+    never be drawn -- nobody voted, or every voter already holds the log.
+    Without this the undrawable poll came back every sitting forever,
+    because a raffle is only ever marked drawn by a successful !won.
+
+    Writes nothing to the sheet: there is no winner to tick a box for.
+    """
+    global _NOWINNER_ARMED
+
+    if await _refuse_raffle(ctx, raffle_access(ctx)):
+        return
+
+    pending = _STATE.raffle_session
+    if pending is None or pending.finished:
+        await ctx.send(embed=error_embed(
+            "No raffle session",
+            "No raffle session is running. Run `!startraffle` first.",
+        ))
+        return
+
+    # Under the lock for the same reason !won and !skipraffle are:
+    # save_state awaits, so without it two commands each write back a
+    # session built from the state they read before waiting, and whichever
+    # lands second silently discards the other's outcome.
+    async with _SHEET_LOCK:
+        session = _STATE.raffle_session
+        if session is None or session.finished or session != pending:
+            await ctx.send(embed=error_embed(
+                "Nothing closed",
+                "The raffle session moved on while this command was waiting. "
+                "Check the poll now on screen and run `!nowinner` again if "
+                "you still want to close it with no winner.",
+            ))
+            return
+
+        item = session.current_item
+        raffle = items_state.find_raffle(_STATE, item)
+        if raffle is None or raffle.drawn:
+            # Superseded by a new poll, or drawn by another officer while
+            # this was waiting. _post_current_poll passes such a raffle
+            # over on its own, so say nothing was closed and let it.
+            await ctx.send(embed=error_embed(
+                "Nothing closed",
+                f"**{item}** is no longer waiting to be drawn, so it was not "
+                "closed. Run `!startraffle` to move the session on.",
+            ))
+            return
+
+        # Who this command would actually take a draw from. Excluded on
+        # both counts, because neither is losing anything: a player who
+        # won earlier this sitting, and -- for a draw whose sheet write
+        # failed part way -- one already recorded as a winner of THIS log,
+        # whose checkbox is ticked and stays ticked.
+        pool, _ = items_raffle.remaining_pool(
+            raffle.eligible, (*session.winners, *raffle.winners)
+        )
+        # An unlisted raffle has never been frozen, so its empty
+        # `eligible` means "not computed", not "nobody". That is exactly
+        # the state a session held on an unidentified voter sits in, and
+        # it is the one case where an empty pool is not evidence of
+        # anything -- closing there would throw away a draw the officer
+        # was never shown.
+        unfrozen = not raffle.listed
+        if (pool or unfrozen) and _NOWINNER_ARMED != (session.position, item):
+            # Armed on (position, item) rather than a bare flag: the
+            # confirmation belongs to the poll on screen, and a session
+            # that has moved on since must ask again.
+            _NOWINNER_ARMED = (session.position, item)
+            if unfrozen:
+                # !won cannot be offered here: it checks names against the
+                # eligible list, which this raffle has not got yet.
+                warning = (
+                    f"The pool for **{item}** has never been frozen, so the "
+                    "bot cannot say who is eligible — the session is still "
+                    "held on a voter it could not identify. Closing it now "
+                    "may throw a real draw away.\n\nRun `!nowinner` again to "
+                    "close it anyway, or identify the voter named above and "
+                    "run `!startraffle` to retry the freeze."
+                )
+            else:
+                count = len(pool)
+                noun = "player is" if count == 1 else "players are"
+                warning = (
+                    f"{count} {noun} still eligible for **{item}**: "
+                    f"{', '.join(pool)}. Closing it ends the draw without "
+                    "them, and no later `!startraffle` will offer it "
+                    "again.\n\n"
+                    "Run `!nowinner` again to close it anyway, `!won <IGN>` "
+                    "to draw it, or `!skipraffle` to leave it for another "
+                    "sitting."
+                )
+            await ctx.send(embed=warn_embed(
+                "Close this log with no winner?", warning
+            ))
+            return
+
+        _NOWINNER_ARMED = None
+        # Marked drawn without touching `winners`. A draw whose sheet
+        # write failed part way keeps the names it did record -- those
+        # boxes are ticked and cannot be unticked from here -- and this
+        # only says no further name will be added.
+        items_state.replace_raffle(_STATE, raffle, drawn=True)
+        _STATE.raffle_session = dataclasses.replace(
+            session,
+            position=session.position + 1,
+            results=(*session.results, (item, raffle.winners)),
+        )
+        channel = (
+            bot.get_channel(_STATE.officer_channel_id)
+            if _STATE.officer_channel_id is not None
+            else None
+        )
+        if channel is not None:
+            await save_state(channel)
+
+    if not raffle.winners:
+        recorded = "Nobody won it."
+    elif len(raffle.winners) == 1:
+        recorded = (
+            f"**{raffle.winners[0]}** stays recorded as a winner; no further "
+            "name will be drawn for it."
+        )
+    else:
+        recorded = (
+            f"**{', '.join(raffle.winners)}** stay recorded as winners; no "
+            "further name will be drawn for it."
+        )
+    await ctx.send(embed=warn_embed(
+        # A part-written draw really did have a winner, and a title
+        # saying otherwise would contradict its own next sentence.
+        "Draw closed" if raffle.winners else "Closed with no winner",
+        f"**{item}** is closed and will not be offered again. {recorded} "
+        f"Open a fresh poll with `!poll {item}` if it should be raffled "
+        "another time.",
+    ))
+    # Outside the lock: _post_current_poll reaches _freeze_raffle, which
+    # takes _SHEET_LOCK, and asyncio.Lock is not reentrant.
     await _post_current_poll(ctx)
 
 
