@@ -272,6 +272,19 @@ def _render(payload: dict) -> str:
     )
 
 
+def _drop_if_empty(payload: dict, key: str) -> None:
+    """Take back a key setdefault added for an item that then spilled.
+
+    The shard was measured with the item in it and passed only while it
+    was absent, so an empty key left behind is bytes nobody measured:
+    "queue":[] behind a raffle shard near the limit pushed it past, and
+    fits() refused a five-name pool. Every key decodes to empty when
+    missing, so dropping one loses nothing.
+    """
+    if not payload[key]:
+        del payload[key]
+
+
 def _encode_with_total(state: State, total: int) -> list[str]:
     first_payload = {
         "part": 0,
@@ -302,6 +315,7 @@ def _encode_with_total(state: State, total: int) -> list[str]:
             continue
 
         current["igns"].pop(user_id)
+        _drop_if_empty(current, "igns")
         current = {"part": len(payloads), "total": total, "igns": {}, "queue": []}
         payloads.append(current)
         current["igns"][user_id] = ign
@@ -315,6 +329,7 @@ def _encode_with_total(state: State, total: int) -> list[str]:
             continue
 
         current["bindings"].pop(user_id)
+        _drop_if_empty(current, "bindings")
         current = {"part": len(payloads), "total": total, "bindings": {}, "queue": []}
         payloads.append(current)
         current["bindings"][user_id] = ign
@@ -329,6 +344,7 @@ def _encode_with_total(state: State, total: int) -> list[str]:
             continue
 
         current["raffles"].pop()
+        _drop_if_empty(current, "raffles")
         current = {"part": len(payloads), "total": total, "raffles": []}
         payloads.append(current)
 
@@ -360,6 +376,7 @@ def _encode_with_total(state: State, total: int) -> list[str]:
             continue
 
         current["queue"].pop()
+        _drop_if_empty(current, "queue")
         current = {"part": len(payloads), "total": total, "queue": []}
         payloads.append(current)
 

@@ -1022,3 +1022,38 @@ def test_raffles_and_queue_both_survive_being_reordered():
     assert len(restored.raffles) == len(state.raffles)
     assert len(restored.queue) == len(state.queue)
     assert restored.raffles[0].item == state.raffles[0].item
+
+
+def test_a_shard_left_by_a_spilled_item_carries_no_empty_list_past_the_limit():
+    """A section that spills must not leave its empty key behind.
+
+    Each loop measures a shard with the item in it, and on overflow pops
+    the item and opens a new shard. But setdefault had already added the
+    key to the old shard -- "queue":[] behind a full raffle shard -- and
+    that shard was only ever measured WITHOUT it. A raffle shard within
+    eleven characters of the limit then rendered past it, fits() said no,
+    and freezing a 5-player pool on the live guild was refused as "Entry
+    list too large".
+
+    Swept one character at a time rather than pinned to one size,
+    because which pool lands a shard in that window depends on every
+    byte ahead of it.
+    """
+    for width in range(1, 2000):
+        state = items_state.State(
+            officer_channel_id=1,
+            raffles=[_raffle(eligible=("x" * width,))],
+            queue=[_request()],
+        )
+
+        try:
+            contents = items_state.encode_state(state)
+        except ValueError as error:
+            # The sweep's end: one raffle now outgrows a whole shard,
+            # which is a correct refusal and not the bug.
+            assert "a raffle is too large" in str(error), width
+            break
+
+        assert all(len(c) <= items_state.MAX_CONTENT for c in contents), width
+    else:
+        raise AssertionError("the sweep never reached a shard-sized raffle")
